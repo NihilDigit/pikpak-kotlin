@@ -7,7 +7,6 @@ import io.github.nihildigit.pikpak.PikPakException
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.HttpRequestRetry
 import io.ktor.client.plugins.HttpTimeout
-import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.headers
 import io.ktor.client.request.request
@@ -18,7 +17,6 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.contentType
-import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -66,17 +64,34 @@ internal class HttpEngine(
         }
     }
 
+    /**
+     * PikPak API request that returns the parsed JSON envelope without checking
+     * `error_code`. Adds the standard PikPak headers (UA + X-Device-Id) — used
+     * by auth bootstrap and any caller that needs to inspect the envelope itself.
+     */
     suspend fun requestRaw(
         method: HttpMethod,
         url: String,
         configure: HttpRequestBuilder.() -> Unit = {},
     ): JsonElement {
-        val response = sendWithRetry(method, url, configure)
+        val response = sendWithRetry(method, url) {
+            headers {
+                append(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
+                append("X-Device-Id", pikpak.deviceId)
+            }
+            configure()
+        }
         val text = response.bodyAsText()
         if (text.isBlank()) return JsonObject(emptyMap())
         return pikpak.json.parseToJsonElement(text)
     }
 
+    /**
+     * Raw external HTTP. Does NOT add PikPak-specific headers — use this for
+     * the signed CDN/OSS URLs returned by PikPak, which reject auth headers
+     * and Accept negotiation. Caller is responsible for any required headers
+     * (Range, custom UA, etc.).
+     */
     suspend fun sendRaw(
         method: HttpMethod,
         url: String,
@@ -95,10 +110,6 @@ internal class HttpEngine(
             try {
                 return client.request(url) {
                     this.method = method
-                    headers {
-                        append(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
-                        append("X-Device-Id", pikpak.deviceId)
-                    }
                     configure()
                 }
             } catch (t: Throwable) {
@@ -145,14 +156,20 @@ internal class HttpEngine(
     }
 
     companion object {
+        // ContentNegotiation is intentionally NOT installed: it would auto-add an
+        // `Accept: application/json` header that the OSS/CDN download endpoints
+        // reject with 406. We parse JSON manually via bodyAsText() + Json.parseToJsonElement().
         fun defaultClient(): HttpClient = HttpClient {
-            install(ContentNegotiation) {
-                json(Json { ignoreUnknownKeys = true; encodeDefaults = false })
-            }
             install(HttpTimeout) {
                 connectTimeoutMillis = 15_000
-                requestTimeoutMillis = 60_000
-                socketTimeoutMillis = 60_000
+                // Request timeout caps the entire HTTP exchange — set high so
+                // long file downloads aren't aborted mid-stream. The per-call
+                // RetryPolicy handles short-lived transport failures.
+                requestTimeoutMillis = Long.MAX_VALUE
+                // Inter-byte socket timeout. Bytes should flow at least every
+                // few minutes even on slow links; tune via a custom HttpClient
+                // if your workload needs different bounds.
+                socketTimeoutMillis = 5L * 60 * 1000
             }
             install(HttpRequestRetry) {
                 retryOnServerErrors(maxRetries = 2)
