@@ -7,8 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    name: jvm + linuxX64 tests
+  linux:
+    name: jvm + linuxX64 + mingwX64 cross-compile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +22,33 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # Integration tests Assumptions.assumeTrue() out without these — CI
-      # therefore only runs the unit subset, which is what we want for PRs.
-      - name: Run JVM + linuxX64 tests
-        run: ./gradlew jvmTest linuxX64Test
+      # Integration tests Assumptions.assumeTrue() out without .env, so CI
+      # runs the unit subset only. linuxX64Test executes a real native binary.
+      # mingwX64 is cross-compiled here (klib only — no runner to execute the .exe).
+      - name: jvmTest + linuxX64Test + mingwX64 klib
+        run: ./gradlew jvmTest linuxX64Test mingwX64MainKlibrary
+
+  apple:
+    name: macosArm64 runtime + iOS compile
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # macosArm64Test runs a real native binary on the Apple-silicon runner.
+      # iOS targets only get compile verification — running an iOS simulator in
+      # CI is slow and gives little extra value for a pure-Kotlin codebase.
+      - name: macosArm64Test + iOS compile
+        run: |
+          ./gradlew macosArm64Test \
+                    compileKotlinIosArm64 \
+                    compileKotlinIosX64 \
+                    compileKotlinIosSimulatorArm64
