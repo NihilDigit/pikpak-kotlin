@@ -2,7 +2,7 @@ package io.github.nihildigit.pikpak
 
 import io.github.cdimascio.dotenv.dotenv
 import kotlinx.coroutines.runBlocking
-import kotlinx.datetime.Clock
+import kotlin.time.Clock
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull

@@ -1,13 +1,13 @@
-import com.vanniktech.maven.publish.SonatypeHost
 import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
-    kotlin("multiplatform") version "2.1.0"
-    kotlin("plugin.serialization") version "2.1.0"
-    // AGP 8.9+ recognises compileSdk = 36 without warning.
-    id("com.android.library") version "8.9.3"
-    id("com.vanniktech.maven.publish") version "0.30.0"
+    kotlin("multiplatform") version "2.3.10"
+    kotlin("plugin.serialization") version "2.3.10"
+    // AGP 9 dropped support for `com.android.library` in KMP projects;
+    // this is the replacement that integrates directly into the `kotlin {}` DSL.
+    id("com.android.kotlin.multiplatform.library") version "9.1.1"
+    id("com.vanniktech.maven.publish") version "0.36.0"
 }
 
 group = "io.github.nihildigit"
@@ -23,12 +23,14 @@ kotlin {
         }
     }
 
-    androidTarget {
-        publishLibraryVariants("release")
+    android {
+        namespace = "io.github.nihildigit.pikpak"
+        compileSdk = 36
+        minSdk = 21
+        // Android's R8/D8 accepts up to JVM 11 bytecode today; pin to 11
+        // here so Kotlin features that require >1.8 bytecode (e.g. certain
+        // inline-class call sites) don't get blocked.
         compilerOptions {
-            // Android's R8/D8 accepts up to JVM 11 bytecode today; pin to 11
-            // here so Kotlin features that require >1.8 bytecode (e.g. certain
-            // inline-class call sites) don't get blocked.
             jvmTarget.set(JvmTarget.JVM_11)
         }
     }
@@ -49,17 +51,17 @@ kotlin {
     applyDefaultHierarchyTemplate()
 
     sourceSets {
-        val ktorVersion = "3.0.3"
-        val coroutinesVersion = "1.10.1"
-        val serializationVersion = "1.7.3"
-        val kotlincryptoVersion = "0.5.6"
-        val kotlinxIoVersion = "0.5.4"
+        val ktorVersion = "3.4.2"
+        val coroutinesVersion = "1.10.2"
+        val serializationVersion = "1.11.0"
+        val kotlincryptoVersion = "0.8.0"
+        val kotlinxIoVersion = "0.9.0"
 
         commonMain.dependencies {
             implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
             implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationVersion")
             implementation("org.jetbrains.kotlinx:kotlinx-io-core:$kotlinxIoVersion")
-            implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.6.1")
+            implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.7.1")
             implementation("io.ktor:ktor-client-core:$ktorVersion")
             implementation("io.ktor:ktor-client-content-negotiation:$ktorVersion")
             implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
@@ -75,11 +77,11 @@ kotlin {
         }
         jvmMain.dependencies {
             implementation("io.ktor:ktor-client-okhttp:$ktorVersion")
-            implementation("org.slf4j:slf4j-simple:2.0.16")
+            implementation("org.slf4j:slf4j-simple:2.0.17")
         }
         jvmTest.dependencies {
             implementation(kotlin("test-junit5"))
-            implementation("org.junit.jupiter:junit-jupiter:5.11.4")
+            implementation("org.junit.jupiter:junit-jupiter:6.0.3")
             implementation("io.github.cdimascio:dotenv-kotlin:6.5.1")
         }
 
@@ -104,18 +106,6 @@ kotlin {
     }
 }
 
-android {
-    namespace = "io.github.nihildigit.pikpak"
-    compileSdk = 36
-    defaultConfig {
-        minSdk = 21
-    }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
-    }
-}
-
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
     testLogging {
@@ -131,7 +121,7 @@ mavenPublishing {
     // New Sonatype Central Portal (replaces legacy OSSRH). The vanniktech
     // plugin handles staging upload, GPG signing of every artifact, POM
     // validation, and (with automaticRelease=true) the staging→release promotion.
-    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
+    publishToMavenCentral(automaticRelease = true)
     signAllPublications()
 
     pom {

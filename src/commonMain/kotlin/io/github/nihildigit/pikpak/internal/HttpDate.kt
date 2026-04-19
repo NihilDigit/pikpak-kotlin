@@ -1,6 +1,6 @@
 package io.github.nihildigit.pikpak.internal
 
-import kotlinx.datetime.Instant
+import kotlin.time.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 
@@ -12,8 +12,8 @@ import kotlinx.datetime.toLocalDateTime
 internal fun Instant.formatHttpDate(): String {
     val dt = toLocalDateTime(TimeZone.UTC)
     val day = DAYS[(dt.dayOfWeek.ordinal)]
-    val mon = MONTHS[dt.monthNumber - 1]
-    val dom = dt.dayOfMonth.padded(2)
+    val mon = MONTHS[dt.month.number - 1]
+    val dom = dt.day.padded(2)
     val hh = dt.hour.padded(2)
     val mm = dt.minute.padded(2)
     val ss = dt.second.padded(2)
