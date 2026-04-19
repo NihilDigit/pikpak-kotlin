@@ -5,6 +5,8 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 plugins {
     kotlin("multiplatform") version "2.1.0"
     kotlin("plugin.serialization") version "2.1.0"
+    // AGP 8.9+ recognises compileSdk = 36 without warning.
+    id("com.android.library") version "8.9.3"
     id("com.vanniktech.maven.publish") version "0.30.0"
 }
 
@@ -18,6 +20,16 @@ kotlin {
     jvm {
         compilerOptions {
             jvmTarget.set(JvmTarget.JVM_21)
+        }
+    }
+
+    androidTarget {
+        publishLibraryVariants("release")
+        compilerOptions {
+            // Android's R8/D8 accepts up to JVM 11 bytecode today; pin to 11
+            // here so Kotlin features that require >1.8 bytecode (e.g. certain
+            // inline-class call sites) don't get blocked.
+            jvmTarget.set(JvmTarget.JVM_11)
         }
     }
 
@@ -71,6 +83,12 @@ kotlin {
             implementation("io.github.cdimascio:dotenv-kotlin:6.5.1")
         }
 
+        // Android rides on the same OkHttp engine as JVM. Ktor's okhttp
+        // artifact is pure-JVM and runs fine on Android's Dalvik/ART.
+        androidMain.dependencies {
+            implementation("io.ktor:ktor-client-okhttp:$ktorVersion")
+        }
+
         // Apple targets share Ktor's Darwin engine.
         appleMain.dependencies {
             implementation("io.ktor:ktor-client-darwin:$ktorVersion")
@@ -83,6 +101,18 @@ kotlin {
         val mingwX64Main by getting {
             dependencies { implementation("io.ktor:ktor-client-cio:$ktorVersion") }
         }
+    }
+}
+
+android {
+    namespace = "io.github.nihildigit.pikpak"
+    compileSdk = 36
+    defaultConfig {
+        minSdk = 21
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
     }
 }
 

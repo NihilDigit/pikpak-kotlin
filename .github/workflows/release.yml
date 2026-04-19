@@ -22,6 +22,23 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - run: ./gradlew jvmTest linuxX64Test
 
+  # Android artefact is JVM bytecode at runtime, so we don't need an emulator
+  # here — a clean release compile of :compileReleaseKotlinAndroid plus AAR
+  # assembly is enough to catch config regressions. Full instrumented tests
+  # belong in a consumer app, not in the SDK's release gate.
+  test-android:
+    name: Assemble androidRelease
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew :assembleRelease
+
   test-macos:
     name: Test macosArm64 runtime + iOS compile
     runs-on: macos-latest
@@ -54,7 +71,7 @@ jobs:
     name: Publish to Maven Central
     # macOS runner so iOS/macOS targets can compile alongside JVM and Linux/Windows.
     runs-on: macos-latest
-    needs: [test-linux, test-macos, test-windows]
+    needs: [test-linux, test-android, test-macos, test-windows]
     steps:
       - uses: actions/checkout@v4
 
