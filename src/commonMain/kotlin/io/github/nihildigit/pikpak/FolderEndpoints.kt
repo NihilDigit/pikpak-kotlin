@@ -9,6 +9,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.contentOrNull
 
@@ -129,6 +130,40 @@ suspend fun PikPakClient.batchDelete(ids: List<String>) {
         method = HttpMethod.Post,
         url = "$DRIVE$FILES_PATH:batchDelete",
         captchaAction = "POST:/drive/v1/files:batchDelete",
+    ) { jsonBody(json, body) }
+}
+
+/**
+ * Restores trashed items back to their original parent folder. Counterpart to
+ * [batchTrash]. No-op when [ids] is empty. Ids must reference items currently
+ * in the trash; untrashing a non-trashed item is a no-op on PikPak's side.
+ */
+suspend fun PikPakClient.batchUntrash(ids: List<String>) {
+    if (ids.isEmpty()) return
+    val body = buildJsonObject {
+        putJsonArray("ids") { ids.forEach { add(it) } }
+    }
+    http.request(
+        method = HttpMethod.Post,
+        url = "$DRIVE$FILES_PATH:batchUntrash",
+        captchaAction = "POST:/drive/v1/files:batchUntrash",
+    ) { jsonBody(json, body) }
+}
+
+/**
+ * Relocates [ids] to [toParentId] (empty string for the root drive). The "update"
+ * leg of CRUD: changes a file/folder's `parent_id`. No-op when [ids] is empty.
+ */
+suspend fun PikPakClient.batchMove(ids: List<String>, toParentId: String) {
+    if (ids.isEmpty()) return
+    val body = buildJsonObject {
+        putJsonArray("ids") { ids.forEach { add(it) } }
+        putJsonObject("to") { put("parent_id", toParentId) }
+    }
+    http.request(
+        method = HttpMethod.Post,
+        url = "$DRIVE$FILES_PATH:batchMove",
+        captchaAction = "POST:/drive/v1/files:batchMove",
     ) { jsonBody(json, body) }
 }
 
