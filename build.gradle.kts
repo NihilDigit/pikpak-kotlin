@@ -51,6 +51,7 @@ kotlin {
             implementation(kotlin("test-junit5"))
             implementation("org.junit.jupiter:junit-jupiter:5.11.4")
             implementation("io.github.cdimascio:dotenv-kotlin:6.5.1")
+            implementation("io.ktor:ktor-client-mock:$ktorVersion")
         }
     }
 }
