@@ -6,14 +6,14 @@ The goal is to give Kotlin/JVM, Android, and (eventually) Kotlin Native consumer
 
 ## Status
 
-Pre-alpha. All current public functions verified end-to-end against the live PikPak API. Surface is not yet stable.
+v0.1.0. All public functions verified end-to-end against the live PikPak API on JVM; native targets compile clean but lack runtime test coverage. Surface is not yet stable.
 
 ## Design
 
 - **Atomic**: every endpoint is a focused `suspend` extension function on `PikPakClient`. No hidden orchestration unless you opt in.
 - **Hard problems abstracted**: session persistence, `access_token` refresh, captcha re-auth on `error_code=9`, exponential-backoff retry, token-bucket rate limiting, GCID content hashing, and OSS HMAC-SHA1 signing all run automatically.
 - **Out of scope**: multi-account pools, sync/backup engines, recursive cleanup heuristics, CLIs. These are easy to build on top — the SDK does not bake them in. (For example, multi-account rotation is just `listOf(client1, client2).random()`.)
-- **Multiplatform**: core code lives in `commonMain`, depending only on multiplatform libraries (Ktor, kotlinx.serialization, kotlinx.coroutines, kotlinx.datetime, kotlinx-io, KotlinCrypto). MVP ships JVM only; iOS/native targets are a build-script change away.
+- **Multiplatform**: core code lives in `commonMain`, depending only on multiplatform libraries (Ktor, kotlinx.serialization, kotlinx.coroutines, kotlinx.datetime, kotlinx-io, KotlinCrypto). Targets shipped: JVM, iOS (x64/arm64/simulatorArm64), macOS (x64/arm64), Linux x64, Windows x64. Each platform uses its native HTTP engine — OkHttp on JVM, Darwin on Apple, CIO on Linux/Windows.
 
 ## API surface
 

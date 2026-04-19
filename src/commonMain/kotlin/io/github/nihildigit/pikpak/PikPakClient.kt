@@ -3,6 +3,7 @@ package io.github.nihildigit.pikpak
 import io.github.nihildigit.pikpak.internal.AuthApi
 import io.github.nihildigit.pikpak.internal.HttpEngine
 import io.ktor.client.HttpClient
+import kotlin.concurrent.Volatile
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json

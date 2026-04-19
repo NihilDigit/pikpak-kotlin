@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "io.github.nihildigit"
-version = "0.1.0-SNAPSHOT"
+version = "0.1.0"
 
 @OptIn(ExperimentalKotlinGradlePluginApi::class)
 kotlin {
@@ -18,6 +18,22 @@ kotlin {
             jvmTarget.set(JvmTarget.JVM_21)
         }
     }
+
+    // Apple targets
+    iosX64()
+    iosArm64()
+    iosSimulatorArm64()
+    macosX64()
+    macosArm64()
+
+    // Other native
+    linuxX64()
+    mingwX64()
+
+    // Shared intermediate source sets so target-specific code only goes in
+    // the smallest set that needs it. The Apple group covers iOS + macOS;
+    // the broader native group covers anything that's not the JVM.
+    applyDefaultHierarchyTemplate()
 
     sourceSets {
         val ktorVersion = "3.0.3"
@@ -37,7 +53,7 @@ kotlin {
             implementation("org.kotlincrypto.hash:md:$kotlincryptoVersion")
             implementation("org.kotlincrypto.hash:sha1:$kotlincryptoVersion")
             implementation("org.kotlincrypto.hash:sha2:$kotlincryptoVersion")
-            implementation("org.kotlincrypto.macs:hmac-sha1:0.5.6")
+            implementation("org.kotlincrypto.macs:hmac-sha1:$kotlincryptoVersion")
         }
         commonTest.dependencies {
             implementation(kotlin("test"))
@@ -52,6 +68,19 @@ kotlin {
             implementation("org.junit.jupiter:junit-jupiter:5.11.4")
             implementation("io.github.cdimascio:dotenv-kotlin:6.5.1")
             implementation("io.ktor:ktor-client-mock:$ktorVersion")
+        }
+
+        // Apple targets share Ktor's Darwin engine.
+        appleMain.dependencies {
+            implementation("io.ktor:ktor-client-darwin:$ktorVersion")
+        }
+        // Linux + Windows native ride on Ktor CIO — pure-Kotlin, no libcurl
+        // dependency at runtime.
+        val linuxX64Main by getting {
+            dependencies { implementation("io.ktor:ktor-client-cio:$ktorVersion") }
+        }
+        val mingwX64Main by getting {
+            dependencies { implementation("io.ktor:ktor-client-cio:$ktorVersion") }
         }
     }
 }
