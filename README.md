@@ -26,7 +26,7 @@ Small, atomic, well-typed surface over the PikPak HTTP API. The painful parts â€
 ```kotlin
 repositories { mavenCentral() }
 dependencies {
-    implementation("io.github.nihildigit:pikpak-kotlin:0.1.3")
+    implementation("io.github.nihildigit:pikpak-kotlin:0.2.0")
 }
 ```
 
