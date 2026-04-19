@@ -23,11 +23,12 @@ jobs:
       - run: ./gradlew jvmTest linuxX64Test
 
   # Android artefact is JVM bytecode at runtime, so we don't need an emulator
-  # here — a clean release compile of :compileReleaseKotlinAndroid plus AAR
-  # assembly is enough to catch config regressions. Full instrumented tests
-  # belong in a consumer app, not in the SDK's release gate.
+  # here — a clean compile of :compileAndroidMain plus AAR assembly is enough
+  # to catch config regressions. Full instrumented tests belong in a consumer
+  # app, not in the SDK's release gate. AGP 9's KMP plugin produces a single
+  # variant, so there's no `Release`/`Debug` split in task names anymore.
   test-android:
-    name: Assemble androidRelease
+    name: Assemble androidMain
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +38,7 @@ jobs:
           java-version: 21
       - uses: android-actions/setup-android@v3
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew :assembleRelease
+      - run: ./gradlew :assembleAndroidMain
 
   test-macos:
     name: Test macosArm64 runtime + iOS compile
