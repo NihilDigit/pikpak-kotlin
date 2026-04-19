@@ -25,11 +25,11 @@ kotlin {
     iosX64()
     iosArm64()
     iosSimulatorArm64()
-    macosX64()
     macosArm64()
 
     // Other native
     linuxX64()
+    linuxArm64()
     mingwX64()
 
     // Shared intermediate source sets so target-specific code only goes in
@@ -79,6 +79,9 @@ kotlin {
         // Linux + Windows native ride on Ktor CIO — pure-Kotlin, no libcurl
         // dependency at runtime.
         val linuxX64Main by getting {
+            dependencies { implementation("io.ktor:ktor-client-cio:$ktorVersion") }
+        }
+        val linuxArm64Main by getting {
             dependencies { implementation("io.ktor:ktor-client-cio:$ktorVersion") }
         }
         val mingwX64Main by getting {
