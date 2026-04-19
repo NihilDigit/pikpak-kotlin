@@ -4,13 +4,6 @@
 [![Maven Central](https://img.shields.io/maven-metadata/v?metadataUrl=https%3A%2F%2Frepo1.maven.org%2Fmaven2%2Fio%2Fgithub%2Fnihildigit%2Fpikpak-kotlin%2Fmaven-metadata.xml&label=Maven%20Central&logo=kotlin&logoColor=white&color=7F52FF)](https://central.sonatype.com/artifact/io.github.nihildigit/pikpak-kotlin)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-![JVM](https://img.shields.io/badge/JVM-2196F3?logo=openjdk&logoColor=white)
-![Android](https://img.shields.io/badge/Android-3DDC84?logo=android&logoColor=white)
-![iOS](https://img.shields.io/badge/iOS-000000?logo=apple&logoColor=white)
-![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)
-![Linux](https://img.shields.io/badge/Linux_x64-FCC624?logo=linux&logoColor=black)
-![Windows](https://img.shields.io/badge/Windows_x64-0078D6?logo=windows&logoColor=white)
-
 A Kotlin Multiplatform SDK for [PikPak](https://mypikpak.com/) cloud storage.
 
 Small, atomic, well-typed surface over the PikPak HTTP API. The painful parts — token lifecycle, captcha refresh, OSS multipart signing, GCID hashing, rate limiting, retry — run automatically.
