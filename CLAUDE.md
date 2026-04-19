@@ -1,0 +1,75 @@
+# CLAUDE.md
+
+Project-specific guidance for Claude Code. Read this before proposing changes.
+
+## What this is
+
+`pikpak-kotlin` is a Kotlin Multiplatform SDK for the [PikPak](https://mypikpak.com/) cloud-storage HTTP API. HTTP wire format and GCID hash copied from [52funny/pikpakcli](https://github.com/52funny/pikpakcli) + [52funny/pikpakhash](https://github.com/52funny/pikpakhash); all code is fresh Kotlin.
+
+Published as `io.github.nihildigit:pikpak-kotlin` on Maven Central. Source of truth: <https://github.com/NihilDigit/pikpak-kotlin>.
+
+## Architecture
+
+- **Atomic endpoints.** Every PikPak operation is one focused `suspend` extension function on `PikPakClient`. No hidden orchestration.
+- **Hard problems abstracted.** Session persistence, `access_token` refresh, captcha re-auth on `error_code=9`, exponential-backoff retry, token-bucket rate limiting, GCID hashing, and OSS HMAC-SHA1 signing all run automatically inside the client.
+- **Session externalised.** `SessionStore` is an interface — `FileSessionStore` (default on JVM), `InMemorySessionStore`, or bring your own. A `PikPakClient` is cheap to construct; multi-account scenarios just hold a list of clients.
+
+### Code layout
+
+- `src/commonMain/` — everything non-platform-specific. Depends only on KMP-capable libs: Ktor, kotlinx.serialization, kotlinx.coroutines, kotlinx.datetime, kotlinx-io, KotlinCrypto.
+- `src/jvmMain/` — `defaultSessionDir()` actual + OkHttp engine binding.
+- `src/nativeMain/` — `defaultSessionDir()` actual for all native targets (posix `getenv`).
+- `src/commonTest/` — unit tests that run on every target (gcid vectors, MockEngine-based captcha retry path).
+- `src/jvmTest/` — live PikPak API integration tests, opt-in via `.env`.
+- `internal/` sub-package — implementation helpers not meant for consumers.
+
+### Shipped targets
+
+`jvm`, `linuxX64`, `mingwX64`, `iosX64`, `iosArm64`, `iosSimulatorArm64`, `macosArm64`. Each non-compile-only target is exercised on a real runner before release (see `.github/workflows/release.yml`). `linuxArm64` and `macosX64` were removed deliberately — add back only when a real user turns up.
+
+## Conventions
+
+- **Atomic SDK philosophy** (non-negotiable). Stay out of: multi-account pools, sync engines, recursive cleanup heuristics, CLIs. These belong on top of the SDK, not inside. `PikPakClient` is atomic enough that a user can build all of them in a few lines.
+- **Don't add machine-specific or region-specific config to the OSS repo.** Hardcoded JDK paths, aliyun/tencent mirrors, personal `~/.m2` credentials — none of these go in `gradle.properties` or `settings.gradle.kts`. Per-contributor overrides live in `~/.gradle/gradle.properties`.
+- **No helper facades for Java consumers.** Every public function is `suspend`. Pure-Java callers have to deal with `Continuation` themselves. If a facade is ever needed, it's a follow-up discussion, not a quiet commit.
+- **Don't default to `runCatching`/swallowing errors** around SDK calls. Throw `PikPakException` and let the caller decide.
+- **Integration tests self-skip via `Assumptions.assumeTrue()`** when `PIKPAK_USERNAME` isn't in `.env`. Keep that pattern for any new live-API test.
+- **Destructive tag ops on unreleased tags are OK.** Force-updating a `v*` tag that never made it to Maven Central is acceptable. Once a version is live on Maven Central, it's immutable — bump instead.
+
+## Development loop
+
+JDK 21 required. Gradle 8.11 wrapper included.
+
+```bash
+./gradlew jvmTest                  # JVM unit + live integration (needs .env)
+./gradlew linuxX64Test             # native runtime: gcid + captcha mock
+./gradlew jvmTest --tests '*Hash*' # unit-only subset, no network
+./gradlew assemble -Pkotlin.native.ignoreDisabledTargets=true  # build all targets buildable on this host
+./gradlew publishToMavenLocal      # verify publish wiring (no creds needed)
+```
+
+Live integration tests will create/delete folders in the test account. `IntegrationUploadTest` + `CleanupOrphansTest` handle their own cleanup; if a run crashes mid-test, `CleanupOrphansTest` trashes leftover `pikpak-kotlin-*` folders.
+
+## CI philosophy
+
+CI here is a **release gate, not a per-commit quality check** — dev-time testing happens locally. `release.yml` triggers only on `v*.*.*` tag push; it runs platform tests in parallel and the `publish` job declares `needs:` on all of them so Maven Central never sees an artifact that hasn't been runtime-tested.
+
+There is intentionally no `ci.yml` on push/PR. If you find yourself adding one, raise it with the maintainer first.
+
+## Releasing
+
+Full step-by-step in [RELEASING.md](./RELEASING.md). Short version:
+
+1. Bump `version` in `build.gradle.kts` (drop `-SNAPSHOT`).
+2. Commit, tag `vX.Y.Z`, push both.
+3. Watch `.github/workflows/release.yml` — it verifies tag matches version, runs every platform's runtime tests, then publishes.
+4. Bump back to `vX.Y.(Z+1)-SNAPSHOT` for ongoing dev.
+
+GPG key + Sonatype Central Portal namespace + GitHub repo secrets are already configured. If any of those need re-setup, RELEASING.md covers it.
+
+## Don't
+
+- Don't introduce a dependency without checking it ships a klib for every target we support.
+- Don't expand the CI matrix on push/PR.
+- Don't add `@Volatile` from `kotlin.jvm` — use `kotlin.concurrent.Volatile` (KMP-safe).
+- Don't vendor the `pikpakcli/` Go reference into git; it's in `.gitignore` intentionally and linked from the README.
