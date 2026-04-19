@@ -72,6 +72,11 @@ jobs:
     # macOS runner so iOS/macOS targets can compile alongside JVM and Linux/Windows.
     runs-on: macos-latest
     needs: [test-linux, test-android, test-macos, test-windows]
+    # `contents: write` is what `gh release create` needs to publish the
+    # auto-generated GitHub Release after Maven Central accepts the artifact.
+    # Default GITHUB_TOKEN is read-only, hence the explicit grant.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
