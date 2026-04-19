@@ -8,6 +8,8 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.contentOrNull
 
 class FolderNotFoundException(val path: String) : RuntimeException("PikPak folder not found: $path")
@@ -94,6 +96,40 @@ suspend fun PikPakClient.deleteFile(fileId: String) {
         url = "$DRIVE$FILES_PATH/$fileId",
         captchaAction = "DELETE:/drive/v1/files",
     )
+}
+
+/**
+ * Moves multiple files/folders to the PikPak trash in one call. Items remain
+ * recoverable from the trash UI for ~30 days. No-op when [ids] is empty.
+ * For permanent removal that bypasses the trash, see [batchDelete].
+ */
+suspend fun PikPakClient.batchTrash(ids: List<String>) {
+    if (ids.isEmpty()) return
+    val body = buildJsonObject {
+        putJsonArray("ids") { ids.forEach { add(it) } }
+    }
+    http.request(
+        method = HttpMethod.Post,
+        url = "$DRIVE$FILES_PATH:batchTrash",
+        captchaAction = "POST:/drive/v1/files:batchTrash",
+    ) { jsonBody(json, body) }
+}
+
+/**
+ * Permanently removes multiple files/folders, bypassing the trash. Items are
+ * not recoverable. No-op when [ids] is empty. For soft-delete semantics that
+ * stage items in the trash for 30 days, use [batchTrash] instead.
+ */
+suspend fun PikPakClient.batchDelete(ids: List<String>) {
+    if (ids.isEmpty()) return
+    val body = buildJsonObject {
+        putJsonArray("ids") { ids.forEach { add(it) } }
+    }
+    http.request(
+        method = HttpMethod.Post,
+        url = "$DRIVE$FILES_PATH:batchDelete",
+        captchaAction = "POST:/drive/v1/files:batchDelete",
+    ) { jsonBody(json, body) }
 }
 
 /** Renames [fileId] to [newName]. Empty names are rejected client-side. */
