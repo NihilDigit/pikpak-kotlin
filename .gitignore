@@ -1,0 +1,38 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/**/build/
+!**/src/**/.gradle/
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+out/
+.fleet/
+
+# Kotlin
+*.class
+.kotlin/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local sessions written by tests / smoke runs
+**/.pikpak-kotlin/
+session_*.json
+
+# Generated docs
+/dokka/
+
+# Vendored reference implementation (linked in README, not vendored into history)
+/pikpakcli/
