@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Project-specific guidance for Claude Code. Read this before proposing changes.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this is
 
@@ -23,6 +23,10 @@ Published as `io.github.nihildigit:pikpak-kotlin` on Maven Central. Source of tr
 - `src/jvmTest/` — live PikPak API integration tests, opt-in via `.env`.
 - `internal/` sub-package — implementation helpers not meant for consumers.
 
+### Request pipeline (read before touching the auth/retry code)
+
+Public endpoints are `suspend` extension functions (`Endpoints.kt`, `FolderEndpoints.kt`, `UploadEndpoint.kt`, `DownloadEndpoint.kt`, `UrlOfflineEndpoint.kt`). They delegate to `PikPakClient.http.request(...)` with an optional `captchaAction`. `HttpEngine` (`internal/HttpEngine.kt`) handles rate-limit acquisition, standard PikPak headers, one-shot captcha refresh on `error_code=9` by calling back into `AuthApi`, and exponential-backoff retry on transient transport errors. `AuthApi` (`internal/AuthApi.kt`) owns the session state machine — cache reuse → refresh_token → full signin — plus the salt-cascade captcha signing flow. `sendRaw` deliberately skips PikPak-specific headers so the OSS CDN (upload + download) doesn't get them and 406 us.
+
 ### Shipped targets
 
 `jvm`, `linuxX64`, `mingwX64`, `iosX64`, `iosArm64`, `iosSimulatorArm64`, `macosArm64`. Each non-compile-only target is exercised on a real runner before release (see `.github/workflows/release.yml`). `linuxArm64` and `macosX64` were removed deliberately — add back only when a real user turns up.
@@ -38,17 +42,24 @@ Published as `io.github.nihildigit:pikpak-kotlin` on Maven Central. Source of tr
 
 ## Development loop
 
-JDK 21 required. Gradle 8.11 wrapper included.
+JDK 21 required. Gradle 8.11 wrapper included. No separate lint step — `ktlint` and Detekt are not wired in; keep style consistent with the surrounding code.
 
 ```bash
-./gradlew jvmTest                  # JVM unit + live integration (needs .env)
-./gradlew linuxX64Test             # native runtime: gcid + captcha mock
-./gradlew jvmTest --tests '*Hash*' # unit-only subset, no network
-./gradlew assemble -Pkotlin.native.ignoreDisabledTargets=true  # build all targets buildable on this host
-./gradlew publishToMavenLocal      # verify publish wiring (no creds needed)
+./gradlew build                                 # compile + full test suite
+./gradlew jvmTest                               # JVM unit + live integration (needs .env)
+./gradlew linuxX64Test                          # native runtime: gcid + captcha mock
+./gradlew assemble -Pkotlin.native.ignoreDisabledTargets=true   # every target buildable on this host
+./gradlew publishToMavenLocal                   # verify publish wiring (no creds needed)
+
+# Single test (FQCN, or a wildcard on method name)
+./gradlew jvmTest --tests 'io.github.nihildigit.pikpak.IntegrationUploadTest'
+./gradlew jvmTest --tests '*CaptchaRetry*'
+
+# Single native test (uses kotlin-test, same pattern)
+./gradlew linuxX64Test --tests 'io.github.nihildigit.pikpak.PikPakHashTest.hello matches reference'
 ```
 
-Live integration tests will create/delete folders in the test account. `IntegrationUploadTest` + `CleanupOrphansTest` handle their own cleanup; if a run crashes mid-test, `CleanupOrphansTest` trashes leftover `pikpak-kotlin-*` folders.
+Live integration tests create/delete folders in the test account. `IntegrationUploadTest` + `CleanupOrphansTest` handle their own cleanup; if a run crashes mid-test, `CleanupOrphansTest` trashes leftover `pikpak-kotlin-*` folders on the next run.
 
 ## CI philosophy
 
