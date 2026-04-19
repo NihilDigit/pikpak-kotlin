@@ -1,6 +1,6 @@
 # pikpak-kotlin
 
-[![CI](https://github.com/NihilDigit/pikpak-kotlin/actions/workflows/ci.yml/badge.svg)](https://github.com/NihilDigit/pikpak-kotlin/actions/workflows/ci.yml)
+[![Release](https://github.com/NihilDigit/pikpak-kotlin/actions/workflows/release.yml/badge.svg)](https://github.com/NihilDigit/pikpak-kotlin/actions/workflows/release.yml)
 [![Maven Central](https://img.shields.io/maven-central/v/io.github.nihildigit/pikpak-kotlin.svg?label=Maven%20Central)](https://central.sonatype.com/artifact/io.github.nihildigit/pikpak-kotlin)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
@@ -21,17 +21,17 @@ Gradle picks the right per-target artifact automatically based on your consumer 
 
 ## Platforms
 
-Every shipped target is exercised by CI on a real runner before release:
+Every shipped target is exercised on a real runner before each release. Tag push triggers `release.yml`, which runs platform tests in parallel and only publishes if all pass:
 
-| Target               | Runtime-tested   | HTTP engine |
-| -------------------- | ---------------- | ----------- |
-| `jvm`                | ubuntu-latest    | OkHttp      |
-| `linuxX64`           | ubuntu-latest    | CIO         |
-| `mingwX64`           | windows-latest   | CIO         |
-| `macosArm64`         | macos-latest     | Darwin      |
-| `iosArm64`           | compile-only     | Darwin      |
-| `iosX64`             | compile-only     | Darwin      |
-| `iosSimulatorArm64`  | compile-only     | Darwin      |
+| Target               | Release-gated runtime | HTTP engine |
+| -------------------- | --------------------- | ----------- |
+| `jvm`                | ubuntu-latest         | OkHttp      |
+| `linuxX64`           | ubuntu-latest         | CIO         |
+| `mingwX64`           | windows-latest        | CIO         |
+| `macosArm64`         | macos-latest          | Darwin      |
+| `iosArm64`           | compile-only          | Darwin      |
+| `iosX64`             | compile-only          | Darwin      |
+| `iosSimulatorArm64`  | compile-only          | Darwin      |
 
 ## Design
 
@@ -104,11 +104,11 @@ Requires JDK 21. The repo includes a Gradle 8.11 wrapper:
 ./gradlew jvmTest --tests '*Hash*'    # unit only, no network
 ```
 
-Integration tests `Assumptions.assumeTrue()` themselves out when `PIKPAK_USERNAME` isn't set, so CI without credentials stays green.
+Integration tests `Assumptions.assumeTrue()` themselves out when `PIKPAK_USERNAME` isn't set, so the release workflow stays green without access to your `.env`.
 
 ## Releasing
 
-See [RELEASING.md](./RELEASING.md). Tagging `v*.*.*` triggers [`.github/workflows/release.yml`](./.github/workflows/release.yml), which compiles every target on a macOS runner and publishes signed artifacts to Maven Central via the Sonatype Central Portal.
+See [RELEASING.md](./RELEASING.md). Tagging `v*.*.*` triggers [`.github/workflows/release.yml`](./.github/workflows/release.yml): it runs the full platform test matrix and, only if every platform passes, publishes signed artifacts to Maven Central via the Sonatype Central Portal. There's no separate "CI on push" workflow — dev-time quality verification happens locally.
 
 ## Credit
 

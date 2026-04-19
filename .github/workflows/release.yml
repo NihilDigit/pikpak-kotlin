@@ -5,12 +5,56 @@ on:
     tags:
       - 'v*.*.*'
 
+# Philosophy: CI here is purely a release gate, not a per-commit quality check.
+# Dev-time testing happens locally; this workflow's job is to make sure every
+# target we ship actually runs on a real machine of the right OS/arch BEFORE
+# the artifact goes to Maven Central. Publish is gated on all runtime tests.
 jobs:
+  test-linux:
+    name: Test jvm + linuxX64 runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew jvmTest linuxX64Test
+
+  test-macos:
+    name: Test macosArm64 runtime + iOS compile
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - run: |
+          ./gradlew macosArm64Test \
+                    compileKotlinIosX64 \
+                    compileKotlinIosArm64 \
+                    compileKotlinIosSimulatorArm64
+
+  test-windows:
+    name: Test mingwX64 runtime
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew mingwX64Test
+
   publish:
     name: Publish to Maven Central
     # macOS runner so iOS/macOS targets can compile alongside JVM and Linux/Windows.
-    # If you don't need Apple targets, switch to ubuntu-latest for a faster, cheaper build.
     runs-on: macos-latest
+    needs: [test-linux, test-macos, test-windows]
     steps:
       - uses: actions/checkout@v4
 
@@ -28,18 +72,14 @@ jobs:
             exit 1
           fi
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
 
       - name: Publish to Maven Central
-        # vanniktech plugin reads the four Gradle properties below from env
-        # via the standard ORG_GRADLE_PROJECT_<name> convention.
         run: ./gradlew publishToMavenCentral --no-configuration-cache
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
