@@ -4,6 +4,13 @@
 [![Maven Central](https://img.shields.io/maven-metadata/v?metadataUrl=https%3A%2F%2Frepo1.maven.org%2Fmaven2%2Fio%2Fgithub%2Fnihildigit%2Fpikpak-kotlin%2Fmaven-metadata.xml&label=Maven%20Central&logo=kotlin&logoColor=white&color=7F52FF)](https://central.sonatype.com/artifact/io.github.nihildigit/pikpak-kotlin)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
+![JVM](https://img.shields.io/badge/JVM-2196F3?logo=openjdk&logoColor=white)
+![Android](https://img.shields.io/badge/Android-3DDC84?logo=android&logoColor=white)
+![iOS](https://img.shields.io/badge/iOS-000000?logo=apple&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux_x64-FCC624?logo=linux&logoColor=black)
+![Windows](https://img.shields.io/badge/Windows_x64-0078D6?logo=windows&logoColor=white)
+
 A Kotlin Multiplatform SDK for [PikPak](https://mypikpak.com/) cloud storage.
 
 Small, atomic, well-typed surface over the PikPak HTTP API. The painful parts — token lifecycle, captcha refresh, OSS multipart signing, GCID hashing, rate limiting, retry — run automatically.
@@ -32,12 +39,15 @@ Every shipped target is exercised on a real runner before each release. Tag push
 | Target               | Release-gated runtime | HTTP engine |
 | -------------------- | --------------------- | ----------- |
 | `jvm`                | ubuntu-latest         | OkHttp      |
+| `android`            | compile-only          | OkHttp      |
 | `linuxX64`           | ubuntu-latest         | CIO         |
 | `mingwX64`           | windows-latest        | CIO         |
 | `macosArm64`         | macos-latest          | Darwin      |
 | `iosArm64`           | compile-only          | Darwin      |
 | `iosX64`             | compile-only          | Darwin      |
 | `iosSimulatorArm64`  | compile-only          | Darwin      |
+
+`android` ships as an AAR with the `pikpak-kotlin-android` artifactId — KMP consumers declaring `androidTarget()` pick it up automatically via Gradle metadata. The Android-default session dir is best-effort; wire your own `FileSessionStore(dir = Path(context.filesDir.absolutePath, "pikpak-kotlin"))` if you care about a stable on-disk location.
 
 ## Design
 
@@ -73,6 +83,8 @@ client.getOrCreateDeepFolderId(parent, path)  // mkdir -p
 client.createFolder(parentId, name)
 client.rename(fileId, newName)
 client.deleteFile(fileId)                     // moves to trash (PikPak is soft-delete)
+client.batchTrash(listOf(id1, id2))           // bulk soft-delete (30-day recoverable)
+client.batchDelete(listOf(id1, id2))          // bulk hard-delete (bypasses trash)
 
 // Transfer
 client.download(fileId, destPath)             // resumable, retries, byte-verified
@@ -81,7 +93,9 @@ client.downloadFromUrl(url, dest, expected)   // when you already have a signed 
 client.upload(parentId, sourcePath)           // GCID-hashed, instant-upload aware,
                                               // OSS multipart with HMAC-SHA1 signing
 
-client.createUrlFile(parentId, "https://...") // PikPak's offline-download queue
+// Offline-download queue
+client.createUrlFile(parentId, "https://...") // submit a URL to the queue
+client.listOfflineTasks()                     // inspect running/errored tasks
 
 client.logout()                               // forget cached tokens
 client.close()                                // close internal HTTP client
