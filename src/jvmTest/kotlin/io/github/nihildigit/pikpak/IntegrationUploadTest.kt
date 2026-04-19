@@ -68,7 +68,7 @@ class IntegrationUploadTest {
                 val listing = client.listFiles(folderId)
                 val uploaded = listing.firstOrNull { it.name == srcName && it.id == result.fileId }
                 assertNotNull(uploaded, "uploaded file should appear in listing")
-                assertEquals(payload.size.toLong(), uploaded!!.sizeBytes, "uploaded file should have correct size")
+                assertEquals(payload.size.toLong(), uploaded.sizeBytes, "uploaded file should have correct size")
 
                 SystemFileSystem.delete(dst, mustExist = false)
                 // Newly uploaded files take a moment before PikPak generates a

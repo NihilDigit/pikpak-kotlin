@@ -7,6 +7,7 @@ import io.github.nihildigit.pikpak.PikPakException
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.HttpRequestRetry
 import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.expectSuccess
 import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.headers
 import io.ktor.client.request.request
@@ -110,6 +111,7 @@ internal class HttpEngine(
             try {
                 return client.request(url) {
                     this.method = method
+                    this.expectSuccess = false
                     configure()
                 }
             } catch (t: Throwable) {

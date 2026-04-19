@@ -54,7 +54,7 @@ class IntegrationSessionReuseTest {
                 // The session must round-trip cleanly through the store too.
                 val reloaded = store.load(username)
                 assertNotNull(reloaded, "store should re-load the saved session")
-                assertEquals(s.accessToken, reloaded!!.accessToken, "stored access_token must match")
+                assertEquals(s.accessToken, reloaded.accessToken, "stored access_token must match")
                 s
             } finally {
                 first.close()
