@@ -1,13 +1,15 @@
+import com.vanniktech.maven.publish.SonatypeHost
 import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     kotlin("multiplatform") version "2.1.0"
     kotlin("plugin.serialization") version "2.1.0"
+    id("com.vanniktech.maven.publish") version "0.30.0"
 }
 
 group = "io.github.nihildigit"
-version = "0.1.0"
+version = "0.1.2-SNAPSHOT"
 
 @OptIn(ExperimentalKotlinGradlePluginApi::class)
 kotlin {
@@ -93,5 +95,49 @@ tasks.withType<Test>().configureEach {
         showExceptions = true
         showCauses = true
         showStackTraces = true
+    }
+}
+
+mavenPublishing {
+    // New Sonatype Central Portal (replaces legacy OSSRH). The vanniktech
+    // plugin handles staging upload, GPG signing of every artifact, POM
+    // validation, and (with automaticRelease=true) the staging→release promotion.
+    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
+    signAllPublications()
+
+    pom {
+        name.set("pikpak-kotlin")
+        description.set(
+            "Atomic Kotlin Multiplatform SDK for PikPak cloud storage. " +
+                "Bakes in session persistence, OAuth refresh, captcha re-auth, rate limiting, " +
+                "GCID hashing, and OSS multipart upload signing — leaves higher-level orchestration " +
+                "(account pools, sync engines) to the caller.",
+        )
+        url.set("https://github.com/NihilDigit/pikpak-kotlin")
+        inceptionYear.set("2026")
+
+        licenses {
+            license {
+                name.set("MIT License")
+                url.set("https://opensource.org/licenses/MIT")
+                distribution.set("repo")
+            }
+        }
+        developers {
+            developer {
+                id.set("nihildigit")
+                name.set("nihildigit")
+                url.set("https://github.com/NihilDigit")
+            }
+        }
+        scm {
+            url.set("https://github.com/NihilDigit/pikpak-kotlin")
+            connection.set("scm:git:git://github.com/NihilDigit/pikpak-kotlin.git")
+            developerConnection.set("scm:git:ssh://git@github.com/NihilDigit/pikpak-kotlin.git")
+        }
+        issueManagement {
+            system.set("GitHub Issues")
+            url.set("https://github.com/NihilDigit/pikpak-kotlin/issues")
+        }
     }
 }

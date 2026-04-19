@@ -69,19 +69,37 @@ PIKPAK_PASSWORD=your-password
 
 `.env` is git-ignored. The library itself never reads `.env` — it is only used by the integration test suite.
 
+## Installation
+
+Once a tagged release lands on Maven Central, consumers just add:
+
+```kotlin
+repositories { mavenCentral() }
+dependencies {
+    implementation("io.github.nihildigit:pikpak-kotlin:<version>")
+}
+```
+
+Gradle resolves the right per-target artifact automatically based on your consumer build (JVM, iOS, Linux, etc.) — no extra coordinates needed.
+
 ## Building & testing
 
 Requires JDK 21. The repo includes a Gradle 8.11 wrapper:
 
 ```bash
 ./gradlew build
-./gradlew jvmTest                     # unit + integration
-./gradlew jvmTest --tests '*Hash*'    # unit only (no network)
+./gradlew jvmTest                     # JVM unit + live integration
+./gradlew linuxX64Test                # native runtime: hash + captcha mock
+./gradlew jvmTest --tests '*Hash*'    # unit only, no network
 ```
 
 Integration tests are opt-in via `.env` — they are skipped when `PIKPAK_USERNAME` is unset, so CI without credentials stays green.
 
 The `IntegrationUploadTest` uploads a 4 KB random file to a freshly-created test folder, verifies the upload via listing + download + byte-comparison, then trashes the folder. `CleanupOrphansTest` is a one-shot housekeeping utility for stragglers from interrupted runs.
+
+## Releasing
+
+See [RELEASING.md](./RELEASING.md). Tagging `v*.*.*` triggers `.github/workflows/release.yml`, which compiles every supported target on a macOS runner and publishes signed artifacts to Maven Central via the Sonatype Central Portal.
 
 ## Credit
 

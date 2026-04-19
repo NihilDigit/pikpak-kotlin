@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  publish:
+    name: Publish to Maven Central
+    # macOS runner so iOS/macOS targets can compile alongside JVM and Linux/Windows.
+    # If you don't need Apple targets, switch to ubuntu-latest for a faster, cheaper build.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches build.gradle.kts version
+        run: |
+          TAG=${GITHUB_REF_NAME#v}
+          VERSION=$(grep -E '^version\s*=\s*"' build.gradle.kts | head -1 | sed -E 's/.*"(.+)".*/\1/')
+          echo "tag=$TAG  version=$VERSION"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::Tag v$TAG does not match build.gradle.kts version $VERSION — bump and re-tag"
+            exit 1
+          fi
+          if [[ "$VERSION" == *"-SNAPSHOT" ]]; then
+            echo "::error::Refusing to release a SNAPSHOT version ($VERSION) — drop the -SNAPSHOT suffix"
+            exit 1
+          fi
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Publish to Maven Central
+        # vanniktech plugin reads the four Gradle properties below from env
+        # via the standard ORG_GRADLE_PROJECT_<name> convention.
+        run: ./gradlew publishToMavenCentral --no-configuration-cache
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}

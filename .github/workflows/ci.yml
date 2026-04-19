@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: jvm + linuxX64 tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Integration tests Assumptions.assumeTrue() out without these — CI
+      # therefore only runs the unit subset, which is what we want for PRs.
+      - name: Run JVM + linuxX64 tests
+        run: ./gradlew jvmTest linuxX64Test
