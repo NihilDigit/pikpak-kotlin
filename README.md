@@ -1,7 +1,7 @@
 # pikpak-kotlin
 
 [![Release](https://github.com/NihilDigit/pikpak-kotlin/actions/workflows/release.yml/badge.svg)](https://github.com/NihilDigit/pikpak-kotlin/actions/workflows/release.yml)
-[![Maven Central](https://img.shields.io/maven-central/v/io.github.nihildigit/pikpak-kotlin.svg?label=Maven%20Central)](https://central.sonatype.com/artifact/io.github.nihildigit/pikpak-kotlin)
+[![Maven Central](https://img.shields.io/maven-metadata/v?metadataUrl=https%3A%2F%2Frepo1.maven.org%2Fmaven2%2Fio%2Fgithub%2Fnihildigit%2Fpikpak-kotlin%2Fmaven-metadata.xml&label=Maven%20Central)](https://central.sonatype.com/artifact/io.github.nihildigit/pikpak-kotlin)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 A Kotlin Multiplatform SDK for [PikPak](https://mypikpak.com/) cloud storage.
