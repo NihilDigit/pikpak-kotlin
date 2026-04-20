@@ -38,14 +38,14 @@ jobs:
           # a consumer app. A clean AAR assembly catches config regressions.
           - { name: android,           runner: ubuntu-latest, task: ':assembleAndroidMain', setup_android: true }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
       - if: matrix.setup_android
-        uses: android-actions/setup-android@v3
-      - uses: gradle/actions/setup-gradle@v4
+        uses: android-actions/setup-android@v4
+      - uses: gradle/actions/setup-gradle@v6
       - run: ./gradlew ${{ matrix.task }}
 
   publish:
@@ -59,7 +59,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Verify tag matches build.gradle.kts version
         run: |
@@ -75,12 +75,12 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
 
       - name: Publish to Maven Central
         run: ./gradlew publishToMavenCentral --no-configuration-cache
