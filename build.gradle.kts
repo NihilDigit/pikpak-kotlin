@@ -11,7 +11,7 @@ plugins {
 }
 
 group = "io.github.nihildigit"
-version = "0.4.2"
+version = "0.4.3"
 
 @OptIn(ExperimentalKotlinGradlePluginApi::class)
 kotlin {
@@ -52,7 +52,22 @@ kotlin {
     applyDefaultHierarchyTemplate()
 
     sourceSets {
-        val ktorVersion = "3.4.2"
+        // Ktor compile-time ABI baseline. Ktor's companion-object `val` constants
+        // (HttpMethod.Post, HttpStatusCode.OK, ContentType.Application.Json, ...)
+        // flip between `public static final` (direct GETSTATIC) and
+        // `private static + public synthetic getter` across minor versions.
+        // The Kotlin compiler picks the call path at compile time based on the
+        // ABI it sees. If the SDK compiles against 3.4.2 (direct field access)
+        // but a consumer runs Ktor 3.1.1 (private field + getter), the JVM
+        // rejects the call site with IllegalAccessError on first use.
+        //
+        // Pin the compile-time view to the lowest supported Ktor so the SDK
+        // bytecode always emits getter-based access — forward-compatible with
+        // every 3.1.1+ Ktor on the consumer's runtime classpath. The test
+        // source set still uses the current release so local/integration runs
+        // exercise up-to-date Ktor behaviour.
+        val ktorCompileVersion = "3.1.1"
+        val ktorTestVersion = "3.4.2"
         val coroutinesVersion = "1.10.2"
         val serializationVersion = "1.11.0"
         val kotlincryptoVersion = "0.8.0"
@@ -67,9 +82,9 @@ kotlin {
             // Ktor version on consumers (see issue #1 — animeko's 3.1.1 was being
             // upgraded to 3.4.2 transitively). Consumers must add their own Ktor
             // client-core + content-negotiation + serialization-kotlinx-json.
-            compileOnly("io.ktor:ktor-client-core:$ktorVersion")
-            compileOnly("io.ktor:ktor-client-content-negotiation:$ktorVersion")
-            compileOnly("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
+            compileOnly("io.ktor:ktor-client-core:$ktorCompileVersion")
+            compileOnly("io.ktor:ktor-client-content-negotiation:$ktorCompileVersion")
+            compileOnly("io.ktor:ktor-serialization-kotlinx-json:$ktorCompileVersion")
             implementation("org.kotlincrypto.hash:md:$kotlincryptoVersion")
             implementation("org.kotlincrypto.hash:sha1:$kotlincryptoVersion")
             implementation("org.kotlincrypto.hash:sha2:$kotlincryptoVersion")
@@ -79,17 +94,17 @@ kotlin {
             implementation(kotlin("test"))
             implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:$coroutinesVersion")
             // Tests must materialise the Ktor classes the SDK declares compileOnly.
-            implementation("io.ktor:ktor-client-core:$ktorVersion")
-            implementation("io.ktor:ktor-client-content-negotiation:$ktorVersion")
-            implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
-            implementation("io.ktor:ktor-client-mock:$ktorVersion")
+            implementation("io.ktor:ktor-client-core:$ktorTestVersion")
+            implementation("io.ktor:ktor-client-content-negotiation:$ktorTestVersion")
+            implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorTestVersion")
+            implementation("io.ktor:ktor-client-mock:$ktorTestVersion")
         }
         jvmMain.dependencies {
             // Engine is compileOnly for the same reason core/content-negotiation
             // are: its own transitive dependency on ktor-client-core pinned the
             // version and upgraded downstream consumers (issue #1). Consumers
             // must add a Ktor JVM engine themselves (okhttp or any other).
-            compileOnly("io.ktor:ktor-client-okhttp:$ktorVersion")
+            compileOnly("io.ktor:ktor-client-okhttp:$ktorCompileVersion")
             implementation("org.slf4j:slf4j-simple:2.0.17")
         }
         jvmTest.dependencies {
@@ -98,26 +113,26 @@ kotlin {
             implementation("io.github.cdimascio:dotenv-kotlin:6.5.1")
             // Integration tests hit the real PikPak API and therefore need a
             // concrete engine on the runtime classpath.
-            implementation("io.ktor:ktor-client-okhttp:$ktorVersion")
+            implementation("io.ktor:ktor-client-okhttp:$ktorTestVersion")
         }
 
         // Android rides on the same OkHttp engine as JVM.
         androidMain.dependencies {
-            compileOnly("io.ktor:ktor-client-okhttp:$ktorVersion")
+            compileOnly("io.ktor:ktor-client-okhttp:$ktorCompileVersion")
         }
 
         // Apple targets share Ktor's Darwin engine.
         appleMain.dependencies {
-            compileOnly("io.ktor:ktor-client-darwin:$ktorVersion")
+            compileOnly("io.ktor:ktor-client-darwin:$ktorCompileVersion")
         }
         // Linux (x64 + arm64) and Windows native all ride on Ktor CIO.
         // linuxMain is auto-created by applyDefaultHierarchyTemplate() and
         // covers both linuxX64 and linuxArm64.
         val linuxMain by getting {
-            dependencies { compileOnly("io.ktor:ktor-client-cio:$ktorVersion") }
+            dependencies { compileOnly("io.ktor:ktor-client-cio:$ktorCompileVersion") }
         }
         val mingwX64Main by getting {
-            dependencies { compileOnly("io.ktor:ktor-client-cio:$ktorVersion") }
+            dependencies { compileOnly("io.ktor:ktor-client-cio:$ktorCompileVersion") }
         }
     }
 }
