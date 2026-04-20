@@ -62,9 +62,13 @@ kotlin {
             implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationVersion")
             implementation("org.jetbrains.kotlinx:kotlinx-io-core:$kotlinxIoVersion")
             implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.7.1")
-            implementation("io.ktor:ktor-client-core:$ktorVersion")
-            implementation("io.ktor:ktor-client-content-negotiation:$ktorVersion")
-            implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
+            // Ktor core APIs are compileOnly so the SDK does not force a specific
+            // Ktor version on consumers (see issue #1 — animeko's 3.1.1 was being
+            // upgraded to 3.4.2 transitively). Consumers must add their own Ktor
+            // client-core + content-negotiation + serialization-kotlinx-json.
+            compileOnly("io.ktor:ktor-client-core:$ktorVersion")
+            compileOnly("io.ktor:ktor-client-content-negotiation:$ktorVersion")
+            compileOnly("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
             implementation("org.kotlincrypto.hash:md:$kotlincryptoVersion")
             implementation("org.kotlincrypto.hash:sha1:$kotlincryptoVersion")
             implementation("org.kotlincrypto.hash:sha2:$kotlincryptoVersion")
@@ -73,6 +77,10 @@ kotlin {
         commonTest.dependencies {
             implementation(kotlin("test"))
             implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:$coroutinesVersion")
+            // Tests must materialise the Ktor classes the SDK declares compileOnly.
+            implementation("io.ktor:ktor-client-core:$ktorVersion")
+            implementation("io.ktor:ktor-client-content-negotiation:$ktorVersion")
+            implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
             implementation("io.ktor:ktor-client-mock:$ktorVersion")
         }
         jvmMain.dependencies {
