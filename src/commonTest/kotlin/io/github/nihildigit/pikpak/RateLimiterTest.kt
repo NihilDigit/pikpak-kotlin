@@ -70,13 +70,15 @@ class RateLimiterTest {
 
     @Test
     fun `concurrent waiters are staggered not thundering`() = runBlocking {
-        // 5 tokens preloaded, 10/s refill → each additional token ~100ms apart.
-        // 8 coroutines compete for 5+3 acquires. The 3 waiters must be
-        // staggered, not waking up simultaneously.
-        val limiter = RateLimiter(capacity = 5, refillPerSecond = 10.0)
+        // 3 tokens preloaded, 5/s refill → each additional token ~200ms apart.
+        // 6 coroutines compete for 3+3 acquires. The 3 waiters must trail each
+        // other by roughly the slot interval; a zero-gap batch would indicate
+        // a thundering herd. Keep the gap threshold well below the ideal slot
+        // (~200ms) so slow CI runners don't flake.
+        val limiter = RateLimiter(capacity = 3, refillPerSecond = 5.0)
         val start = TimeSource.Monotonic.markNow()
         val completionTimes = coroutineScope {
-            val deferreds = (1..8).map {
+            val deferreds = (1..6).map {
                 async {
                     limiter.acquire()
                     start.elapsedNow().inWholeMilliseconds
@@ -84,12 +86,10 @@ class RateLimiterTest {
             }
             deferreds.awaitAll()
         }
-        val waiterTimes = completionTimes.sorted().drop(5) // the 3 that had to wait
-        // Each waiter should trail the previous by at least ~50ms (half the
-        // 100ms slot). Zero-gap would indicate a thundering herd.
+        val waiterTimes = completionTimes.sorted().drop(3) // the 3 that had to wait
         val gaps = waiterTimes.zipWithNext { a, b -> b - a }
         for (gap in gaps) {
-            assertTrue(gap >= 50, "waiters should be staggered, saw gap=${gap}ms in $waiterTimes")
+            assertTrue(gap >= 80, "waiters should be staggered, saw gap=${gap}ms in $waiterTimes")
         }
     }
 
