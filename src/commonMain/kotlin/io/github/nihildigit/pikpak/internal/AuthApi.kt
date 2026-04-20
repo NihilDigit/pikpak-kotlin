@@ -36,6 +36,11 @@ private const val SESSION_EXPIRY_SKEW_SEC = 5L * 60L
  *  - [loginLocked] assumes the caller already holds [PikPakClient.mutex].
  *  - [refreshCaptchaToken] takes the mutex itself — it's called from inside
  *    `HttpEngine.request`, which never holds the mutex.
+ *
+ * Invariant: every request issued from inside [AuthApi] MUST go through
+ * [HttpEngine.requestRaw] (not `request`). The `request` path may trigger
+ * a captcha-refresh callback that re-enters this API, which would deadlock
+ * on the already-held mutex. `requestRaw` bypasses that callback.
  */
 internal class AuthApi(private val pikpak: PikPakClient) {
 
@@ -118,6 +123,9 @@ internal class AuthApi(private val pikpak: PikPakClient) {
                 put("client_version", PikPakConstants.CLIENT_VERSION)
                 put("timestamp", timestamp)
             }
+            // Byte-for-byte copy of the Go reference (52funny/pikpakcli/internal/api/captcha_token.go).
+            // PikPak's server does not validate this value — only that the field is present.
+            // Do NOT "fix" the missing `h`: matching the reference exactly is the safest posture.
             put("redirect_uri", "ttps://api.mypikpak.com/v1/auth/callback")
         }
         val url = "${PikPakConstants.USER_BASE}/v1/shield/captcha/init?client_id=${PikPakConstants.CLIENT_ID}"

@@ -5,7 +5,9 @@ import io.github.nihildigit.pikpak.PikPakClient
 import io.github.nihildigit.pikpak.PikPakConstants
 import io.github.nihildigit.pikpak.PikPakException
 import io.ktor.client.HttpClient
-import io.ktor.client.plugins.HttpRequestRetry
+import io.ktor.client.network.sockets.ConnectTimeoutException
+import io.ktor.client.network.sockets.SocketTimeoutException
+import io.ktor.client.plugins.HttpRequestTimeoutException
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.expectSuccess
 import io.ktor.client.request.HttpRequestBuilder
@@ -124,11 +126,19 @@ internal class HttpEngine(
     }
 
     private fun isRetryable(t: Throwable): Boolean {
-        val name = t::class.simpleName?.lowercase().orEmpty()
-        if ("timeout" in name || "connect" in name || "io" in name) return true
+        if (t is HttpRequestTimeoutException) return true
+        if (t is ConnectTimeoutException) return true
+        if (t is SocketTimeoutException) return true
+        if (t is kotlinx.io.IOException) return true
+        // Ktor's engine-layer I/O errors (CIO, OkHttp, Darwin) all extend
+        // java.io.IOException on JVM and kotlinx.io.IOException on native,
+        // but some engines also throw plain RuntimeException wrappers. Fall
+        // back to a message-level check for the canonical transient signals.
         val message = t.message?.lowercase().orEmpty()
-        return "reset" in message || "closed" in message || "broken" in message ||
-            "unexpected eof" in message || "timeout" in message
+        return "connection reset" in message ||
+            "connection closed" in message ||
+            "broken pipe" in message ||
+            "unexpected eof" in message
     }
 
     private fun HttpRequestBuilder.applyAuthHeaders() {
@@ -173,10 +183,10 @@ internal class HttpEngine(
                 // if your workload needs different bounds.
                 socketTimeoutMillis = 5L * 60 * 1000
             }
-            install(HttpRequestRetry) {
-                retryOnServerErrors(maxRetries = 2)
-                exponentialDelay()
-            }
+            // HttpRequestRetry is intentionally NOT installed. The SDK's own
+            // sendWithRetry loop (driven by RetryPolicy) already handles
+            // transient failures; stacking both plugins compounds backoff and
+            // multiplies attempt counts in surprising ways.
             expectSuccess = false
         }
     }
@@ -192,7 +202,11 @@ internal fun buildUrl(base: String, path: String, query: Map<String, String> = e
 
 private fun encode(s: String): String = buildString(s.length) {
     for (c in s) when {
-        c.isLetterOrDigit() || c == '-' || c == '_' || c == '.' || c == '~' -> append(c)
+        // RFC 3986 unreserved set. Must match ASCII only — Char.isLetterOrDigit
+        // returns true for Unicode letters on the JVM, which would leave
+        // non-ASCII characters unencoded and mis-transmit UTF-8 bytes.
+        c in '0'..'9' || c in 'a'..'z' || c in 'A'..'Z' ||
+            c == '-' || c == '_' || c == '.' || c == '~' -> append(c)
         else -> for (b in c.toString().encodeToByteArray()) append('%').append(hex(b))
     }
 }

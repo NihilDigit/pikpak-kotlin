@@ -11,6 +11,7 @@ suspend fun PikPakClient.getQuota(): QuotaResponse {
     val response = http.request(
         method = HttpMethod.Get,
         url = "$DRIVE/drive/v1/about",
+        captchaAction = "GET:/drive/v1/about",
     )
     return json.decodeFromJsonElement(QuotaResponse.serializer(), response)
 }
