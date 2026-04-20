@@ -84,32 +84,37 @@ kotlin {
             implementation("io.ktor:ktor-client-mock:$ktorVersion")
         }
         jvmMain.dependencies {
-            implementation("io.ktor:ktor-client-okhttp:$ktorVersion")
+            // Engine is compileOnly for the same reason core/content-negotiation
+            // are: its own transitive dependency on ktor-client-core pinned the
+            // version and upgraded downstream consumers (issue #1). Consumers
+            // must add a Ktor JVM engine themselves (okhttp or any other).
+            compileOnly("io.ktor:ktor-client-okhttp:$ktorVersion")
             implementation("org.slf4j:slf4j-simple:2.0.17")
         }
         jvmTest.dependencies {
             implementation(kotlin("test-junit5"))
             implementation("org.junit.jupiter:junit-jupiter:6.0.3")
             implementation("io.github.cdimascio:dotenv-kotlin:6.5.1")
+            // Integration tests hit the real PikPak API and therefore need a
+            // concrete engine on the runtime classpath.
+            implementation("io.ktor:ktor-client-okhttp:$ktorVersion")
         }
 
-        // Android rides on the same OkHttp engine as JVM. Ktor's okhttp
-        // artifact is pure-JVM and runs fine on Android's Dalvik/ART.
+        // Android rides on the same OkHttp engine as JVM.
         androidMain.dependencies {
-            implementation("io.ktor:ktor-client-okhttp:$ktorVersion")
+            compileOnly("io.ktor:ktor-client-okhttp:$ktorVersion")
         }
 
         // Apple targets share Ktor's Darwin engine.
         appleMain.dependencies {
-            implementation("io.ktor:ktor-client-darwin:$ktorVersion")
+            compileOnly("io.ktor:ktor-client-darwin:$ktorVersion")
         }
-        // Linux + Windows native ride on Ktor CIO — pure-Kotlin, no libcurl
-        // dependency at runtime.
+        // Linux + Windows native ride on Ktor CIO.
         val linuxX64Main by getting {
-            dependencies { implementation("io.ktor:ktor-client-cio:$ktorVersion") }
+            dependencies { compileOnly("io.ktor:ktor-client-cio:$ktorVersion") }
         }
         val mingwX64Main by getting {
-            dependencies { implementation("io.ktor:ktor-client-cio:$ktorVersion") }
+            dependencies { compileOnly("io.ktor:ktor-client-cio:$ktorVersion") }
         }
     }
 }

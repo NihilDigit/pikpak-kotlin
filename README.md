@@ -18,11 +18,20 @@ Small, atomic, well-typed surface over the PikPak HTTP API. The painful parts â€
 ```kotlin
 repositories { mavenCentral() }
 dependencies {
-    implementation("io.github.nihildigit:pikpak-kotlin:0.2.0")
+    implementation("io.github.nihildigit:pikpak-kotlin:0.4.1")
+
+    // Ktor is compileOnly in the SDK so it never upgrades the Ktor
+    // version you've already pinned. Declare the pieces the SDK uses plus
+    // an engine for your platform explicitly:
+    implementation("io.ktor:ktor-client-core:<your-ktor-version>")
+    implementation("io.ktor:ktor-client-content-negotiation:<your-ktor-version>")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:<your-ktor-version>")
+    // then one engine: ktor-client-okhttp (jvm/android), ktor-client-darwin
+    // (apple), ktor-client-cio (linux/mingw), or any other Ktor engine.
 }
 ```
 
-Gradle picks the right per-target artifact automatically based on your consumer build. No extra coordinates needed.
+Gradle picks the right per-target artifact automatically based on your consumer build. No extra coordinates needed beyond Ktor.
 
 ## Platforms
 
