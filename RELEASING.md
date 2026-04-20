@@ -1,6 +1,6 @@
 # Releasing pikpak-kotlin
 
-End-to-end workflow for cutting a new version onto Maven Central via GitHub Actions. The repo is wired so that **pushing a `v*.*.*` git tag** triggers `.github/workflows/release.yml`, which compiles every supported target on a macOS runner and publishes signed artifacts to the Sonatype Central Portal.
+End-to-end workflow for cutting a new version onto Maven Central via GitHub Actions. The repo is wired so that **pushing a `v*.*.*` git tag** triggers `.github/workflows/release.yml`, which fans out across a `strategy.matrix` (one cell per shipped target, each on the cheapest runner that can handle it — ubuntu-latest for JVM/Linux/Windows-cross-compile/Android, macos-latest for Apple targets) and then publishes signed artifacts to the Sonatype Central Portal once every cell passes.
 
 This document is one-time setup plus the per-release ritual.
 
@@ -66,7 +66,9 @@ git push origin main v0.2.0
 
 # 4. Watch the workflow at:
 #    https://github.com/NihilDigit/pikpak-kotlin/actions
-#    A successful run takes ~10 min on the macos-latest runner (mostly Kotlin/Native compile).
+#    A successful run takes ~9 min total: test matrix fans out in parallel
+#    (longest cell is iosSimulatorArm64Test ~4 min on macos-latest),
+#    then publish runs ~4 min on macos-latest.
 
 # 5. Bump back to a SNAPSHOT for ongoing dev.
 #    Edit build.gradle.kts: version = "0.2.1-SNAPSHOT"
