@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # Manual trigger for validating CI changes (action bumps, matrix edits, etc.)
+  # without cutting a real release. The `publish` job below is gated to tag
+  # pushes only, so workflow_dispatch runs the test matrix and stops there.
+  workflow_dispatch:
 
 # Philosophy: CI here is purely a release gate, not a per-commit quality check.
 # Dev-time testing happens locally; this workflow's job is to make sure every
@@ -53,6 +57,8 @@ jobs:
     # macOS runner so iOS/macOS targets can compile alongside JVM and Linux/Windows.
     runs-on: macos-latest
     needs: [test]
+    # Gate on a real tag push so workflow_dispatch runs never publish.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     # `contents: write` is what `gh release create` needs to publish the
     # auto-generated GitHub Release after Maven Central accepts the artifact.
     # Default GITHUB_TOKEN is read-only, hence the explicit grant.
