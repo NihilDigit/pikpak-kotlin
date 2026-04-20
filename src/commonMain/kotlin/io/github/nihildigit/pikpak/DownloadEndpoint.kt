@@ -43,6 +43,8 @@ suspend fun PikPakClient.download(fileId: String, dest: Path): Long {
  */
 suspend fun PikPakClient.downloadFromUrl(url: String, dest: Path, expectedSize: Long = -1L): Long {
     var attempt = 0
+    var restartCount = 0
+    val maxRestarts = retryPolicy.maxAttempts
     while (true) {
         val existing = SystemFileSystem.metadataOrNullSafe(dest)?.size ?: 0L
         if (expectedSize >= 0 && existing == expectedSize) return existing
@@ -56,6 +58,15 @@ suspend fun PikPakClient.downloadFromUrl(url: String, dest: Path, expectedSize: 
         when (outcome) {
             is DownloadOutcome.Done -> return outcome.totalBytes
             is DownloadOutcome.RestartFromZero -> {
+                // Cap restarts: a server that consistently ignores Range + sends
+                // an incomplete body would otherwise loop forever.
+                restartCount++
+                if (restartCount > maxRestarts) {
+                    throw PikPakException(
+                        errorCode = -1,
+                        errorMessage = "download restarted $restartCount times without progress",
+                    )
+                }
                 SystemFileSystem.delete(dest, mustExist = false)
                 attempt = 0
                 continue

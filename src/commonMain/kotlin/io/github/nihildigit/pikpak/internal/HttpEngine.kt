@@ -20,6 +20,7 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.contentType
+import io.ktor.http.isSuccess
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -85,7 +86,20 @@ internal class HttpEngine(
             configure()
         }
         val text = response.bodyAsText()
-        if (text.isBlank()) return JsonObject(emptyMap())
+        if (text.isBlank()) {
+            // Some PikPak endpoints (e.g. DELETE) legitimately return an empty
+            // 2xx body. A blank body on a non-2xx status is never OK — surface
+            // it as an exception instead of silently decoding to {} (which
+            // would look like a successful response with error_code=0).
+            if (!response.status.isSuccess()) {
+                throw PikPakException(
+                    errorCode = -1,
+                    errorMessage = "empty response body",
+                    httpStatus = response.status.value,
+                )
+            }
+            return JsonObject(emptyMap())
+        }
         return pikpak.json.parseToJsonElement(text)
     }
 

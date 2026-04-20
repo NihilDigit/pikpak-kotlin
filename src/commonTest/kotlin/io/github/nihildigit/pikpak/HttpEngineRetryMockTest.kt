@@ -66,6 +66,36 @@ class HttpEngineRetryMockTest {
     }
 
     @Test
+    fun `empty body on non-2xx throws PikPakException`() = runBlocking {
+        val client = clientWithAuth { _ ->
+            respond(
+                content = "",
+                status = HttpStatusCode.ServiceUnavailable,
+                headers = headersOf(),
+            )
+        }
+        val e = assertFailsWith<PikPakException> { client.listFiles(parentId = "root") }
+        assertTrue(e.httpStatus == 503, "expected httpStatus=503, got ${e.httpStatus}")
+        client.close()
+    }
+
+    @Test
+    fun `empty body on 2xx returned as empty envelope`() = runBlocking {
+        // Some PikPak endpoints return 200 with no body for DELETE-style ops.
+        // The library should decode that to an empty object, not throw.
+        val client = clientWithAuth { _ ->
+            respond(
+                content = "",
+                status = HttpStatusCode.OK,
+                headers = headersOf(),
+            )
+        }
+        // listFiles would fail decoding but deleteFile doesn't need a body at all.
+        client.deleteFile("FID")
+        client.close()
+    }
+
+    @Test
     fun `server error_code surfaces as PikPakException without retry`() = runBlocking {
         var filesHandlerCalls = 0
         val client = clientWithAuth { req ->

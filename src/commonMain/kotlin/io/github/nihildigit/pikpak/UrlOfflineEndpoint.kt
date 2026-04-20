@@ -44,12 +44,29 @@ data class TaskListResponse(
 )
 
 /**
- * Submits a remote URL to PikPak's cloud-download (offline download) queue.
- * The returned [OfflineTask] reflects the task's initial phase — typically
- * `PHASE_TYPE_RUNNING`. Pass `""` for [parentId] to drop the result into the
- * root drive.
+ * Outcome of [createUrlFile]. PikPak's `POST /drive/v1/files` with
+ * `UPLOAD_TYPE_URL` either enqueues a new offline task ([Queued]) or — in
+ * the rarer "this URL was already fetched by some user so we have it"
+ * path — returns a done signal with no task envelope ([InstantComplete]).
+ * Model the two branches explicitly so callers can't confuse a real task
+ * whose fields happen to be default-initialised with the no-task case.
  */
-suspend fun PikPakClient.createUrlFile(parentId: String, url: String): OfflineTask {
+sealed class CreateUrlResult {
+    /** PikPak accepted the URL and queued a task; poll [OfflineTask.id]. */
+    data class Queued(val task: OfflineTask) : CreateUrlResult()
+
+    /** PikPak recognized the URL as already-fetched and did not create a task. */
+    data object InstantComplete : CreateUrlResult()
+}
+
+/**
+ * Submits a remote URL to PikPak's cloud-download (offline download) queue.
+ * Returns [CreateUrlResult.Queued] when a task is created (the usual path;
+ * poll via [listOfflineTasks]) or [CreateUrlResult.InstantComplete] when
+ * PikPak recognized the URL and fulfilled it without a task. Pass `""`
+ * for [parentId] to drop the result into the root drive.
+ */
+suspend fun PikPakClient.createUrlFile(parentId: String, url: String): CreateUrlResult {
     val body = buildJsonObject {
         put("kind", FileKind.FILE)
         put("upload_type", "UPLOAD_TYPE_URL")
@@ -62,8 +79,9 @@ suspend fun PikPakClient.createUrlFile(parentId: String, url: String): OfflineTa
         captchaAction = "POST:/drive/v1/files",
     ) { jsonBody(json, body) }
     val taskNode = (response as JsonObject)["task"]?.jsonObject
-        ?: return OfflineTask() // some responses omit task on instant completion
-    return json.decodeFromJsonElement(OfflineTask.serializer(), taskNode)
+        ?: return CreateUrlResult.InstantComplete
+    val task = json.decodeFromJsonElement(OfflineTask.serializer(), taskNode)
+    return CreateUrlResult.Queued(task)
 }
 
 /**

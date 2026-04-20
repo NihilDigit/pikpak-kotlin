@@ -86,7 +86,10 @@ client.upload(parentId, sourcePath)           // GCID-hashed, instant-upload awa
                                               // OSS multipart with HMAC-SHA1 signing
 
 // Offline-download queue
-client.createUrlFile(parentId, "https://...") // submit a URL to the queue
+when (val r = client.createUrlFile(parentId, "https://...")) {
+    is CreateUrlResult.Queued           -> r.task.id          // poll via listOfflineTasks()
+    is CreateUrlResult.InstantComplete  -> { /* PikPak already had this URL */ }
+}
 client.listOfflineTasks()                     // inspect running/errored tasks
 
 client.logout()                               // forget cached tokens

@@ -48,37 +48,45 @@ class IntegrationOfflineDownloadTest {
             val ts = Clock.System.now().toEpochMilliseconds()
             parentId = client.createFolder(parentId = "", name = "pikpak-kotlin-offline-$ts")
 
-            val task = client.createUrlFile(parentId = parentId, url = magnet)
-            taskId = task.id.takeIf { it.isNotEmpty() }
-            fileId = task.fileId.takeIf { it.isNotEmpty() }
-            assertTrue(
-                taskId != null || fileId != null,
-                "createUrlFile should return either a task id or an immediate file id",
-            )
-            assertTrue(
-                task.phase != "PHASE_TYPE_ERROR",
-                "freshly-submitted task should not be in ERROR phase; got ${task.phase} / ${task.message}",
-            )
-
-            if (taskId != null) {
-                val deadline = Clock.System.now().toEpochMilliseconds() + 30_000L
-                var observed = task
-                while (Clock.System.now().toEpochMilliseconds() < deadline) {
-                    val listing = client.listOfflineTasks(
-                        phaseFilter = "PHASE_TYPE_RUNNING,PHASE_TYPE_ERROR,PHASE_TYPE_COMPLETE",
-                    )
-                    val hit = listing.tasks.firstOrNull { it.id == taskId }
-                    if (hit != null) {
-                        observed = hit
-                        fileId = hit.fileId.takeIf { it.isNotEmpty() } ?: fileId
-                        if (hit.phase == "PHASE_TYPE_COMPLETE" || hit.phase == "PHASE_TYPE_ERROR") break
-                    }
-                    delay(3.seconds)
+            when (val result = client.createUrlFile(parentId = parentId, url = magnet)) {
+                is CreateUrlResult.InstantComplete -> {
+                    // URL was already in PikPak's cache — no task, no file id from here.
+                    // Accept this as a valid outcome; polling adds nothing.
                 }
-                assertTrue(
-                    observed.phase != "PHASE_TYPE_ERROR",
-                    "observed task should not error during brief polling; message=${observed.message}",
-                )
+                is CreateUrlResult.Queued -> {
+                    val task = result.task
+                    taskId = task.id.takeIf { it.isNotEmpty() }
+                    fileId = task.fileId.takeIf { it.isNotEmpty() }
+                    assertTrue(
+                        taskId != null || fileId != null,
+                        "Queued result should carry a task id or an immediate file id",
+                    )
+                    assertTrue(
+                        task.phase != "PHASE_TYPE_ERROR",
+                        "freshly-submitted task should not be in ERROR phase; got ${task.phase} / ${task.message}",
+                    )
+
+                    if (taskId != null) {
+                        val deadline = Clock.System.now().toEpochMilliseconds() + 30_000L
+                        var observed = task
+                        while (Clock.System.now().toEpochMilliseconds() < deadline) {
+                            val listing = client.listOfflineTasks(
+                                phaseFilter = "PHASE_TYPE_RUNNING,PHASE_TYPE_ERROR,PHASE_TYPE_COMPLETE",
+                            )
+                            val hit = listing.tasks.firstOrNull { it.id == taskId }
+                            if (hit != null) {
+                                observed = hit
+                                fileId = hit.fileId.takeIf { it.isNotEmpty() } ?: fileId
+                                if (hit.phase == "PHASE_TYPE_COMPLETE" || hit.phase == "PHASE_TYPE_ERROR") break
+                            }
+                            delay(3.seconds)
+                        }
+                        assertTrue(
+                            observed.phase != "PHASE_TYPE_ERROR",
+                            "observed task should not error during brief polling; message=${observed.message}",
+                        )
+                    }
+                }
             }
         } finally {
             runCatching {

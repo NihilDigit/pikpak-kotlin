@@ -46,7 +46,7 @@ class RateLimiterTest {
 
     @Test
     fun `unlimited limiter never blocks`() = runBlocking {
-        val limiter = RateLimiter.Unlimited
+        val limiter = RateLimiter.unlimited()
         val start = TimeSource.Monotonic.markNow()
         repeat(1000) { limiter.acquire() }
         val elapsed = start.elapsedNow().inWholeMilliseconds
@@ -54,19 +54,42 @@ class RateLimiterTest {
     }
 
     @Test
-    fun `Default limiter is independent per access`() {
-        // Each construction is a fresh bucket — verifies Default isn't a singleton
+    fun `default factory creates independent buckets per call`() {
+        // Each construction is a fresh bucket — verifies default() isn't a singleton
         // (important for per-client rate budgets).
-        val a = RateLimiter.Default
-        val b = RateLimiter.Default
-        // Different instances: we can't compare directly without reflection, but
-        // the key behavioural invariant is that consuming one doesn't drain the other.
+        val a = RateLimiter.default()
+        val b = RateLimiter.default()
         runBlocking {
             repeat(5) { a.acquire() } // drains a
             val start = TimeSource.Monotonic.markNow()
             repeat(5) { b.acquire() } // b still has 5 preloaded
             val elapsed = start.elapsedNow().inWholeMilliseconds
             assertTrue(elapsed < 50, "b should not have been drained by a (elapsed=${elapsed}ms)")
+        }
+    }
+
+    @Test
+    fun `concurrent waiters are staggered not thundering`() = runBlocking {
+        // 5 tokens preloaded, 10/s refill → each additional token ~100ms apart.
+        // 8 coroutines compete for 5+3 acquires. The 3 waiters must be
+        // staggered, not waking up simultaneously.
+        val limiter = RateLimiter(capacity = 5, refillPerSecond = 10.0)
+        val start = TimeSource.Monotonic.markNow()
+        val completionTimes = coroutineScope {
+            val deferreds = (1..8).map {
+                async {
+                    limiter.acquire()
+                    start.elapsedNow().inWholeMilliseconds
+                }
+            }
+            deferreds.awaitAll()
+        }
+        val waiterTimes = completionTimes.sorted().drop(5) // the 3 that had to wait
+        // Each waiter should trail the previous by at least ~50ms (half the
+        // 100ms slot). Zero-gap would indicate a thundering herd.
+        val gaps = waiterTimes.zipWithNext { a, b -> b - a }
+        for (gap in gaps) {
+            assertTrue(gap >= 50, "waiters should be staggered, saw gap=${gap}ms in $waiterTimes")
         }
     }
 

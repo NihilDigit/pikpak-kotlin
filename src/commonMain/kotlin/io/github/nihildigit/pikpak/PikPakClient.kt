@@ -29,7 +29,7 @@ class PikPakClient(
     val account: String,
     password: String,
     val sessionStore: SessionStore = FileSessionStore(),
-    val rateLimiter: RateLimiter = RateLimiter.Default,
+    val rateLimiter: RateLimiter = RateLimiter.default(),
     val retryPolicy: RetryPolicy = RetryPolicy.Default,
     httpClient: HttpClient? = null,
 ) {
