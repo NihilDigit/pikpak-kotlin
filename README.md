@@ -18,7 +18,7 @@ Small, atomic, well-typed surface over the PikPak HTTP API. The painful parts â€
 ```kotlin
 repositories { mavenCentral() }
 dependencies {
-    implementation("io.github.nihildigit:pikpak-kotlin:0.4.1")
+    implementation("io.github.nihildigit:pikpak-kotlin:0.4.2")
 
     // Ktor is compileOnly in the SDK so it never upgrades the Ktor
     // version you've already pinned. Declare the pieces the SDK uses plus
@@ -35,18 +35,19 @@ Gradle picks the right per-target artifact automatically based on your consumer 
 
 ## Platforms
 
-Every shipped target is exercised on a real runner before each release. Tag push triggers `release.yml`, which runs platform tests in parallel and only publishes if all pass:
+Every shipped target is verified on a real runner before each release. Tag push triggers `release.yml`, which fans out across a platform matrix and only publishes if every cell passes. Runtime tests are run on targets that [Kotlin/Native's own tier table](https://kotlinlang.org/docs/native-target-support.html) also runs upstream; the rest only have to compile cleanly.
 
-| Target               | Release-gated runtime | HTTP engine |
+| Target               | Release-gated CI      | HTTP engine |
 | -------------------- | --------------------- | ----------- |
-| `jvm`                | ubuntu-latest         | OkHttp      |
+| `jvm`                | runtime test          | OkHttp      |
 | `android`            | compile-only          | OkHttp      |
-| `linuxX64`           | ubuntu-latest         | CIO         |
-| `mingwX64`           | windows-latest        | CIO         |
-| `macosArm64`         | macos-latest          | Darwin      |
+| `linuxX64`           | runtime test          | CIO         |
+| `linuxArm64`         | compile-only          | CIO         |
+| `mingwX64`           | compile-only          | CIO         |
+| `macosArm64`         | runtime test          | Darwin      |
+| `iosSimulatorArm64`  | runtime test          | Darwin      |
 | `iosArm64`           | compile-only          | Darwin      |
 | `iosX64`             | compile-only          | Darwin      |
-| `iosSimulatorArm64`  | compile-only          | Darwin      |
 
 `android` ships as an AAR with the `pikpak-kotlin-android` artifactId â€” KMP consumers declaring `androidTarget()` pick it up automatically via Gradle metadata. The Android-default session dir is best-effort; wire your own `FileSessionStore(dir = Path(context.filesDir.absolutePath, "pikpak-kotlin"))` if you care about a stable on-disk location.
 

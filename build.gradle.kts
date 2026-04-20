@@ -11,7 +11,7 @@ plugins {
 }
 
 group = "io.github.nihildigit"
-version = "0.4.1"
+version = "0.4.2"
 
 @OptIn(ExperimentalKotlinGradlePluginApi::class)
 kotlin {
@@ -43,6 +43,7 @@ kotlin {
 
     // Other native
     linuxX64()
+    linuxArm64()
     mingwX64()
 
     // Shared intermediate source sets so target-specific code only goes in
@@ -109,8 +110,10 @@ kotlin {
         appleMain.dependencies {
             compileOnly("io.ktor:ktor-client-darwin:$ktorVersion")
         }
-        // Linux + Windows native ride on Ktor CIO.
-        val linuxX64Main by getting {
+        // Linux (x64 + arm64) and Windows native all ride on Ktor CIO.
+        // linuxMain is auto-created by applyDefaultHierarchyTemplate() and
+        // covers both linuxX64 and linuxArm64.
+        val linuxMain by getting {
             dependencies { compileOnly("io.ktor:ktor-client-cio:$ktorVersion") }
         }
         val mingwX64Main by getting {

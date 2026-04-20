@@ -29,7 +29,11 @@ Public endpoints are `suspend` extension functions (`Endpoints.kt`, `FolderEndpo
 
 ### Shipped targets
 
-`jvm`, `linuxX64`, `mingwX64`, `iosX64`, `iosArm64`, `iosSimulatorArm64`, `macosArm64`. Each non-compile-only target is exercised on a real runner before release (see `.github/workflows/release.yml`). `linuxArm64` and `macosX64` were removed deliberately — add back only when a real user turns up.
+`jvm`, `android` (AAR, artifactId `pikpak-kotlin-android`), `linuxX64`, `linuxArm64`, `mingwX64`, `iosX64`, `iosArm64`, `iosSimulatorArm64`, `macosArm64`.
+
+Which targets get runtime-tested in CI follows [Kotlin/Native's tier table](https://kotlinlang.org/docs/native-target-support.html): we run `*Test` for targets whose "Running Tests" column is ✅ upstream (`jvm`, `linuxX64`, `macosArm64`, `iosSimulatorArm64`), and only `compileKotlin<Target>` for the rest (`android` via `:assembleAndroidMain`, `linuxArm64`, `mingwX64`, `iosArm64`, `iosX64`). When adding a target, pick the cell type by what upstream Kotlin itself runs — don't shoulder runtime validation the toolchain vendor won't commit to.
+
+`macosX64` is deliberately not shipped (deprecated upstream from Kotlin 2.3.20). Add a target back only when a real user turns up.
 
 ## Conventions
 
@@ -63,7 +67,7 @@ Live integration tests create/delete folders in the test account. `IntegrationUp
 
 ## CI philosophy
 
-CI here is a **release gate, not a per-commit quality check** — dev-time testing happens locally. `release.yml` triggers only on `v*.*.*` tag push; it runs platform tests in parallel and the `publish` job declares `needs:` on all of them so Maven Central never sees an artifact that hasn't been runtime-tested.
+CI here is a **release gate, not a per-commit quality check** — dev-time testing happens locally. `release.yml` triggers only on `v*.*.*` tag push; platform verification is a `strategy.matrix` over every shipped target (one cell per target, one Gradle task per cell), and `publish` declares `needs: [test]` so Maven Central never sees an artifact whose matrix cell didn't pass. When you add or remove a target, the matrix `include:` list is the single place to edit.
 
 There is intentionally no `ci.yml` on push/PR. If you find yourself adding one, raise it with the maintainer first.
 
