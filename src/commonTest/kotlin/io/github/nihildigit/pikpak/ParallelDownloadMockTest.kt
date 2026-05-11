@@ -85,7 +85,7 @@ class ParallelDownloadMockTest {
     // --- partCount=1 delegates to downloadFromUrl (no tmp files) ---
 
     @Test
-    fun `partCount=1 delegates to downloadFromUrl, no part files created`() = runBlocking {
+    fun `partCount=1 delegates to downloadFromUrl with no part files created`() = runBlocking {
         val body = ByteArray(100) { it.toByte() }
         var requestCount = 0
 
@@ -280,7 +280,9 @@ class ParallelDownloadMockTest {
         val client = clientWithAuth { req ->
             val rangeHeader = req.headers[HttpHeaders.Range] ?: error("no Range header")
             val (start, end) = parseRangeHeader(rangeHeader)
-            synchronized(capturedRanges) { capturedRanges += Pair(start, end) }
+            // MockEngine handlers run on a single dispatcher; no cross-thread mutation
+            // happens in this test, so a plain mutation is safe and KMP-portable.
+            capturedRanges += Pair(start, end)
             val length = (end - start + 1).toInt()
             val slice = body.copyOfRange(start.toInt(), start.toInt() + length)
             respond(
