@@ -52,6 +52,7 @@ JDK 21 required. Gradle 8.11 wrapper included. No separate lint step — `ktlint
 ./gradlew build                                 # compile + full test suite
 ./gradlew jvmTest                               # JVM unit + live integration (needs .env)
 ./gradlew linuxX64Test                          # native runtime: gcid + captcha mock
+./gradlew compileTestKotlinLinuxX64             # native commonTest compile only — fastest pre-push KMP check
 ./gradlew assemble -Pkotlin.native.ignoreDisabledTargets=true   # every target buildable on this host
 ./gradlew publishToMavenLocal                   # verify publish wiring (no creds needed)
 
@@ -87,4 +88,6 @@ GPG key + Sonatype Central Portal namespace + GitHub repo secrets are already co
 - Don't introduce a dependency without checking it ships a klib for every target we support.
 - Don't expand the CI matrix on push/PR.
 - Don't add `@Volatile` from `kotlin.jvm` — use `kotlin.concurrent.Volatile` (KMP-safe).
+- Don't use JVM-only APIs in `commonMain` or `commonTest` — `kotlin.synchronized`, `java.util.concurrent.*`, `Thread.*`, `AtomicLong` from `j.u.c.atomic`, etc. JVM tests will pass; the release matrix's native cells (`linuxX64`, `macosArm64`, `iosSimulatorArm64`) fail at `compileTestKotlin<Target>`. Use `kotlinx.coroutines.sync.Mutex` for cross-coroutine sync, atomicfu for atomics, or move the test to `jvmTest` if JVM-specific.
+- Don't put `,` (and likely other punctuation beyond `=`, `-`, space) in backtick-quoted test names. Kotlin/JVM accepts anything between backticks, but Kotlin/Native rejects `,` — same failure mode as the previous bullet, surfaces at native commonTest compile time only.
 - Don't vendor the `pikpakcli/` Go reference into git; it's in `.gitignore` intentionally and linked from the README.
