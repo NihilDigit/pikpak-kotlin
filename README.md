@@ -101,10 +101,26 @@ when (val r = client.createUrlFile(parentId, "https://...")) {
     is CreateUrlResult.InstantComplete  -> { /* PikPak already had this URL */ }
 }
 client.listOfflineTasks()                     // inspect running/errored tasks
+client.getTask(taskId)                        // one task, without pulling the table
 
 client.logout()                               // forget cached tokens
 client.close()                                // close internal HTTP client
 ```
+
+### Random access
+
+`RangeReader` serves arbitrary byte ranges from one remote file, which is what playback needs and what a download call cannot give. It keeps concurrency inside the 8 connections a signed PikPak URL accepts, hands a contended slot to the highest-priority read, refreshes the URL when its signature expires, waits out a 503 instead of failing, and resumes from the last delivered byte when a body stops early. Nothing is cached — piece scheduling and disk layout stay with the caller.
+
+```kotlin
+val reader = client.rangeReader(fileId)       // refreshes its own URL via getFile
+reader.read(start = 0, length = 1 shl 20, priority = 10) { channel ->
+    // channel is live: the bytes have not been buffered anywhere
+}
+reader.stats.value                            // active reads, bytes, refreshes, throttles
+reader.close()
+```
+
+Construct `RangeReader` directly with your own `urlProvider` when the URL comes from somewhere other than `getFile`. `parallelDownloadFromUrl` is a thin wrapper over the same machinery.
 
 `SessionStore` defaults to a JSON file at `~/.config/pikpak-kotlin/session_<md5(account)>.json` on JVM. Provide your own (`InMemorySessionStore`, an Android-Context-aware one, etc.) by passing `sessionStore = ...` to the client.
 
