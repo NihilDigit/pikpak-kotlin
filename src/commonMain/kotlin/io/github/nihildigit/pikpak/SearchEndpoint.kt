@@ -52,7 +52,7 @@ private suspend fun PikPakClient.listTrashPaged(
     pageToken: String,
 ): FileListPage {
     val query = mutableMapOf(
-        "thumbnail_size" to "SIZE_MEDIUM",
+        "thumbnail_size" to THUMBNAIL_SIZE,
         "limit" to pageSize.toString(),
         "with_audit" to "false",
         "filters" to """{"trashed":{"eq":true}}""",

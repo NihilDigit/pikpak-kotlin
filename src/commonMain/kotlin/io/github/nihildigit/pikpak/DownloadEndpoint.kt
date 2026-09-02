@@ -105,8 +105,8 @@ private suspend fun PikPakClient.tryDownloadOnce(
             method = HttpMethod.Get,
             url = url,
             configure = {
-                header(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
-                if (offset > 0) header(HttpHeaders.Range, "bytes=$offset-")
+                headers[HttpHeaders.UserAgent] = PikPakConstants.USER_AGENT
+                if (offset > 0) headers[HttpHeaders.Range] = "bytes=$offset-"
             },
         ) { response ->
             val status = response.status

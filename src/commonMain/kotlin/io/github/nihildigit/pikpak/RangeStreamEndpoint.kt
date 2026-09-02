@@ -17,22 +17,23 @@ import io.ktor.utils.io.ByteReadChannel
  * open-ended range costs no memory until you read it. Once the block returns,
  * the connection is released and [channel] is dead. Do not let it escape.
  *
- * Field semantics:
+ * Field semantics — every size is null when the server did not say, rather
+ * than a sentinel that reads as a real number in arithmetic:
  *  - [channel]: the response body. Yields exactly [contentLength] bytes.
  *  - [contentLength]: byte count of THIS range, not the underlying file.
- *  - [totalSize]: size of the full remote file in bytes, parsed from the
- *    `Content-Range: bytes X-Y/TOTAL` response header. `-1` if the server
- *    omitted Content-Range or returned a non-numeric total ("*").
- *  - [rangeStart] / [rangeEndInclusive]: the actual range the server says it
- *    sent (X-Y from Content-Range). Differs from what the caller asked for
- *    when the request range extended past EOF. Both `-1` if no Content-Range.
+ *  - [totalSize]: size of the full remote file, from
+ *    `Content-Range: bytes X-Y/TOTAL`. Null when Content-Range was absent or
+ *    the total was "*".
+ *  - [rangeStart] / [rangeEndInclusive]: the range the server says it actually
+ *    sent. Differs from what the caller asked for when the request extended
+ *    past EOF. Null when there was no Content-Range.
  */
 data class RangeStream(
     val channel: ByteReadChannel,
-    val contentLength: Long,
-    val totalSize: Long,
-    val rangeStart: Long,
-    val rangeEndInclusive: Long,
+    val contentLength: Long?,
+    val totalSize: Long?,
+    val rangeStart: Long?,
+    val rangeEndInclusive: Long?,
 )
 
 /**
@@ -107,8 +108,10 @@ public suspend fun <T> PikPakClient.streamRangeFromUrl(
         method = HttpMethod.Get,
         url = url,
         configure = {
-            header(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
-            header(HttpHeaders.Range, rangeHeader)
+            // set, not append: an injected client that already carries a
+            // User-Agent would otherwise send two of them.
+            headers[HttpHeaders.UserAgent] = PikPakConstants.USER_AGENT
+            headers[HttpHeaders.Range] = rangeHeader
             configure()
         },
     ) { response ->
@@ -135,48 +138,45 @@ public suspend fun <T> PikPakClient.streamRangeFromUrl(
                 )
         }
 
-        // Parse Content-Range: bytes X-Y/TOTAL  (TOTAL may be *)
         val parsed = parseContentRange(response.headers[HttpHeaders.ContentRange])
-        val parsedStart = parsed.first
-        val parsedEnd = parsed.second
-        val parsedTotal = parsed.third
-
-        val rawContentLength = response.headers[HttpHeaders.ContentLength]?.toLongOrNull()
-        val contentLength: Long = when {
-            rawContentLength != null && rawContentLength >= 0L -> rawContentLength
-            parsedStart >= 0L && parsedEnd >= 0L -> parsedEnd - parsedStart + 1L
-            else -> -1L
-        }
+        val rawContentLength = response.headers[HttpHeaders.ContentLength]?.toLongOrNull()?.takeIf { it >= 0L }
+        val derivedLength = parsed?.let { it.endInclusive - it.start + 1L }
 
         block(
             RangeStream(
                 channel = response.bodyAsChannel(),
-                contentLength = contentLength,
-                totalSize = parsedTotal,
-                rangeStart = parsedStart,
-                rangeEndInclusive = parsedEnd,
+                contentLength = rawContentLength ?: derivedLength,
+                totalSize = parsed?.totalSize,
+                rangeStart = parsed?.start,
+                rangeEndInclusive = parsed?.endInclusive,
             ),
         )
     }
 }
 
+/** What a `Content-Range` header says. A Triple of Longs said none of this. */
+private data class ContentRange(
+    val start: Long,
+    val endInclusive: Long,
+    /** Null when the server sent "*" — it knows the range but not the file's length. */
+    val totalSize: Long?,
+)
+
 /**
- * Parses a Content-Range header of the form "bytes X-Y/TOTAL" or "bytes X-Y/ *" (star total).
- * Returns a triple of (rangeStart, rangeEndInclusive, totalSize).
- * Any field that cannot be parsed is returned as -1.
+ * Parses `bytes X-Y/TOTAL` or `bytes X-Y/ *`. Null when the header is absent
+ * or malformed; an unparseable header is not a range we can reason about.
  */
-private fun parseContentRange(header: String?): Triple<Long, Long, Long> {
-    if (header == null) return Triple(-1L, -1L, -1L)
-    // Expected format: "bytes 100-149/10000" or "bytes 0-99/*"
+private fun parseContentRange(header: String?): ContentRange? {
+    if (header == null) return null
     val withoutPrefix = header.removePrefix("bytes ").trim()
     val slashIndex = withoutPrefix.indexOf('/')
-    if (slashIndex < 0) return Triple(-1L, -1L, -1L)
+    if (slashIndex < 0) return null
     val rangePart = withoutPrefix.substring(0, slashIndex)
     val totalPart = withoutPrefix.substring(slashIndex + 1)
     val dashIndex = rangePart.indexOf('-')
-    if (dashIndex < 0) return Triple(-1L, -1L, -1L)
-    val rangeStart = rangePart.substring(0, dashIndex).toLongOrNull() ?: return Triple(-1L, -1L, -1L)
-    val rangeEnd = rangePart.substring(dashIndex + 1).toLongOrNull() ?: return Triple(-1L, -1L, -1L)
-    val total = if (totalPart == "*") -1L else totalPart.toLongOrNull() ?: return Triple(-1L, -1L, -1L)
-    return Triple(rangeStart, rangeEnd, total)
+    if (dashIndex < 0) return null
+    val start = rangePart.substring(0, dashIndex).toLongOrNull() ?: return null
+    val end = rangePart.substring(dashIndex + 1).toLongOrNull() ?: return null
+    val total = if (totalPart == "*") null else totalPart.toLongOrNull() ?: return null
+    return ContentRange(start, end, total)
 }

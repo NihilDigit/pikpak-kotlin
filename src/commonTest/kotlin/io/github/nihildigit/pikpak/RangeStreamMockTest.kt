@@ -153,7 +153,7 @@ class RangeStreamMockTest {
     // --- Content-Range missing ---
 
     @Test
-    fun `missing Content-Range returns negative sentinel fields`() = runBlocking {
+    fun `missing Content-Range leaves the range fields null`() = runBlocking {
         val body = ByteArray(50) { it.toByte() }
 
         val client = clientWithCdnHandler { _ ->
@@ -165,9 +165,9 @@ class RangeStreamMockTest {
         }
 
         client.streamRangeFromUrl("https://cdn/file", start = 0L, length = 50L) { stream ->
-            assertEquals(-1L, stream.totalSize)
-            assertEquals(-1L, stream.rangeStart)
-            assertEquals(-1L, stream.rangeEndInclusive)
+            assertEquals(null, stream.totalSize)
+            assertEquals(null, stream.rangeStart)
+            assertEquals(null, stream.rangeEndInclusive)
             // contentLength comes from Content-Length header
             assertEquals(50L, stream.contentLength)
         }
@@ -177,7 +177,7 @@ class RangeStreamMockTest {
     // --- Content-Range with * total ---
 
     @Test
-    fun `Content-Range with star total sets totalSize to -1 but preserves rangeStart and End`() = runBlocking {
+    fun `Content-Range with star total nulls totalSize but preserves rangeStart and End`() = runBlocking {
         val body = ByteArray(100) { it.toByte() }
 
         val client = clientWithCdnHandler { _ ->
@@ -192,7 +192,7 @@ class RangeStreamMockTest {
         }
 
         client.streamRangeFromUrl("https://cdn/file", start = 0L, length = 100L) { stream ->
-            assertEquals(-1L, stream.totalSize)
+            assertEquals(null, stream.totalSize)
             assertEquals(0L, stream.rangeStart)
             assertEquals(99L, stream.rangeEndInclusive)
             assertEquals(100L, stream.contentLength)

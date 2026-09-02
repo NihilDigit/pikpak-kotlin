@@ -216,7 +216,7 @@ suspend fun PikPakClient.rename(fileId: String, newName: String) {
 suspend fun PikPakClient.getFile(fileId: String): FileDetail {
     val response = http.request(
         method = HttpMethod.Get,
-        url = buildUrl(DRIVE, "$FILES_PATH/$fileId", mapOf("thumbnail_size" to "SIZE_MEDIUM")),
+        url = buildUrl(DRIVE, "$FILES_PATH/$fileId", mapOf("thumbnail_size" to THUMBNAIL_SIZE)),
         captchaAction = "GET:/drive/v1/files",
     )
     return json.decodeFromJsonElement(FileDetail.serializer(), response)

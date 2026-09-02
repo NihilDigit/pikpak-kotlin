@@ -244,10 +244,12 @@ private suspend fun <T> PikPakClient.ossRequest(
 
 private fun HttpRequestBuilder.applyOssHeaders(date: String, securityToken: String, authorization: String) {
     headers {
-        append(HttpHeaders.UserAgent, OSS_USER_AGENT)
-        append(HttpHeaders.Date, date)
-        append("X-Oss-Security-Token", securityToken)
-        append(HttpHeaders.Authorization, authorization)
+        // set, not append: the OSS signature covers exactly one value per
+        // header, and an injected client's own User-Agent would break it.
+        set(HttpHeaders.UserAgent, OSS_USER_AGENT)
+        set(HttpHeaders.Date, date)
+        set("X-Oss-Security-Token", securityToken)
+        set(HttpHeaders.Authorization, authorization)
     }
     contentType(ContentType.parse(OSS_CONTENT_TYPE))
 }

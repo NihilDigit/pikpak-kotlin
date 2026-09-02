@@ -226,7 +226,7 @@ class RangeReader(
         while (remaining == null || remaining > 0) {
             val attemptUrl = currentUrl()
             var delivered = 0L
-            var announced = -1L
+            var announced: Long? = null
 
             try {
                 client.streamRangeFromUrl(attemptUrl, offset, remaining) { stream ->
@@ -279,7 +279,7 @@ class RangeReader(
             remaining = remaining?.minus(delivered)
             addBytes(delivered)
 
-            val truncated = announced >= 0 && delivered < announced
+            val truncated = announced != null && delivered < announced!!
             if (!truncated) {
                 // An open-ended read is done when the server's own
                 // Content-Length has been delivered in full.

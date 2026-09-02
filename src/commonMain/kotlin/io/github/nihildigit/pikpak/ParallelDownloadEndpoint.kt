@@ -84,7 +84,7 @@ public suspend fun PikPakClient.parallelDownloadFromUrl(
     val totalSize: Long = if (expectedSize >= 0L) {
         expectedSize
     } else {
-        val probed = streamRangeFromUrl(url, start = 0L, length = 1L) { it.totalSize }
+        val probed = streamRangeFromUrl(url, start = 0L, length = 1L) { it.totalSize } ?: -1L
         if (probed <= 0L) {
             throw PikPakException(
                 -1,

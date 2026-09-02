@@ -11,6 +11,14 @@ private const val DRIVE = PikPakConstants.DRIVE_BASE
 private const val FILES_PATH = "/drive/v1/files"
 
 /**
+ * Thumbnail variant asked for on every listing. SIZE_SMALL rather than
+ * SIZE_MEDIUM: the SDK never decodes a thumbnail, and a 500-entry page carries
+ * one signed thumbnail URL per row either way. The parameter cannot simply be
+ * dropped — PikPak then picks its own default.
+ */
+internal const val THUMBNAIL_SIZE = "SIZE_SMALL"
+
+/**
  * Server-side filter fragments for [listFiles] and [listFilesPaged].
  *
  * PikPak's `filters` query parameter is a JSON object of
@@ -90,7 +98,7 @@ suspend fun PikPakClient.listFilesPaged(
         for ((field, expr) in extraFilters) put(field, expr)
     }
     val query = mutableMapOf(
-        "thumbnail_size" to "SIZE_MEDIUM",
+        "thumbnail_size" to THUMBNAIL_SIZE,
         "limit" to pageSize.toString(),
         "parent_id" to parentId,
         "with_audit" to "false",
