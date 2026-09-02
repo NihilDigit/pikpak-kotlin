@@ -27,6 +27,7 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -66,10 +67,25 @@ internal class HttpEngine(
         configure: HttpRequestBuilder.() -> Unit = {},
     ): JsonElement {
         var captchaRetried = false
+        var reauthRetried = false
         while (true) {
-            val element = requestRaw(method, url) {
-                applyAuthHeaders()
-                configure()
+            val sessionUsed = pikpak.state.session
+            val element = try {
+                requestRaw(method, url) {
+                    applyAuthHeaders()
+                    configure()
+                }
+            } catch (e: PikPakException) {
+                // The access token has not reached its own expiry or we would
+                // not have sent it, so the server disagreeing is the only
+                // signal available. Re-auth once; a second 401 is a real
+                // authorization failure and belongs to the caller.
+                if (e.httpStatus == 401 && !reauthRetried) {
+                    reauthRetried = true
+                    pikpak.mutex.withLock { pikpak.auth.reauthenticateLocked(sessionUsed) }
+                    continue
+                }
+                throw e
             }
             val errorCode = element.tryGetErrorCode()
             if (errorCode == ErrorCodes.OK) return element

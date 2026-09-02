@@ -75,7 +75,7 @@ internal class AuthApi(private val pikpak: PikPakClient) {
             put("client_secret", PikPakConstants.CLIENT_SECRET)
             put("grant_type", "password")
             put("username", pikpak.account)
-            put("password", pikpak.state.password)
+            put("password", pikpak.state.passwordSupplier())
             put("captcha_token", captcha)
         }
         val response = pikpak.http.requestRaw(
@@ -110,7 +110,45 @@ internal class AuthApi(private val pikpak: PikPakClient) {
         return session
     }
 
-    suspend fun refreshCaptchaToken(action: String) = pikpak.mutex.withLock {
+    /**
+     * Re-authenticates after the server rejected a token it had previously
+     * issued (HTTP 401). Distinct from [loginLocked], which trusts a session
+     * that has not reached its own expiry — exactly the session the server just
+     * refused.
+     *
+     * [previous] is the session the failing request used. If another coroutine
+     * already replaced it while this one waited for the lock, that replacement
+     * is the re-auth we wanted and no second round trip happens.
+     */
+    suspend fun reauthenticateLocked(previous: Session?): Session {
+        val current = pikpak.state.session
+        if (current != null && current.accessToken.isNotEmpty() && current.accessToken != previous?.accessToken) {
+            return current
+        }
+        val refreshToken = current?.refreshToken.orEmpty()
+        if (refreshToken.isNotEmpty()) {
+            try {
+                return refreshAccessTokenLocked(refreshToken)
+            } catch (_: PikPakException) {
+                // fall through to full signin
+            }
+        }
+        return signInLocked()
+    }
+
+    suspend fun refreshCaptchaToken(action: String) {
+        // Snapshot before queuing for the lock. N coroutines that all hit
+        // error_code=9 on the same stale token would otherwise each issue a
+        // captcha/init; whoever gets the lock first refreshes, and the rest
+        // find the token already changed and reuse it.
+        val stale = pikpak.state.captchaToken
+        pikpak.mutex.withLock {
+            if (pikpak.state.captchaToken != stale) return
+            refreshCaptchaTokenLocked(action)
+        }
+    }
+
+    private suspend fun refreshCaptchaTokenLocked(action: String) {
         val sub = pikpak.state.session?.sub.orEmpty()
         val timestamp = Clock.System.now().toEpochMilliseconds().toString()
         val signRaw = PikPakConstants.CLIENT_ID +
@@ -169,7 +207,12 @@ internal class AuthApi(private val pikpak: PikPakClient) {
 
     private suspend fun commitSession(session: Session) {
         pikpak.state.session = session
-        runCatching { pikpak.sessionStore.save(pikpak.account, session) }
+        // A store failure used to be swallowed. The refresh token then existed
+        // only in this process, and the next cold start silently fell back to a
+        // plaintext password sign-in — with no signal that persistence had
+        // stopped working. The in-memory session stays valid either way, so the
+        // caller can catch this and carry on if it genuinely does not care.
+        pikpak.sessionStore.save(pikpak.account, session)
     }
 
     private fun isExpired(session: Session): Boolean {

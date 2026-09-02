@@ -46,6 +46,14 @@ class RateLimiter(
                 // Reserve a slot after whichever is later: "now" or the last
                 // reserved slot. Each reservation advances nextReleaseAt by
                 // one refill interval, serialising concurrent waiters.
+                //
+                // The reservation spends its token now, going negative if it
+                // has to. Without this, refill() kept crediting a bucket that
+                // nobody had debited, so every reserved slot was paid for twice
+                // and the observed rate ran at up to double the configured one
+                // — with a caller arriving later able to take a free token
+                // ahead of an already-queued waiter.
+                tokens -= 1.0
                 val interval = (1000.0 / refillPerSecond).toLong().coerceAtLeast(1).milliseconds
                 val base = if (nextReleaseAt < now) now else nextReleaseAt
                 val myReleaseAt = base + interval

@@ -12,6 +12,21 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 
 /**
+ * Values PikPak uses for [OfflineTask.phase] and [FileDetail.phase]. Exported
+ * because polling a task means comparing against them, and a caller that has
+ * to spell the strings itself gets no compiler help when one is mistyped.
+ */
+object TaskPhase {
+    const val PENDING = "PHASE_TYPE_PENDING"
+    const val RUNNING = "PHASE_TYPE_RUNNING"
+    const val COMPLETE = "PHASE_TYPE_COMPLETE"
+    const val ERROR = "PHASE_TYPE_ERROR"
+
+    /** The two phases a task never leaves. */
+    val TERMINAL: Set<String> = setOf(COMPLETE, ERROR)
+}
+
+/**
  * Snapshot of an offline-download task. PikPak surfaces the same shape from both
  * the URL submission endpoint (`POST /drive/v1/files` with `UPLOAD_TYPE_URL`) and
  * the task listing endpoint (`GET /drive/v1/tasks`), so this model is unified.
@@ -95,7 +110,7 @@ suspend fun PikPakClient.createUrlFile(parentId: String, url: String): CreateUrl
  * list, a side-effect file landing in the drive, etc.).
  */
 suspend fun PikPakClient.listOfflineTasks(
-    phaseFilter: String = "PHASE_TYPE_RUNNING,PHASE_TYPE_ERROR",
+    phaseFilter: String = "${TaskPhase.RUNNING},${TaskPhase.ERROR}",
     limit: Int = 10_000,
     pageToken: String? = null,
 ): TaskListResponse {

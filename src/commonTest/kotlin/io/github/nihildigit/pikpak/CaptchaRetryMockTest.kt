@@ -7,6 +7,9 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import io.ktor.utils.io.ByteReadChannel
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -97,6 +100,77 @@ class CaptchaRetryMockTest {
 
             val signinCalls = callLog.count { it.endsWith("/v1/auth/signin") }
             assertEquals(1, signinCalls, "we must NOT fall back to a fresh signin on captcha-9")
+        } finally {
+            client.close()
+        }
+    }
+
+    /**
+     * Two coroutines hold the same stale captcha token and both get
+     * error_code=9. Only one captcha/init may go out: the refresh is keyed on
+     * the token, not on the request that tripped over it, so N concurrent
+     * callers used to mean N handshakes and N of them racing to overwrite each
+     * other's token.
+     *
+     * Both requests are parked in the mock engine until the second one arrives,
+     * which is what guarantees they read the same stale token before either
+     * takes the lock.
+     */
+    @Test
+    fun `concurrent error_code 9 triggers a single captcha init`() = runBlocking {
+        val firstArrived = CompletableDeferred<Unit>()
+        val bothArrived = CompletableDeferred<Unit>()
+        val log = mutableListOf<String>()
+
+        val engine = MockEngine { request ->
+            val path = request.url.encodedPath
+            log += "${request.method.value} $path"
+            val captchaInitCount = log.count { it.endsWith("/v1/shield/captcha/init") }
+            when {
+                path.endsWith("/v1/shield/captcha/init") -> json(
+                    """{"captcha_token":"CAPTCHA-$captchaInitCount","expires_in":300,"url":""}""",
+                )
+                path.endsWith("/v1/auth/signin") -> json(
+                    """{"access_token":"AT-1","refresh_token":"RT-1","sub":"USER","expires_in":3600}""",
+                )
+                path.endsWith("/drive/v1/about") -> {
+                    val token = request.headers["X-Captcha-Token"]
+                    if (token == "CAPTCHA-1") {
+                        if (firstArrived.isCompleted) bothArrived.complete(Unit) else {
+                            firstArrived.complete(Unit)
+                            bothArrived.await()
+                        }
+                        json("""{"error_code":9,"error":"captcha_required"}""")
+                    } else {
+                        json("""{"kind":"drive#about","quota":{"limit":"10","usage":"1"}}""")
+                    }
+                }
+                else -> respond(
+                    content = "",
+                    status = HttpStatusCode.NotFound,
+                    headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                )
+            }
+        }
+
+        val client = PikPakClient(
+            account = "mock@example.com",
+            password = "mock-password",
+            sessionStore = InMemorySessionStore(),
+            httpClient = HttpClient(engine),
+        )
+        try {
+            client.login()
+            assertEquals("CAPTCHA-1", client.state.captchaToken)
+
+            val results = listOf(async { client.getQuota() }, async { client.getQuota() }).awaitAll()
+            assertTrue(results.all { it.quota.limitBytes == 10L }, "both callers must get the retried response")
+
+            assertEquals(
+                2, log.count { it.endsWith("/v1/shield/captcha/init") },
+                "one init at signin plus one shared refresh — not one refresh per coroutine",
+            )
+            assertEquals("CAPTCHA-2", client.state.captchaToken)
         } finally {
             client.close()
         }

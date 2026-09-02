@@ -91,7 +91,7 @@ suspend fun PikPakClient.upload(parentId: String, source: Path): UploadResult {
     val phase = fileNode["phase"]?.jsonPrimitive?.contentOrNull.orEmpty()
     val fileId = fileNode["id"]?.jsonPrimitive?.contentOrNull.orEmpty()
 
-    if (phase == "PHASE_TYPE_COMPLETE") {
+    if (phase == TaskPhase.COMPLETE) {
         return UploadResult(fileId = fileId, instantUpload = true, bytesUploaded = 0L)
     }
 
