@@ -8,20 +8,13 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.utils.io.ByteReadChannel
 
 /**
- * A bounded byte-range over a remote file, returned by [streamRangeFromUrl].
+ * A bounded byte-range over a remote file, handed to the block passed to
+ * [streamRangeFromUrl].
  *
- * Lifecycle: this is a thin value type. The underlying HTTP connection lives
- * for as long as [channel] is open. Callers MUST either fully consume [channel]
- * or call [ByteReadChannel.cancel] on it — leaking the channel leaks the
- * connection. The recommended pattern is to copy/process the channel inside a
- * try/finally that cancels on the way out:
- *
- *     val stream = client.streamRangeFromUrl(url, start = 0, length = 1 shl 20)
- *     try {
- *         stream.channel.copyTo(sink)
- *     } finally {
- *         stream.channel.cancel()
- *     }
+ * Lifecycle: valid only for the duration of that block. [channel] is a live
+ * connection, not a buffer — the bytes have not been read yet, so a large or
+ * open-ended range costs no memory until you read it. Once the block returns,
+ * the connection is released and [channel] is dead. Do not let it escape.
  *
  * Field semantics:
  *  - [channel]: the response body. Yields exactly [contentLength] bytes.
@@ -47,6 +40,10 @@ data class RangeStream(
  * of PikPak's MPEG-TS transcoded variants (one transcode URL serves the whole
  * media; `Range: bytes=start-end` slices any segment of it, server returns 206).
  *
+ * For sustained playback-style reads against one file prefer [RangeReader],
+ * which adds a connection budget, priority scheduling and automatic URL
+ * refresh on top of this call.
+ *
  * Request shape:
  *  - [length] null   → `Range: bytes=$start-` (open-ended, server returns from
  *    [start] to EOF). Use when the caller wants "from here to the end".
@@ -55,11 +52,10 @@ data class RangeStream(
  *
  * Pipeline reuse:
  *  - Goes through `PikPakClient.http.sendRaw`, so transport-level retries
- *    (5xx, 429, transient I/O) follow the configured [RetryPolicy].
- *  - Does NOT add PikPak's `Authorization` / `X-Device-Id` / `Accept` headers.
- *    The URL is expected to be a signed CDN/transcode link, which rejects them
- *    (this is the same constraint as [downloadFromUrl]).
- *  - Goes through the client's [rateLimiter] like every other outbound call.
+ *    (5xx, 429, transient I/O) follow the configured [RetryPolicy], and the
+ *    request does NOT consume a rate-limiter token.
+ *  - Does NOT add PikPak's `Authorization` / `X-Device-Id` headers. The URL is
+ *    expected to be a signed CDN/transcode link, which rejects them.
  *
  * Failure modes — throws [PikPakException] on:
  *  - `start < 0`, or `length != null && length <= 0` (caller bug — fail fast,
@@ -72,24 +68,23 @@ data class RangeStream(
  *    PikPakException carries httpStatus = 416 so callers can match.
  *  - Any other non-2xx after sendRaw's retry budget is exhausted.
  *
- * URL lifecycle: NOT handled. If the signed URL has expired (401/403), this
- * throws and the caller is expected to re-fetch a fresh URL via [getFile] and
- * retry. Built-in refresh would hide the URL lifecycle from callers and break
- * the atomic-SDK contract; deliberately omitted.
+ * URL lifecycle: an expired signature (401/403) surfaces as
+ * [UrlExpiredException]. This function does not refresh it — re-fetch via
+ * [getFile] and retry, or use [RangeReader] which does exactly that.
  *
  * @param url    a signed PikPak CDN URL — typically from [FileDetail.downloadUrl]
  *               or [MediaVariant.url].
  * @param start  starting byte offset, inclusive. Must be `>= 0`.
  * @param length number of bytes to fetch, or null for "from [start] to EOF".
  *               Must be `>= 1` when non-null.
- * @return a [RangeStream] whose channel MUST be consumed or cancelled by the
- *         caller (see [RangeStream] kdoc for the lifecycle contract).
+ * @param block  receives the live range. Everything you need must be read here.
  */
-public suspend fun PikPakClient.streamRangeFromUrl(
+public suspend fun <T> PikPakClient.streamRangeFromUrl(
     url: String,
     start: Long,
     length: Long? = null,
-): RangeStream {
+    block: suspend (RangeStream) -> T,
+): T {
     if (start < 0) throw PikPakException(-1, "streamRangeFromUrl: start must be >= 0, got $start")
     if (length != null && length <= 0) {
         throw PikPakException(-1, "streamRangeFromUrl: length must be >= 1 when non-null, got $length")
@@ -101,55 +96,60 @@ public suspend fun PikPakClient.streamRangeFromUrl(
         "bytes=$start-${start + length - 1}"
     }
 
-    val response = http.sendRaw(HttpMethod.Get, url) {
-        header(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
-        header(HttpHeaders.Range, rangeHeader)
+    return http.sendRaw(
+        method = HttpMethod.Get,
+        url = url,
+        configure = {
+            header(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
+            header(HttpHeaders.Range, rangeHeader)
+        },
+    ) { response ->
+        val status = response.status
+        when {
+            status == HttpStatusCode.OK ->
+                throw PikPakException(
+                    -1,
+                    "streamRangeFromUrl: server returned 200 instead of 206 — Range header was ignored, " +
+                        "streaming the full file would violate the range contract",
+                    httpStatus = 200,
+                )
+            status == HttpStatusCode.RequestedRangeNotSatisfiable ->
+                throw PikPakException(
+                    -1,
+                    "streamRangeFromUrl: server returned 416 Range Not Satisfiable (start=$start may exceed file size)",
+                    httpStatus = 416,
+                )
+            status != HttpStatusCode.PartialContent ->
+                throw PikPakException(
+                    -1,
+                    "streamRangeFromUrl: unexpected HTTP status ${status.value}",
+                    httpStatus = status.value,
+                )
+        }
+
+        // Parse Content-Range: bytes X-Y/TOTAL  (TOTAL may be *)
+        val parsed = parseContentRange(response.headers[HttpHeaders.ContentRange])
+        val parsedStart = parsed.first
+        val parsedEnd = parsed.second
+        val parsedTotal = parsed.third
+
+        val rawContentLength = response.headers[HttpHeaders.ContentLength]?.toLongOrNull()
+        val contentLength: Long = when {
+            rawContentLength != null && rawContentLength >= 0L -> rawContentLength
+            parsedStart >= 0L && parsedEnd >= 0L -> parsedEnd - parsedStart + 1L
+            else -> -1L
+        }
+
+        block(
+            RangeStream(
+                channel = response.bodyAsChannel(),
+                contentLength = contentLength,
+                totalSize = parsedTotal,
+                rangeStart = parsedStart,
+                rangeEndInclusive = parsedEnd,
+            ),
+        )
     }
-
-    val status = response.status
-    when {
-        status == HttpStatusCode.OK ->
-            throw PikPakException(
-                -1,
-                "streamRangeFromUrl: server returned 200 instead of 206 — Range header was ignored, " +
-                    "streaming the full file would violate the range contract",
-                httpStatus = 200,
-            )
-        status == HttpStatusCode.RequestedRangeNotSatisfiable ->
-            throw PikPakException(
-                -1,
-                "streamRangeFromUrl: server returned 416 Range Not Satisfiable (start=$start may exceed file size)",
-                httpStatus = 416,
-            )
-        status != HttpStatusCode.PartialContent ->
-            throw PikPakException(
-                -1,
-                "streamRangeFromUrl: unexpected HTTP status ${status.value}",
-                httpStatus = status.value,
-            )
-    }
-
-    // Parse Content-Range: bytes X-Y/TOTAL  (TOTAL may be *)
-    val contentRangeHeader = response.headers[HttpHeaders.ContentRange]
-    val parsed = parseContentRange(contentRangeHeader)
-    val parsedStart = parsed.first
-    val parsedEnd = parsed.second
-    val parsedTotal = parsed.third
-
-    val rawContentLength = response.headers[HttpHeaders.ContentLength]?.toLongOrNull()
-    val contentLength: Long = when {
-        rawContentLength != null && rawContentLength >= 0L -> rawContentLength
-        parsedStart >= 0L && parsedEnd >= 0L -> parsedEnd - parsedStart + 1L
-        else -> -1L
-    }
-
-    return RangeStream(
-        channel = response.bodyAsChannel(),
-        contentLength = contentLength,
-        totalSize = parsedTotal,
-        rangeStart = parsedStart,
-        rangeEndInclusive = parsedEnd,
-    )
 }
 
 /**

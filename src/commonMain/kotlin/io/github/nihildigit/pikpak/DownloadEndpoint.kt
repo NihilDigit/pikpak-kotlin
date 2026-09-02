@@ -7,6 +7,7 @@ import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.readAvailable
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.io.buffered
 import kotlinx.io.files.FileMetadata
@@ -57,6 +58,7 @@ suspend fun PikPakClient.downloadFromUrl(url: String, dest: Path, expectedSize: 
         val outcome = tryDownloadOnce(url, dest, offset, expectedSize)
         when (outcome) {
             is DownloadOutcome.Done -> return outcome.totalBytes
+            is DownloadOutcome.Fatal -> throw outcome.cause
             is DownloadOutcome.RestartFromZero -> {
                 // Cap restarts: a server that consistently ignores Range + sends
                 // an incomplete body would otherwise loop forever.
@@ -84,6 +86,9 @@ private sealed interface DownloadOutcome {
     data class Done(val totalBytes: Long) : DownloadOutcome
     data object RestartFromZero : DownloadOutcome
     data class Retry(val cause: Throwable) : DownloadOutcome
+
+    /** Not worth another attempt — surfaced to the caller as-is. */
+    data class Fatal(val cause: Throwable) : DownloadOutcome
 }
 
 private suspend fun PikPakClient.tryDownloadOnce(
@@ -92,43 +97,45 @@ private suspend fun PikPakClient.tryDownloadOnce(
     offset: Long,
     expectedSize: Long,
 ): DownloadOutcome {
-    val response = try {
-        http.sendRaw(HttpMethod.Get, url) {
-            header(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
-            if (offset > 0) header(HttpHeaders.Range, "bytes=$offset-")
-        }
-    } catch (t: Throwable) {
-        return DownloadOutcome.Retry(t)
-    }
-
-    val status = response.status
-    return when {
-        offset > 0 && status == HttpStatusCode.RequestedRangeNotSatisfiable -> {
-            if (expectedSize >= 0 && offset == expectedSize) DownloadOutcome.Done(expectedSize)
-            else DownloadOutcome.RestartFromZero
-        }
-        offset > 0 && status == HttpStatusCode.OK -> DownloadOutcome.RestartFromZero
-        offset > 0 && status != HttpStatusCode.PartialContent -> {
-            if (status.value >= 500 || status.value == 429) DownloadOutcome.Retry(
-                PikPakException(-1, "download HTTP ${status.value}", httpStatus = status.value),
-            ) else throw PikPakException(-1, "download HTTP ${status.value}", httpStatus = status.value)
-        }
-        offset == 0L && status != HttpStatusCode.OK -> {
-            if (status.value >= 500 || status.value == 429) DownloadOutcome.Retry(
-                PikPakException(-1, "download HTTP ${status.value}", httpStatus = status.value),
-            ) else throw PikPakException(-1, "download HTTP ${status.value}", httpStatus = status.value)
-        }
-        else -> {
-            try {
-                val written = streamBody(response.bodyAsChannel(), dest, append = offset > 0)
-                val total = offset + written
-                if (expectedSize >= 0 && total != expectedSize) {
-                    DownloadOutcome.Retry(PikPakException(-1, "download incomplete: got $total of $expectedSize"))
-                } else DownloadOutcome.Done(total)
-            } catch (t: Throwable) {
-                DownloadOutcome.Retry(t)
+    return try {
+        http.sendRaw(
+            method = HttpMethod.Get,
+            url = url,
+            configure = {
+                header(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
+                if (offset > 0) header(HttpHeaders.Range, "bytes=$offset-")
+            },
+        ) { response ->
+            val status = response.status
+            when {
+                offset > 0 && status == HttpStatusCode.RequestedRangeNotSatisfiable -> {
+                    if (expectedSize >= 0 && offset == expectedSize) DownloadOutcome.Done(expectedSize)
+                    else DownloadOutcome.RestartFromZero
+                }
+                offset > 0 && status == HttpStatusCode.OK -> DownloadOutcome.RestartFromZero
+                (offset > 0 && status != HttpStatusCode.PartialContent) ||
+                    (offset == 0L && status != HttpStatusCode.OK) -> {
+                    val e = PikPakException(-1, "download HTTP ${status.value}", httpStatus = status.value)
+                    if (status.value >= 500 || status.value == 429) DownloadOutcome.Retry(e)
+                    else DownloadOutcome.Fatal(e)
+                }
+                else -> {
+                    val written = streamBody(response.bodyAsChannel(), dest, append = offset > 0)
+                    val total = offset + written
+                    if (expectedSize >= 0 && total != expectedSize) {
+                        DownloadOutcome.Retry(PikPakException(-1, "download incomplete: got $total of $expectedSize"))
+                    } else DownloadOutcome.Done(total)
+                }
             }
         }
+    } catch (t: Throwable) {
+        // Cancellation means the caller walked away; wrapping it in Retry would
+        // silently resume a download nobody is waiting for.
+        if (t is CancellationException) throw t
+        // An expired signature cannot be retried with the same URL — only a
+        // fresh getFile() helps, and that is the caller's decision.
+        if (t is UrlExpiredException) throw t
+        DownloadOutcome.Retry(t)
     }
 }
 

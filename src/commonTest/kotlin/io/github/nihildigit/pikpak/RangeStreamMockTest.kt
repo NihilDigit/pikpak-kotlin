@@ -10,7 +10,6 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.readAvailable
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -39,18 +38,18 @@ class RangeStreamMockTest {
             )
         }
 
-        val stream = client.streamRangeFromUrl("https://cdn/file", start = 100L, length = 50L)
-        assertEquals(50L, stream.contentLength)
-        assertEquals(10000L, stream.totalSize)
-        assertEquals(100L, stream.rangeStart)
-        assertEquals(149L, stream.rangeEndInclusive)
+        client.streamRangeFromUrl("https://cdn/file", start = 100L, length = 50L) { stream ->
+            assertEquals(50L, stream.contentLength)
+            assertEquals(10000L, stream.totalSize)
+            assertEquals(100L, stream.rangeStart)
+            assertEquals(149L, stream.rangeEndInclusive)
 
-        // Verify channel bytes
-        val received = ByteArray(50)
-        val n = stream.channel.readAvailable(received, 0, 50)
-        assertEquals(50, n)
-        assertEquals(body.toList(), received.toList())
-        stream.channel.cancel(CancellationException("test done"))
+            // Verify channel bytes
+            val received = ByteArray(50)
+            val n = stream.channel.readAvailable(received, 0, 50)
+            assertEquals(50, n)
+            assertEquals(body.toList(), received.toList())
+        }
 
         assertEquals(1, requestCount)
         client.close()
@@ -75,9 +74,8 @@ class RangeStreamMockTest {
             )
         }
 
-        val stream = client.streamRangeFromUrl("https://cdn/file", start = 100L, length = null)
+        client.streamRangeFromUrl("https://cdn/file", start = 100L, length = null) { }
         assertEquals("bytes=100-", capturedRange)
-        stream.channel.cancel(CancellationException("test done"))
         client.close()
     }
 
@@ -93,7 +91,7 @@ class RangeStreamMockTest {
         }
 
         assertFailsWith<PikPakException> {
-            client.streamRangeFromUrl("https://cdn/file", start = 100L, length = 50L)
+            client.streamRangeFromUrl("https://cdn/file", start = 100L, length = 50L) { }
         }
         client.close()
     }
@@ -110,7 +108,7 @@ class RangeStreamMockTest {
         }
 
         val ex = assertFailsWith<PikPakException> {
-            client.streamRangeFromUrl("https://cdn/file", start = 99999L, length = 1L)
+            client.streamRangeFromUrl("https://cdn/file", start = 99999L, length = 1L) { }
         }
         assertEquals(416, ex.httpStatus)
         client.close()
@@ -128,7 +126,7 @@ class RangeStreamMockTest {
         }
 
         assertFailsWith<PikPakException> {
-            client.streamRangeFromUrl("https://cdn/file", start = -1L, length = 50L)
+            client.streamRangeFromUrl("https://cdn/file", start = -1L, length = 50L) { }
         }
         assertEquals(false, httpInvoked, "HTTP must not be called for invalid start")
         client.close()
@@ -146,7 +144,7 @@ class RangeStreamMockTest {
         }
 
         assertFailsWith<PikPakException> {
-            client.streamRangeFromUrl("https://cdn/file", start = 0L, length = 0L)
+            client.streamRangeFromUrl("https://cdn/file", start = 0L, length = 0L) { }
         }
         assertEquals(false, httpInvoked, "HTTP must not be called for invalid length")
         client.close()
@@ -166,13 +164,13 @@ class RangeStreamMockTest {
             )
         }
 
-        val stream = client.streamRangeFromUrl("https://cdn/file", start = 0L, length = 50L)
-        assertEquals(-1L, stream.totalSize)
-        assertEquals(-1L, stream.rangeStart)
-        assertEquals(-1L, stream.rangeEndInclusive)
-        // contentLength comes from Content-Length header
-        assertEquals(50L, stream.contentLength)
-        stream.channel.cancel(CancellationException("test done"))
+        client.streamRangeFromUrl("https://cdn/file", start = 0L, length = 50L) { stream ->
+            assertEquals(-1L, stream.totalSize)
+            assertEquals(-1L, stream.rangeStart)
+            assertEquals(-1L, stream.rangeEndInclusive)
+            // contentLength comes from Content-Length header
+            assertEquals(50L, stream.contentLength)
+        }
         client.close()
     }
 
@@ -193,12 +191,12 @@ class RangeStreamMockTest {
             )
         }
 
-        val stream = client.streamRangeFromUrl("https://cdn/file", start = 0L, length = 100L)
-        assertEquals(-1L, stream.totalSize)
-        assertEquals(0L, stream.rangeStart)
-        assertEquals(99L, stream.rangeEndInclusive)
-        assertEquals(100L, stream.contentLength)
-        stream.channel.cancel(CancellationException("test done"))
+        client.streamRangeFromUrl("https://cdn/file", start = 0L, length = 100L) { stream ->
+            assertEquals(-1L, stream.totalSize)
+            assertEquals(0L, stream.rangeStart)
+            assertEquals(99L, stream.rangeEndInclusive)
+            assertEquals(100L, stream.contentLength)
+        }
         client.close()
     }
 

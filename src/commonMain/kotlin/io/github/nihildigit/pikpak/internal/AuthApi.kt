@@ -45,9 +45,20 @@ private const val SESSION_EXPIRY_SKEW_SEC = 5L * 60L
 internal class AuthApi(private val pikpak: PikPakClient) {
 
     suspend fun loginLocked(): Session {
+        // A live in-memory session outranks anything the store can return: it
+        // is at least as fresh, and consulting the store first made the cost of
+        // every login() call a function of the store implementation's quality.
+        pikpak.state.session?.let { if (isUsable(it)) return it }
+
         pikpak.sessionStore.load(pikpak.account)?.let { cached ->
-            pikpak.state.session = cached
-            if (!isExpired(cached)) return cached
+            // Only publish the cached session once it is known good. Publishing
+            // first left state.session holding an unusable token whenever the
+            // refresh below threw something other than PikPakException, and
+            // every subsequent request went out with that token.
+            if (isUsable(cached)) {
+                pikpak.state.session = cached
+                return cached
+            }
             try {
                 return refreshAccessTokenLocked(cached.refreshToken)
             } catch (_: PikPakException) {
@@ -165,6 +176,15 @@ internal class AuthApi(private val pikpak: PikPakClient) {
         val now = Clock.System.now().epochSeconds
         return session.expiresAt <= now
     }
+
+    /**
+     * A session is only worth reusing if it can actually authorize a request.
+     * SessionStore implementations that hand back a placeholder carrying just a
+     * refresh token report a blank access token, and `Authorization: Bearer `
+     * fails every call until something forces a re-login.
+     */
+    private fun isUsable(session: Session): Boolean =
+        session.accessToken.isNotEmpty() && !isExpired(session)
 
     private fun JsonElement.toSession(): Session {
         val obj = jsonObject

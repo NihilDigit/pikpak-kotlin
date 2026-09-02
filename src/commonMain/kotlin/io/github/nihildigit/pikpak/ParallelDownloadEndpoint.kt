@@ -1,7 +1,6 @@
 package io.github.nihildigit.pikpak
 
 import io.ktor.utils.io.readAvailable
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -89,16 +88,15 @@ public suspend fun PikPakClient.parallelDownloadFromUrl(
         expectedSize
     } else {
         // 1-byte probe to read totalSize from Content-Range header
-        val probe = streamRangeFromUrl(url, start = 0L, length = 1L)
-        probe.channel.cancel(CancellationException("probe complete"))
-        if (probe.totalSize <= 0L) {
+        val probed = streamRangeFromUrl(url, start = 0L, length = 1L) { it.totalSize }
+        if (probed <= 0L) {
             throw PikPakException(
                 -1,
                 "parallelDownloadFromUrl: probe did not return a parseable Content-Range total " +
-                    "(got totalSize=${probe.totalSize}); server may have returned \"*\" or omitted Content-Range",
+                    "(got totalSize=$probed); server may have returned \"*\" or omitted Content-Range",
             )
         }
-        probe.totalSize
+        probed
     }
 
     // Build part ranges and tmp paths
@@ -161,8 +159,7 @@ private suspend fun PikPakClient.fetchPartToTmp(
     length: Long,
     tmpPath: Path,
 ) {
-    val stream = streamRangeFromUrl(url, start, length)
-    try {
+    streamRangeFromUrl(url, start, length) { stream ->
         val written = writeChannelToPath(stream.channel, tmpPath)
         if (written != length) {
             throw PikPakException(
@@ -170,8 +167,6 @@ private suspend fun PikPakClient.fetchPartToTmp(
                 "parallelDownloadFromUrl: part at offset $start got $written bytes, expected $length (truncated response)",
             )
         }
-    } finally {
-        stream.channel.cancel(CancellationException("part fetch complete"))
     }
 }
 

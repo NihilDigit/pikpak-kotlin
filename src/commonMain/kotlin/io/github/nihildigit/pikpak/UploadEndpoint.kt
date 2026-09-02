@@ -14,6 +14,7 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.contentType
 import io.ktor.http.headersOf
+import io.ktor.http.isSuccess
 import kotlin.time.Clock
 import kotlinx.io.buffered
 import kotlinx.io.files.Path
@@ -123,12 +124,11 @@ private data class OssParams(
 private data class UploadedPart(val partNumber: Int, val eTag: String)
 
 private suspend fun PikPakClient.ossInitiate(oss: OssParams): String {
-    val response = ossRequest(
+    val xml = ossRequest(
         method = HttpMethod.Post,
         oss = oss,
         rawQuery = "uploads",
-    )
-    val xml = response.bodyAsText()
+    ) { it.bodyAsText() }
     return Regex("<UploadId>(.+?)</UploadId>").find(xml)?.groupValues?.get(1)
         ?: throw PikPakException(-1, "upload: OSS InitiateMultipartUpload missing UploadId\n$xml")
 }
@@ -164,13 +164,13 @@ private suspend fun PikPakClient.ossUploadPart(
     partNumber: Int,
     body: ByteArray,
 ): String {
-    val response = ossRequest(
+    val raw = ossRequest(
         method = HttpMethod.Put,
         oss = oss,
         rawQuery = "partNumber=$partNumber&uploadId=$uploadId",
         body = body,
-    )
-    val raw = response.headers[HttpHeaders.ETag] ?: throw PikPakException(-1, "upload: part $partNumber missing ETag")
+    ) { it.headers[HttpHeaders.ETag] }
+        ?: throw PikPakException(-1, "upload: part $partNumber missing ETag")
     return raw.trim('"')
 }
 
@@ -191,15 +191,22 @@ private suspend fun PikPakClient.ossComplete(
         oss = oss,
         rawQuery = "uploadId=$uploadId",
         body = xml.encodeToByteArray(),
-    )
+    ) { }
 }
 
-private suspend fun PikPakClient.ossRequest(
+/**
+ * One signed OSS exchange. Verifies the status before handing the live
+ * response to [block]: OSS answers an expired STS token with a 403 whose body
+ * is an XML error document, and a caller that only reads a header off it
+ * (ETag, say) would see "success with a missing header".
+ */
+private suspend fun <T> PikPakClient.ossRequest(
     method: HttpMethod,
     oss: OssParams,
     rawQuery: String,
     body: ByteArray? = null,
-): HttpResponse {
+    block: suspend (HttpResponse) -> T,
+): T {
     val date = Clock.System.now().formatHttpDate()
     val ossHeaders = headersOf("X-Oss-Security-Token", oss.securityToken)
     val ossPath = "/${oss.key}"
@@ -215,9 +222,23 @@ private suspend fun PikPakClient.ossRequest(
         accessKeySecret = oss.accessKeySecret,
     )
     val url = "https://${oss.endpoint}$ossPath?$rawQuery"
-    return http.sendRaw(method, url) {
-        applyOssHeaders(date, oss.securityToken, auth)
-        if (body != null) setBody(body)
+    return http.sendRaw(
+        method = method,
+        url = url,
+        configure = {
+            applyOssHeaders(date, oss.securityToken, auth)
+            if (body != null) setBody(body)
+        },
+    ) { response ->
+        if (!response.status.isSuccess()) {
+            throw PikPakException(
+                errorCode = -1,
+                errorMessage = "OSS ${method.value} $rawQuery failed with HTTP ${response.status.value}",
+                httpStatus = response.status.value,
+                rawBody = response.bodyAsText(),
+            )
+        }
+        block(response)
     }
 }
 

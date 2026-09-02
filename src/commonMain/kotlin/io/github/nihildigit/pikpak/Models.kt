@@ -1,5 +1,6 @@
 package io.github.nihildigit.pikpak
 
+import kotlin.time.Instant
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -42,8 +43,52 @@ internal data class FileListPage(
 data class DownloadLink(
     val url: String = "",
     val token: String = "",
+    /** Raw `expire` field as PikPak sends it. Prefer [expiresAt]. */
     val expire: String = "",
-)
+) {
+    /**
+     * When the signature on [url] stops being accepted, or null when PikPak
+     * gave nothing parseable. Past this moment the CDN answers 403 with an
+     * empty body, which the SDK surfaces as [UrlExpiredException].
+     *
+     * Three encodings have been observed in the wild for the same field, so
+     * all three are accepted: RFC 3339, epoch seconds, epoch milliseconds. If
+     * the field is absent the `expire` query parameter on [url] is used, which
+     * is what the CDN actually signs.
+     */
+    val expiresAt: Instant?
+        get() = parseExpiry(expire) ?: parseExpiry(url.queryParam("expire"))
+}
+
+private fun parseExpiry(raw: String?): Instant? {
+    val value = raw?.trim().orEmpty()
+    if (value.isEmpty()) return null
+    val numeric = value.toLongOrNull()
+    if (numeric != null) {
+        // Anything past this magnitude cannot be seconds — 10^12 seconds is
+        // the year 33658, while 10^12 milliseconds is 2001.
+        return if (numeric >= 1_000_000_000_000L) {
+            Instant.fromEpochMilliseconds(numeric)
+        } else {
+            Instant.fromEpochSeconds(numeric)
+        }
+    }
+    return try {
+        Instant.parse(value)
+    } catch (_: IllegalArgumentException) {
+        null
+    }
+}
+
+private fun String.queryParam(name: String): String? {
+    val q = substringAfter('?', "")
+    if (q.isEmpty()) return null
+    for (pair in q.split('&')) {
+        val eq = pair.indexOf('=')
+        if (eq > 0 && pair.substring(0, eq) == name) return pair.substring(eq + 1)
+    }
+    return null
+}
 
 /**
  * Per-track media metadata for a [MediaVariant]. Populated for video files;

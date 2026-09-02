@@ -117,20 +117,24 @@ class MediaExploreTest {
                 }
 
                 runCatching {
-                    val resp = client.http.sendRaw(HttpMethod.Get, url) {
-                        header(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
-                        // Force a tiny response so we never accidentally start streaming
-                        // hundreds of MB. 2KB is plenty to see a m3u8 header or ts packets.
-                        header(HttpHeaders.Range, "bytes=0-2047")
+                    val firstChunk = client.http.sendRaw(
+                        method = HttpMethod.Get,
+                        url = url,
+                        configure = {
+                            header(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
+                            // Force a tiny response so we never accidentally start streaming
+                            // hundreds of MB. 2KB is plenty to see a m3u8 header or ts packets.
+                            header(HttpHeaders.Range, "bytes=0-2047")
+                        },
+                    ) { resp ->
+                        val ct = resp.headers[HttpHeaders.ContentType]
+                        val cl = resp.headers[HttpHeaders.ContentLength]
+                        val ar = resp.headers[HttpHeaders.AcceptRanges]
+                        val cr = resp.headers[HttpHeaders.ContentRange]
+                        println("       status=${resp.status.value}  content-type=$ct  content-length=$cl")
+                        println("       accept-ranges=$ar  content-range=$cr")
+                        resp.bodyAsChannel().readRemaining(800).readByteArray()
                     }
-                    val ct = resp.headers[HttpHeaders.ContentType]
-                    val cl = resp.headers[HttpHeaders.ContentLength]
-                    val ar = resp.headers[HttpHeaders.AcceptRanges]
-                    val cr = resp.headers[HttpHeaders.ContentRange]
-                    println("       status=${resp.status.value}  content-type=$ct  content-length=$cl")
-                    println("       accept-ranges=$ar  content-range=$cr")
-
-                    val firstChunk = resp.bodyAsChannel().readRemaining(800).readByteArray()
                     val asText = firstChunk.decodeToString().takeWhile { it.code < 0x80 || it == '\n' }
                     val looksTextual = firstChunk.take(64).all { it == 0x09.toByte() || it == 0x0A.toByte() || it == 0x0D.toByte() || it >= 0x20 }
                     if (looksTextual) {
