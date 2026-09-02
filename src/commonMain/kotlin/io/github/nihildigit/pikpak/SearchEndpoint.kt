@@ -8,14 +8,18 @@ private const val FILES_PATH = "/drive/v1/files"
 
 /**
  * Substring search (case-insensitive) over entry names under [parentId]. Scope
- * is one folder deep — PikPak's server-side `filters` API only supports `eq`,
- * so substring matching is done client-side after paginating the listing. For
- * recursive searches, call this per-folder and merge.
+ * is one folder deep, and the matching is client-side after paginating the
+ * listing: PikPak has no name search on this endpoint at all — `name` as a
+ * filter field answers 404, and `q` / `search_text` are accepted and ignored.
+ * For recursive searches, call this per-folder and merge.
  *
  * @param keyword substring to match. Empty string is rejected.
  * @param parentId folder whose direct children to search. `""` (default) is
  *   the root drive.
- * @param includeTrashed include entries currently in the trash.
+ * @param includeTrashed also match entries in the trash whose original parent
+ *   was [parentId]. The trash listing is account-wide, so it is filtered back
+ *   down to [parentId] here — otherwise a search scoped to one folder returned
+ *   deleted files from anywhere in the drive.
  */
 suspend fun PikPakClient.searchFiles(
     keyword: String,
@@ -23,7 +27,8 @@ suspend fun PikPakClient.searchFiles(
     includeTrashed: Boolean = false,
 ): List<FileStat> {
     require(keyword.isNotEmpty()) { "keyword must not be empty" }
-    val pool = if (includeTrashed) listFiles(parentId) + listTrash() else listFiles(parentId)
+    val live = listFiles(parentId)
+    val pool = if (includeTrashed) live + listTrash().filter { it.parentId == parentId } else live
     return pool.filter { it.name.contains(keyword, ignoreCase = true) }
 }
 

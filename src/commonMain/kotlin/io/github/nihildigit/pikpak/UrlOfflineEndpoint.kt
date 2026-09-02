@@ -70,8 +70,23 @@ sealed class CreateUrlResult {
     /** PikPak accepted the URL and queued a task; poll [OfflineTask.id]. */
     data class Queued(val task: OfflineTask) : CreateUrlResult()
 
-    /** PikPak recognized the URL as already-fetched and did not create a task. */
-    data object InstantComplete : CreateUrlResult()
+    /**
+     * PikPak recognized the URL as already-fetched and did not create a task.
+     *
+     * The full response body is kept in [raw] because this branch is rare
+     * enough that its shape is not pinned down. Probing on 2026-09-02 could
+     * not reproduce it: submitting a magnet PikPak had already fetched for
+     * this account, twice in a row, produced a fresh `task` node both times.
+     * What is known is the shape of the *other* branch, which carries
+     * `upload_type`, `url` = `{"kind":"upload#url"}` and `task`; the
+     * no-task branch is whatever is left when `task` is absent. [file] is
+     * decoded if a `file` node turns up, which is the field a caller would
+     * otherwise have to guess at by picking the newest entry in the folder.
+     */
+    data class InstantComplete(
+        val raw: JsonObject,
+        val file: FileStat? = null,
+    ) : CreateUrlResult()
 }
 
 /**
@@ -93,10 +108,37 @@ suspend fun PikPakClient.createUrlFile(parentId: String, url: String): CreateUrl
         url = "${PikPakConstants.DRIVE_BASE}/drive/v1/files",
         captchaAction = "POST:/drive/v1/files",
     ) { jsonBody(json, body) }
-    val taskNode = (response as JsonObject)["task"]?.jsonObject
-        ?: return CreateUrlResult.InstantComplete
+    val obj = response as JsonObject
+    val taskNode = obj["task"]?.jsonObject
+        ?: return CreateUrlResult.InstantComplete(
+            raw = obj,
+            file = obj["file"]?.jsonObject?.let { json.decodeFromJsonElement(FileStat.serializer(), it) },
+        )
     val task = json.decodeFromJsonElement(OfflineTask.serializer(), taskNode)
     return CreateUrlResult.Queued(task)
+}
+
+/**
+ * Fetches one offline task by id (`GET /drive/v1/tasks/{id}`). Use this to
+ * poll a task you submitted instead of listing every task on the account and
+ * searching it — a poll loop over [listOfflineTasks] pulls the whole table
+ * once every interval.
+ *
+ * The single-task response and the listing do not always agree. The listing
+ * defaults to `with=reference_resource`, which overlays the state of the file
+ * the task produced: a task whose output file was later deleted reads as
+ * `PHASE_TYPE_ERROR` / "File deleted" in the listing while this endpoint still
+ * reports the task's own `PHASE_TYPE_COMPLETE` / "Saved". Ask this endpoint
+ * about the transfer, the listing about the file.
+ */
+suspend fun PikPakClient.getTask(taskId: String): OfflineTask {
+    require(taskId.isNotEmpty()) { "taskId must not be empty" }
+    val response = http.request(
+        method = HttpMethod.Get,
+        url = "${PikPakConstants.DRIVE_BASE}/drive/v1/tasks/$taskId",
+        captchaAction = "GET:/drive/v1/tasks",
+    )
+    return json.decodeFromJsonElement(OfflineTask.serializer(), response)
 }
 
 /**
@@ -107,20 +149,29 @@ suspend fun PikPakClient.createUrlFile(parentId: String, url: String): CreateUrl
  *
  * The SDK intentionally exposes no polling/timeout loop — callers decide when
  * a task counts as "done" (phase transition, disappearance from the running
- * list, a side-effect file landing in the drive, etc.).
+ * list, a side-effect file landing in the drive, etc.). To follow one known
+ * task, use [getTask]: the server has no `id` filter here (it answers 400).
+ *
+ * @param limit page size. The 10 000 default fetches the whole table in one
+ *   request, which is right for a one-shot inventory and wrong for a poll
+ *   loop; lower it when polling.
+ * @param with extra data to join in, or null for none. `reference_resource`
+ *   (the default) attaches the produced file, at the cost of reporting a task
+ *   whose file was deleted as errored — see [getTask].
  */
 suspend fun PikPakClient.listOfflineTasks(
     phaseFilter: String = "${TaskPhase.RUNNING},${TaskPhase.ERROR}",
     limit: Int = 10_000,
     pageToken: String? = null,
+    with: String? = "reference_resource",
 ): TaskListResponse {
     val query = mutableMapOf(
         "type" to "offline",
         "thumbnail_size" to "SIZE_SMALL",
         "limit" to limit.toString(),
         "filters" to """{"phase":{"in":"$phaseFilter"}}""",
-        "with" to "reference_resource",
     )
+    if (!with.isNullOrEmpty()) query["with"] = with
     if (!pageToken.isNullOrEmpty()) query["page_token"] = pageToken
     val response = http.request(
         method = HttpMethod.Get,

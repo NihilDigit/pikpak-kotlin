@@ -22,11 +22,18 @@ private const val FILES_PATH = "/drive/v1/files"
  * Looks up the file id of an immediate child folder of [parentId] named [name].
  * Throws [FolderNotFoundException] if no such folder exists. Pass `""` for the
  * root drive.
+ *
+ * Folders are selected on the server, so a parent holding thousands of files
+ * and a handful of folders costs one page instead of all of them. The name
+ * itself is still compared locally: PikPak refuses `name` as a filter field
+ * (404 under every operator) and ignores the `q` / `search_text` query
+ * parameters, so there is nothing server-side to match against.
  */
 suspend fun PikPakClient.getFolderId(parentId: String, name: String): String {
     var pageToken = ""
+    val filters = mapOf(FileFilter.kind(FileKind.FOLDER))
     do {
-        val page = listFilesPaged(parentId, 500, pageToken)
+        val page = listFilesPaged(parentId, 500, pageToken, filters)
         page.files.firstOrNull { it.isFolder && it.name == name && !it.trashed }?.let { return it.id }
         pageToken = page.nextPageToken
     } while (pageToken.isNotEmpty())
@@ -37,17 +44,25 @@ suspend fun PikPakClient.getFolderId(parentId: String, name: String): String {
  * Resolves a slash-separated path (e.g. `"a/b/c"` or `"/a/b"`) to a folder id,
  * starting from [parentId]. Pass `""` for the root drive. Throws
  * [FolderNotFoundException] for the first missing segment.
+ *
+ * Resolved paths are memoized on the client, so a second call for the same
+ * path costs nothing. Any mutating call in this file drops the memo; see
+ * [PikPakClient.clearFolderIdCache] to drop it after a change made elsewhere.
  */
 suspend fun PikPakClient.getDeepFolderId(parentId: String, path: String): String {
+    folderIds.get(parentId, path)?.let { return it }
     val segments = path.trim('/').split('/').filter { it.isNotEmpty() }
     var current = parentId
     for (segment in segments) {
         try {
             current = getFolderId(current, segment)
-        } catch (e: FolderNotFoundException) {
+        } catch (_: FolderNotFoundException) {
+            // Report the path the caller asked for, not just the segment that
+            // was missing — the segment alone reads as a different lookup.
             throw FolderNotFoundException(path)
         }
     }
+    folderIds.put(parentId, path, current)
     return current
 }
 
@@ -57,8 +72,17 @@ suspend fun PikPakClient.getPathFolderId(path: String): String = getDeepFolderId
 /**
  * `mkdir -p` for PikPak. Walks [path] from [parentId], creating any missing
  * folders, and returns the id of the deepest folder.
+ *
+ * Not atomic, and cannot be: PikPak has no create-if-absent call, so two
+ * devices racing on the same missing segment both see "not found" and both
+ * create it. PikPak permits duplicate names in one parent, so the result is
+ * two folders with the same name and different ids rather than an error.
+ * Callers that care should treat "first match wins" as the rule and reconcile
+ * out of band; there is no server-side primitive that would let the SDK do
+ * better.
  */
 suspend fun PikPakClient.getOrCreateDeepFolderId(parentId: String, path: String): String {
+    folderIds.get(parentId, path)?.let { return it }
     val segments = path.trim('/').split('/').filter { it.isNotEmpty() }
     var current = parentId
     for (segment in segments) {
@@ -68,6 +92,7 @@ suspend fun PikPakClient.getOrCreateDeepFolderId(parentId: String, path: String)
             createFolder(current, segment)
         }
     }
+    folderIds.put(parentId, path, current)
     return current
 }
 
@@ -97,6 +122,7 @@ suspend fun PikPakClient.deleteFile(fileId: String) {
         url = "$DRIVE$FILES_PATH/$fileId",
         captchaAction = "DELETE:/drive/v1/files",
     )
+    folderIds.invalidateAll()
 }
 
 /**
@@ -114,6 +140,7 @@ suspend fun PikPakClient.batchTrash(ids: List<String>) {
         url = "$DRIVE$FILES_PATH:batchTrash",
         captchaAction = "POST:/drive/v1/files:batchTrash",
     ) { jsonBody(json, body) }
+    folderIds.invalidateAll()
 }
 
 /**
@@ -131,6 +158,7 @@ suspend fun PikPakClient.batchDelete(ids: List<String>) {
         url = "$DRIVE$FILES_PATH:batchDelete",
         captchaAction = "POST:/drive/v1/files:batchDelete",
     ) { jsonBody(json, body) }
+    folderIds.invalidateAll()
 }
 
 /**
@@ -148,6 +176,7 @@ suspend fun PikPakClient.batchUntrash(ids: List<String>) {
         url = "$DRIVE$FILES_PATH:batchUntrash",
         captchaAction = "POST:/drive/v1/files:batchUntrash",
     ) { jsonBody(json, body) }
+    folderIds.invalidateAll()
 }
 
 /**
@@ -165,6 +194,7 @@ suspend fun PikPakClient.batchMove(ids: List<String>, toParentId: String) {
         url = "$DRIVE$FILES_PATH:batchMove",
         captchaAction = "POST:/drive/v1/files:batchMove",
     ) { jsonBody(json, body) }
+    folderIds.invalidateAll()
 }
 
 /** Renames [fileId] to [newName]. Empty names are rejected client-side. */
@@ -176,6 +206,7 @@ suspend fun PikPakClient.rename(fileId: String, newName: String) {
         url = "$DRIVE$FILES_PATH/$fileId",
         captchaAction = "PATCH:/drive/v1/files",
     ) { jsonBody(json, body) }
+    folderIds.invalidateAll()
 }
 
 /**

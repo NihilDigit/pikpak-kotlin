@@ -34,7 +34,7 @@ data class FileStat(
 }
 
 @Serializable
-internal data class FileListPage(
+data class FileListPage(
     @SerialName("next_page_token") val nextPageToken: String = "",
     val files: List<FileStat> = emptyList(),
 )

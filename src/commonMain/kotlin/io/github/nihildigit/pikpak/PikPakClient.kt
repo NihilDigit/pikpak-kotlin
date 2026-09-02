@@ -1,6 +1,7 @@
 package io.github.nihildigit.pikpak
 
 import io.github.nihildigit.pikpak.internal.AuthApi
+import io.github.nihildigit.pikpak.internal.FolderIdCache
 import io.github.nihildigit.pikpak.internal.HttpEngine
 import io.ktor.client.HttpClient
 import kotlin.concurrent.Volatile
@@ -67,6 +68,14 @@ class PikPakClient(
     internal val mutex = Mutex()
     internal val http = HttpEngine(client, this)
     internal val auth = AuthApi(this)
+    internal val folderIds = FolderIdCache()
+
+    /**
+     * Drops the memoized path-to-folder-id map. The SDK clears it after every
+     * mutation it performs itself; call this when a folder was moved, renamed
+     * or deleted through some other client.
+     */
+    suspend fun clearFolderIdCache() = folderIds.invalidateAll()
 
     /**
      * Ensures the client has a valid access token. Reuses a cached session if
