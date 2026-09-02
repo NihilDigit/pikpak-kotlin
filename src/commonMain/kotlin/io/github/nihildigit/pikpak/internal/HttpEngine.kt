@@ -59,6 +59,8 @@ import kotlinx.serialization.json.jsonPrimitive
 internal class HttpEngine(
     private val client: HttpClient,
     private val pikpak: PikPakClient,
+    /** Deferred so the CDN client is only built if CDN traffic actually happens. */
+    private val cdnClient: () -> HttpClient,
 ) {
     suspend fun request(
         method: HttpMethod,
@@ -112,6 +114,7 @@ internal class HttpEngine(
         url: String,
         configure: HttpRequestBuilder.() -> Unit = {},
     ): JsonElement = execute(
+        client = client,
         method = method,
         url = url,
         rateLimited = true,
@@ -171,6 +174,7 @@ internal class HttpEngine(
         configure: HttpRequestBuilder.() -> Unit = {},
         block: suspend (HttpResponse) -> T,
     ): T = execute(
+        client = cdnClient(),
         method = method,
         url = url,
         rateLimited = false,
@@ -197,6 +201,7 @@ internal class HttpEngine(
      * because a block may have already written bytes somewhere.
      */
     private suspend fun <T> execute(
+        client: HttpClient,
         method: HttpMethod,
         url: String,
         rateLimited: Boolean,

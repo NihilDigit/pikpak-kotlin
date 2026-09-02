@@ -158,7 +158,13 @@ data class FileDetail(
     val revision: String = "",
     val starred: Boolean = false,
     @SerialName("web_content_link") val webContentLink: String = "",
-    val links: Links = Links(),
+    /**
+     * Signed download links keyed by content type. PikPak has been observed to
+     * return more than one; each carries its own signature and therefore its
+     * own 8-connection budget, which is the reason not to collapse them to the
+     * one entry the SDK used to model.
+     */
+    val links: Map<String, DownloadLink> = emptyMap(),
     /**
      * Alternate representations of this file. Empty for non-media files and for
      * media that hasn't been transcoded yet. See [MediaVariant] for byte-range
@@ -168,13 +174,16 @@ data class FileDetail(
     val trashed: Boolean = false,
     val writable: Boolean = true,
 ) {
-    @Serializable
-    data class Links(
-        @SerialName("application/octet-stream") val octetStream: DownloadLink = DownloadLink(),
-    )
-
     val sizeBytes: Long get() = size.toLongOrNull() ?: 0L
-    val downloadUrl: String? get() = links.octetStream.url.takeIf { it.isNotBlank() }
+
+    /** The `application/octet-stream` link — the raw file — or an empty one. */
+    val octetStream: DownloadLink get() = links[OCTET_STREAM] ?: DownloadLink()
+
+    val downloadUrl: String? get() = octetStream.url.takeIf { it.isNotBlank() }
+
+    companion object {
+        const val OCTET_STREAM = "application/octet-stream"
+    }
 }
 
 @Serializable

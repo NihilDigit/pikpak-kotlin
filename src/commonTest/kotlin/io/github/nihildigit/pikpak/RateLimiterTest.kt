@@ -4,6 +4,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -90,6 +91,31 @@ class RateLimiterTest {
         val gaps = waiterTimes.zipWithNext { a, b -> b - a }
         for (gap in gaps) {
             assertTrue(gap >= 80, "waiters should be staggered, saw gap=${gap}ms in $waiterTimes")
+        }
+    }
+
+    /**
+     * A reservation spends its token immediately. Without that, refill kept
+     * crediting tokens that queued waiters had already been promised, so a
+     * caller arriving mid-queue found a "free" token and jumped ahead of them
+     * — and the bucket issued up to twice the configured rate.
+     */
+    @Test
+    fun `a latecomer cannot take a token already promised to a waiter`() = runBlocking {
+        val limiter = RateLimiter(capacity = 1, refillPerSecond = 5.0)
+        limiter.acquire() // drains the bucket
+        coroutineScope {
+            // Five waiters now hold reservations at +200ms through +1000ms.
+            val waiters = List(5) { async { limiter.acquire() } }
+            delay(250)
+            val start = TimeSource.Monotonic.markNow()
+            limiter.acquire()
+            val elapsed = start.elapsedNow().inWholeMilliseconds
+            assertTrue(
+                elapsed >= 100,
+                "latecomer must queue behind the five reservations but waited only ${elapsed}ms",
+            )
+            waiters.awaitAll()
         }
     }
 

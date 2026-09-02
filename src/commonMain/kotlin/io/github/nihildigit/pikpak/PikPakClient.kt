@@ -3,6 +3,7 @@ package io.github.nihildigit.pikpak
 import io.github.nihildigit.pikpak.internal.AuthApi
 import io.github.nihildigit.pikpak.internal.FolderIdCache
 import io.github.nihildigit.pikpak.internal.HttpEngine
+import io.github.nihildigit.pikpak.internal.defaultCdnHttpClient
 import io.ktor.client.HttpClient
 import kotlin.concurrent.Volatile
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -48,6 +49,8 @@ class PikPakClient(
     val rateLimiter: RateLimiter = RateLimiter.default(),
     val retryPolicy: RetryPolicy = RetryPolicy.Default,
     httpClient: HttpClient? = null,
+    cdnHttpClient: HttpClient? = null,
+    val connectionBudget: Int = DEFAULT_CONNECTION_BUDGET,
 ) {
     constructor(
         account: String,
@@ -56,17 +59,46 @@ class PikPakClient(
         rateLimiter: RateLimiter = RateLimiter.default(),
         retryPolicy: RetryPolicy = RetryPolicy.Default,
         httpClient: HttpClient? = null,
-    ) : this(account, { password }, sessionStore, rateLimiter, retryPolicy, httpClient)
+        cdnHttpClient: HttpClient? = null,
+        connectionBudget: Int = DEFAULT_CONNECTION_BUDGET,
+    ) : this(
+        account,
+        { password },
+        sessionStore,
+        rateLimiter,
+        retryPolicy,
+        httpClient,
+        cdnHttpClient,
+        connectionBudget,
+    )
 
     val deviceId: String = MD5().digest(account.encodeToByteArray()).toHex()
 
     private val ownsHttpClient = httpClient == null
     private val client: HttpClient = httpClient ?: HttpEngine.defaultClient()
+
+    private val ownsCdnClient = cdnHttpClient == null && httpClient == null
+
+    /**
+     * Client for signed CDN and OSS URLs.
+     *
+     * When the SDK owns its clients this is a separate, per-platform-tuned one
+     * allowing at least [connectionBudget] connections per host, because every
+     * engine's default cap is lower and the CDN offers no HTTP/2 to
+     * multiplex over.
+     *
+     * An injected [httpClient] is reused here rather than quietly opening a
+     * second connection pool behind the caller's back. That costs the tuning:
+     * to keep both, pass [tunedCdnClient] as `cdnHttpClient`.
+     */
+    private val cdn: Lazy<HttpClient> = lazy {
+        cdnHttpClient ?: httpClient ?: defaultCdnHttpClient(connectionBudget)
+    }
     internal val json: Json = Json { ignoreUnknownKeys = true; encodeDefaults = false }
 
     internal val state = ClientState(passwordSupplier)
     internal val mutex = Mutex()
-    internal val http = HttpEngine(client, this)
+    internal val http = HttpEngine(client, this) { cdn.value }
     internal val auth = AuthApi(this)
     internal val folderIds = FolderIdCache()
 
@@ -113,9 +145,33 @@ class PikPakClient(
      */
     val sessionFlow: StateFlow<Session?> = state.sessionFlow.asStateFlow()
 
-    /** Closes the underlying HTTP client if it was created by this SDK. No-op otherwise. */
+    /** Closes the underlying HTTP clients that were created by this SDK. No-op for injected ones. */
     fun close() {
         if (ownsHttpClient) client.close()
+        if (ownsCdnClient && cdn.isInitialized()) cdn.value.close()
+    }
+
+    companion object {
+        /**
+         * Concurrent connections the CDN client is configured to allow per
+         * host, and the default budget of a [RangeReader].
+         *
+         * Measured 2026-09-02: one signed PikPak URL accepts exactly 8
+         * concurrent connections and answers the 9th onward with 503, the
+         * excess count matching n − 8 precisely. Two different URLs get 8 each,
+         * so the cap is per URL or per edge host rather than per client.
+         * Per-connection throughput sits near 0.8 MB/s regardless of how many
+         * are open, so the aggregate scales linearly to that ceiling.
+         */
+        const val DEFAULT_CONNECTION_BUDGET = 8
+
+        /**
+         * The per-platform CDN client the SDK would build for itself. Pass it
+         * as `cdnHttpClient` when you inject your own API client but still
+         * want the tuned connection pool for downloads. You own its lifecycle.
+         */
+        fun tunedCdnClient(connectionBudget: Int = DEFAULT_CONNECTION_BUDGET): HttpClient =
+            defaultCdnHttpClient(connectionBudget)
     }
 }
 

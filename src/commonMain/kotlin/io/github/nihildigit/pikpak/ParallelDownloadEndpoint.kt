@@ -1,5 +1,6 @@
 package io.github.nihildigit.pikpak
 
+import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -14,23 +15,25 @@ import kotlinx.io.write
  *
  * Use this when single-connection throughput is bottlenecked by the server's
  * per-connection cap rather than the client's egress bandwidth. PikPak's CDN
- * (and most cloud-storage CDNs) hard-caps a single TCP connection regardless
- * of account tier — opening N concurrent range requests against the same URL
- * multiplies effective throughput close to N×, up to the user's link capacity.
+ * holds one connection to roughly 0.8 MB/s no matter how many are open, and
+ * the aggregate scales linearly with connection count up to the client's link.
  *
- * The caller chooses [partCount]. There is no SDK-side default because the
- * optimal value depends on the caller's egress link, not on the server: a
- * 50 Mbps consumer link saturates at ~32 connections; a gigabit host can keep
- * going past 128. Empirical guidance: 8 is a safe minimum, 16–32 covers most
- * residential broadband, beyond 64 typically hits diminishing returns.
+ * [partCount] is capped at 8 in effect, because that is what one signed PikPak
+ * URL accepts before answering 503 — the excess is queued by the underlying
+ * [RangeReader] rather than failing, so a larger value costs latency and buys
+ * nothing. Two *different* URLs get 8 each, so genuinely wider fan-out means
+ * more links, not more parts.
  *
  * Behaviour:
  *  - [partCount] == 1 degenerates to [downloadFromUrl] (sequential path with
  *    resume + retry). No tmp files are created.
  *  - [partCount] >= 2 splits the file into equal-sized contiguous parts (the
  *    last part absorbs any remainder), fetches each into a `dest.name.part-N`
- *    tmp file next to [dest] via [streamRangeFromUrl] in parallel, then
- *    concatenates them into [dest] in order.
+ *    tmp file next to [dest] in parallel, then concatenates them in order.
+ *  - Each part is fetched through a shared [RangeReader], so a part that dies
+ *    mid-body resumes from its own offset instead of restarting, and a 503 is
+ *    a wait rather than a failure. This is the difference from the previous
+ *    revision, where one failed part discarded every other part's work.
  *  - If [expectedSize] >= 0 the caller's value is used verbatim. If < 0 the
  *    function issues one 1-byte probe range request to derive the total size
  *    from the response's `Content-Range` header.
@@ -39,25 +42,22 @@ import kotlinx.io.write
  *  - [partCount] < 1 (caller bug — fail fast).
  *  - [expectedSize] < 0 and the probe can't return a parseable Content-Range
  *    total ("*" or missing).
- *  - Any single part's [streamRangeFromUrl] call throws. All in-flight parts
- *    are cancelled, every `.part-N` tmp file next to [dest] is removed, and the
- *    underlying cause is rethrown. [dest] itself is not touched until every
- *    part has succeeded — partial results never leak.
+ *  - A part exhausts its retries. All in-flight parts are cancelled, every
+ *    `.part-N` tmp file next to [dest] is removed, and the cause is rethrown.
+ *    [dest] itself is not touched until every part has succeeded.
  *  - The concatenation phase fails (disk full mid-write, etc.). Tmp files are
  *    still cleaned up; [dest] may be left partially written and is the caller's
- *    to remove. This split is intentional: by the time we start concatenating,
- *    the network phase has succeeded and the failure mode is purely local I/O,
- *    which the caller is better positioned to recover from.
+ *    to remove. By that point the network phase has succeeded and the failure
+ *    is purely local I/O, which the caller can recover from better than we can.
  *
- * Resume / restart: NOT supported in this revision. If the function is
- * interrupted mid-download, the next call starts over from byte 0. Combining
- * resume with parallel parts is non-trivial (each part needs independent
- * resume state) and is deliberately deferred. Use [downloadFromUrl] when
- * resume matters more than throughput.
+ * Resume across calls: NOT supported. Interrupted mid-download, the next call
+ * starts from byte 0. Use [downloadFromUrl] when resume matters more than
+ * throughput.
  *
- * URL refresh: NOT handled. Same contract as [streamRangeFromUrl] — if the
- * signed URL expires mid-fetch and a part gets 401/403, the whole task fails
- * and the caller is expected to re-fetch a fresh URL via [getFile] and retry.
+ * URL refresh: NOT handled, because the caller passed a URL rather than a file
+ * id and there is nothing to refresh it from. A signature that expires
+ * mid-download fails the whole call. Build a [RangeReader] with a `getFile`
+ * backed provider (see [rangeReader]) when downloads outlive a signature.
  *
  * @param url          a signed PikPak CDN URL (typically [FileDetail.downloadUrl]
  *                     or [MediaVariant.url]).
@@ -73,21 +73,17 @@ public suspend fun PikPakClient.parallelDownloadFromUrl(
     partCount: Int,
     expectedSize: Long = -1L,
 ): Long {
-    // Pre-flight validation
     if (partCount < 1) {
         throw PikPakException(-1, "parallelDownloadFromUrl: partCount must be >= 1, got $partCount")
     }
 
-    // partCount == 1: delegate to sequential downloadFromUrl (resume + retry, no tmp files)
     if (partCount == 1) {
         return downloadFromUrl(url, dest, expectedSize)
     }
 
-    // Resolve total file size
     val totalSize: Long = if (expectedSize >= 0L) {
         expectedSize
     } else {
-        // 1-byte probe to read totalSize from Content-Range header
         val probed = streamRangeFromUrl(url, start = 0L, length = 1L) { it.totalSize }
         if (probed <= 0L) {
             throw PikPakException(
@@ -99,32 +95,46 @@ public suspend fun PikPakClient.parallelDownloadFromUrl(
         probed
     }
 
-    // Build part ranges and tmp paths
-    val partSize = totalSize / partCount
+    if (totalSize == 0L) {
+        SystemFileSystem.delete(dest, mustExist = false)
+        SystemFileSystem.sink(dest).buffered().use { }
+        return 0L
+    }
+
+    // One part per byte is the ceiling: any more and partSize floors to 0,
+    // which used to make the length check throw on a file smaller than
+    // partCount bytes.
+    val effectiveParts = if (partCount.toLong() > totalSize) totalSize.toInt() else partCount
+    val partSize = totalSize / effectiveParts
     val parentDir = dest.parent ?: Path(".")
     val destName = dest.name
-    val tmpPaths = List(partCount) { i -> Path(parentDir, "$destName.part-$i") }
+    val tmpPaths = List(effectiveParts) { i -> Path(parentDir, "$destName.part-$i") }
 
-    // Fan-out: fetch each part to its tmp file, clean up all on any failure
+    val reader = RangeReader(
+        client = this,
+        urlProvider = { url },
+        connectionBudget = minOf(effectiveParts, connectionBudget),
+    )
+
     try {
         coroutineScope {
-            val jobs = List(partCount) { i ->
+            val jobs = List(effectiveParts) { i ->
                 val start = i.toLong() * partSize
-                val end = if (i == partCount - 1) totalSize - 1L else (i.toLong() + 1L) * partSize - 1L
+                val end = if (i == effectiveParts - 1) totalSize - 1L else (i.toLong() + 1L) * partSize - 1L
                 val length = end - start + 1L
-                async { fetchPartToTmp(url, start, length, tmpPaths[i]) }
+                async { fetchPartToTmp(reader, start, length, tmpPaths[i]) }
             }
             jobs.awaitAll()
         }
     } catch (t: Throwable) {
-        // Clean up all tmp files on failure, then rethrow
         for (tmp in tmpPaths) {
             SystemFileSystem.delete(tmp, mustExist = false)
         }
         throw t
+    } finally {
+        reader.close()
     }
 
-    // Concat phase: delete pre-existing dest, write parts in order
     SystemFileSystem.delete(dest, mustExist = false)
     try {
         SystemFileSystem.sink(dest).buffered().use { sink ->
@@ -140,7 +150,6 @@ public suspend fun PikPakClient.parallelDownloadFromUrl(
             }
         }
     } finally {
-        // Always clean up tmp files after concat (success or failure)
         for (tmp in tmpPaths) {
             SystemFileSystem.delete(tmp, mustExist = false)
         }
@@ -150,17 +159,17 @@ public suspend fun PikPakClient.parallelDownloadFromUrl(
 }
 
 /**
- * Fetches a single byte range from [url] and writes it to [tmpPath].
+ * Fetches a single byte range and writes it to [tmpPath].
  * Throws if bytes written != [length].
  */
-private suspend fun PikPakClient.fetchPartToTmp(
-    url: String,
+private suspend fun fetchPartToTmp(
+    reader: RangeReader,
     start: Long,
     length: Long,
     tmpPath: Path,
 ) {
-    streamRangeFromUrl(url, start, length) { stream ->
-        val written = writeChannelToPath(stream.channel, tmpPath)
+    reader.read(start, length) { channel ->
+        val written = writeChannelToPath(channel, tmpPath)
         if (written != length) {
             throw PikPakException(
                 -1,
@@ -174,7 +183,7 @@ private suspend fun PikPakClient.fetchPartToTmp(
  * Drains [channel] into a new file at [dest], returning total bytes written.
  */
 private suspend fun writeChannelToPath(
-    channel: io.ktor.utils.io.ByteReadChannel,
+    channel: ByteReadChannel,
     dest: Path,
 ): Long {
     return SystemFileSystem.sink(dest).buffered().use { sink ->

@@ -1,5 +1,6 @@
 package io.github.nihildigit.pikpak
 
+import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.header
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.HttpHeaders
@@ -77,12 +78,18 @@ data class RangeStream(
  * @param start  starting byte offset, inclusive. Must be `>= 0`.
  * @param length number of bytes to fetch, or null for "from [start] to EOF".
  *               Must be `>= 1` when non-null.
+ * @param configure escape hatch onto the request builder, applied after the
+ *               SDK's own headers. Its reason to exist is per-call timeouts:
+ *               the CDN client's timeouts are sized for long streaming reads,
+ *               which is wrong for a 64 KB probe that should fail fast.
+ *               `configure = { timeout { requestTimeoutMillis = 5_000 } }`.
  * @param block  receives the live range. Everything you need must be read here.
  */
 public suspend fun <T> PikPakClient.streamRangeFromUrl(
     url: String,
     start: Long,
     length: Long? = null,
+    configure: HttpRequestBuilder.() -> Unit = {},
     block: suspend (RangeStream) -> T,
 ): T {
     if (start < 0) throw PikPakException(-1, "streamRangeFromUrl: start must be >= 0, got $start")
@@ -102,6 +109,7 @@ public suspend fun <T> PikPakClient.streamRangeFromUrl(
         configure = {
             header(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
             header(HttpHeaders.Range, rangeHeader)
+            configure()
         },
     ) { response ->
         val status = response.status

@@ -76,7 +76,10 @@ suspend fun PikPakClient.downloadFromUrl(url: String, dest: Path, expectedSize: 
             is DownloadOutcome.Retry -> {
                 attempt++
                 if (attempt >= retryPolicy.maxAttempts) throw outcome.cause
-                delay(retryPolicy.delayFor(attempt))
+                // delayFor is zero-based: the wait after the first failure is
+                // delayFor(0). This loop counted attempts from one and skipped
+                // the first rung of the backoff curve.
+                delay(retryPolicy.delayFor(attempt - 1))
             }
         }
     }

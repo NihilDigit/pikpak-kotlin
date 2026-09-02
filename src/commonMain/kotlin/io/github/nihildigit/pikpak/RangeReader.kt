@@ -1,0 +1,380 @@
+package io.github.nihildigit.pikpak
+
+import io.github.nihildigit.pikpak.internal.PriorityGate
+import io.ktor.utils.io.ByteChannel
+import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.ByteWriteChannel
+import io.ktor.utils.io.readAvailable
+import io.ktor.utils.io.writeFully
+import kotlin.time.Instant
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlin.time.Clock
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
+
+/** Why [RangeReader] is asking for a URL. */
+sealed interface UrlRequest {
+    /** No URL yet. */
+    data object Initial : UrlRequest
+
+    /** [previous] came back 401/403 — its signature has expired or been revoked. */
+    data class Expired(val previous: String) : UrlRequest
+
+    /** [previous] failed with a client error that is not an expiry, e.g. 404 after the file moved. */
+    data class Rejected(val previous: String, val status: Int) : UrlRequest
+}
+
+/** Live counters for one [RangeReader]. */
+data class RangeReaderStats(
+    /** Reads currently holding a connection slot. */
+    val activeReads: Int = 0,
+    /** Reads waiting for a slot. */
+    val queuedReads: Int = 0,
+    /** Bytes delivered to callers since construction. */
+    val bytesRead: Long = 0,
+    /** How many times the URL was refreshed. */
+    val urlRefreshes: Int = 0,
+    /** When the URL was last refreshed. */
+    val lastUrlRefreshAt: Instant? = null,
+    /** Requests retried after a transport failure or a truncated body. */
+    val retries: Int = 0,
+    /** Requests the CDN answered 503 — over its per-URL connection cap, not a failure. */
+    val throttled: Int = 0,
+)
+
+/**
+ * Concurrent random-access reader over one remote file.
+ *
+ * Built for playback: give it a way to obtain a signed URL and it will serve
+ * arbitrary byte ranges, keeping the connection count inside what PikPak's CDN
+ * accepts and refreshing the URL when the signature expires. Nothing is
+ * buffered or cached here — piece scheduling, disk layout and read-ahead
+ * belong to the caller.
+ *
+ * What it handles:
+ *  - **Connection budget.** All reads on one instance share [connectionBudget]
+ *    slots. A signed PikPak URL accepts 8 concurrent connections and answers
+ *    the 9th with 503, so the budget is a hard property of the URL, not a
+ *    tuning knob. Two readers on two different URLs get 8 each.
+ *  - **Priority.** When slots are contended, a higher [read] priority is
+ *    served first. Playback-head reads should outrank read-ahead.
+ *  - **Expiry.** 401/403 calls [urlProvider] with [UrlRequest.Expired] and
+ *    reissues the request. Concurrent reads share one refresh.
+ *  - **Throttling.** 503 backs off and retries without spending a retry.
+ *  - **Truncation.** A body that stops early, or an I/O failure mid-body,
+ *    resumes from the offset already delivered instead of restarting.
+ *
+ * What it does not handle: caching, read-ahead, and the file's identity. The
+ * reader never calls `getFile` itself — [urlProvider] owns that, which is what
+ * lets a caller layer its own fallbacks behind it.
+ *
+ * Cancelling the coroutine that called [read] closes that read's connection
+ * and frees its slot.
+ */
+class RangeReader(
+    private val client: PikPakClient,
+    private val urlProvider: suspend (UrlRequest) -> String,
+    val connectionBudget: Int = PikPakClient.DEFAULT_CONNECTION_BUDGET,
+    /**
+     * Transport failures tolerated per [read] before it gives up. Counts
+     * truncated bodies and I/O errors; 503 and URL expiry do not count.
+     */
+    private val maxAttempts: Int = 5,
+) : AutoCloseable {
+
+    init {
+        require(connectionBudget >= 1) { "connectionBudget must be >= 1, got $connectionBudget" }
+        require(maxAttempts >= 1) { "maxAttempts must be >= 1, got $maxAttempts" }
+    }
+
+    private val gate = PriorityGate(connectionBudget)
+    private val urlMutex = Mutex()
+    private var url: String? = null
+    private var closed = false
+
+    private val _stats = MutableStateFlow(RangeReaderStats())
+    val stats: StateFlow<RangeReaderStats> = _stats.asStateFlow()
+
+    /**
+     * Reads [length] bytes starting at [start] (to EOF when [length] is null)
+     * and hands them to [block] as a stream.
+     *
+     * The channel [block] receives is stitched across however many HTTP
+     * requests the read actually took, so a mid-body failure and the resume
+     * that follows are invisible to it. Bytes arrive in order and exactly
+     * once. The channel dies when [block] returns; do not let it escape.
+     *
+     * @param priority higher wins a contended slot. Equal priorities are FIFO.
+     */
+    suspend fun <T> read(
+        start: Long,
+        length: Long? = null,
+        priority: Int = 0,
+        block: suspend (ByteReadChannel) -> T,
+    ): T {
+        require(start >= 0) { "start must be >= 0, got $start" }
+        require(length == null || length >= 1) { "length must be >= 1 when non-null, got $length" }
+        check(!closed) { "RangeReader is closed" }
+
+        return withSlot(priority) {
+            coroutineScope {
+                val channel = ByteChannel(autoFlush = true)
+                val failure = PumpFailure()
+                val pump = launchPump(this, channel, failure, start, length)
+                try {
+                    val result = block(channel)
+                    // Cancelling a channel only tells the reader that bytes
+                    // stopped; the reason has to be carried out separately or
+                    // the caller sees "short read" instead of "403".
+                    failure.cause?.let { throw it }
+                    result
+                } catch (t: Throwable) {
+                    val cause = failure.cause
+                    if (cause != null && cause !== t) throw cause
+                    throw t
+                } finally {
+                    // The caller may stop reading early — an aborted seek, a
+                    // full buffer. Killing the pump is what releases the
+                    // connection; without it the slot stays held until the
+                    // server finishes sending a range nobody wants.
+                    pump.cancel()
+                    channel.cancel(CancellationException("read block finished"))
+                }
+            }
+        }
+    }
+
+    private class PumpFailure {
+        var cause: Throwable? = null
+    }
+
+    /** Reads a range into memory. Only for ranges small enough to hold; [read] is the general form. */
+    suspend fun readBytes(start: Long, length: Long, priority: Int = 0): ByteArray {
+        require(length <= Int.MAX_VALUE) { "readBytes cannot materialise $length bytes" }
+        val out = ByteArray(length.toInt())
+        read(start, length, priority) { channel ->
+            var filled = 0
+            while (filled < out.size) {
+                val n = channel.readAvailable(out, filled, out.size - filled)
+                if (n == -1) break
+                filled += n
+            }
+            if (filled != out.size) {
+                throw PikPakException(-1, "readBytes: got $filled of $length bytes at offset $start")
+            }
+        }
+        return out
+    }
+
+    /**
+     * Fetches a URL now so the first [read] does not pay for it. Useful right
+     * after resolving a file, while the user is still looking at a spinner.
+     */
+    suspend fun prewarm(): String = currentUrl()
+
+    override fun close() {
+        closed = true
+    }
+
+    private suspend fun <T> withSlot(priority: Int, body: suspend () -> T): T {
+        gate.acquire(priority)
+        updateStats()
+        try {
+            return body()
+        } finally {
+            gate.release()
+            updateStats()
+        }
+    }
+
+    private fun launchPump(
+        scope: CoroutineScope,
+        sink: ByteChannel,
+        failure: PumpFailure,
+        start: Long,
+        length: Long?,
+    ): Job = scope.launch {
+        try {
+            pump(sink, start, length)
+            sink.flushAndClose()
+        } catch (t: Throwable) {
+            // Record before cancelling: the reader wakes up the moment the
+            // channel dies and must find the reason already there.
+            if (t !is CancellationException) failure.cause = t
+            sink.cancel(t)
+            if (t is CancellationException) throw t
+        }
+    }
+
+    private suspend fun pump(sink: ByteWriteChannel, start: Long, length: Long?) {
+        var offset = start
+        var remaining = length
+        var failures = 0
+        var throttles = 0
+        var rejectionRefreshed = false
+
+        while (remaining == null || remaining > 0) {
+            val attemptUrl = currentUrl()
+            var delivered = 0L
+            var announced = -1L
+
+            try {
+                client.streamRangeFromUrl(attemptUrl, offset, remaining) { stream ->
+                    announced = stream.contentLength
+                    val buffer = ByteArray(READ_CHUNK)
+                    while (true) {
+                        val n = stream.channel.readAvailable(buffer, 0, buffer.size)
+                        if (n == -1) break
+                        if (n > 0) {
+                            sink.writeFully(buffer, 0, n)
+                            sink.flush()
+                            delivered += n
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                offset += delivered
+                remaining = remaining?.minus(delivered)
+                addBytes(delivered)
+
+                when {
+                    t is UrlExpiredException -> {
+                        refreshUrl(UrlRequest.Expired(attemptUrl), attemptUrl)
+                    }
+                    t is PikPakException && t.httpStatus == 503 -> {
+                        // Over the URL's connection cap. Somebody else's read
+                        // will finish; this is a queue, not a failure.
+                        throttles++
+                        if (throttles > MAX_THROTTLE_WAITS) throw t
+                        bumpThrottled()
+                        delay(throttleBackoff(throttles))
+                    }
+                    t is PikPakException && t.httpStatus in 400..499 -> {
+                        if (rejectionRefreshed) throw t
+                        rejectionRefreshed = true
+                        refreshUrl(UrlRequest.Rejected(attemptUrl, t.httpStatus!!), attemptUrl)
+                    }
+                    else -> {
+                        failures++
+                        if (failures >= maxAttempts) throw t
+                        bumpRetries()
+                        delay(client.retryPolicy.delayFor(failures - 1))
+                    }
+                }
+                continue
+            }
+
+            offset += delivered
+            remaining = remaining?.minus(delivered)
+            addBytes(delivered)
+
+            val truncated = announced >= 0 && delivered < announced
+            if (!truncated) {
+                // An open-ended read is done when the server's own
+                // Content-Length has been delivered in full.
+                if (remaining == null || remaining <= 0L) return
+            }
+            if (delivered == 0L) {
+                failures++
+                if (failures >= maxAttempts) {
+                    throw PikPakException(
+                        -1,
+                        "RangeReader: no progress at offset $offset after $failures attempts",
+                    )
+                }
+                bumpRetries()
+                delay(client.retryPolicy.delayFor(failures - 1))
+            } else {
+                bumpRetries()
+            }
+        }
+    }
+
+    private suspend fun currentUrl(): String = urlMutex.withLock {
+        url ?: urlProvider(UrlRequest.Initial).also { url = it }
+    }
+
+    /**
+     * Replaces [stale] with a fresh URL. Eight reads hitting the same expired
+     * signature at once must not become eight getFile calls, so a refresh that
+     * already happened is reused.
+     */
+    private suspend fun refreshUrl(reason: UrlRequest, stale: String): String = urlMutex.withLock {
+        val existing = url
+        if (existing != null && existing != stale) return existing
+        val fresh = urlProvider(reason)
+        if (fresh == stale) {
+            throw PikPakException(
+                -1,
+                "RangeReader: urlProvider returned the same rejected URL; it cannot make progress",
+                errorDescription = stale,
+            )
+        }
+        url = fresh
+        _stats.value = _stats.value.copy(
+            urlRefreshes = _stats.value.urlRefreshes + 1,
+            lastUrlRefreshAt = Clock.System.now(),
+        )
+        fresh
+    }
+
+    private fun updateStats() {
+        _stats.value = _stats.value.copy(activeReads = gate.inUse, queuedReads = gate.queued)
+    }
+
+    private fun addBytes(count: Long) {
+        if (count <= 0) return
+        _stats.value = _stats.value.copy(bytesRead = _stats.value.bytesRead + count)
+    }
+
+    private fun bumpRetries() {
+        _stats.value = _stats.value.copy(retries = _stats.value.retries + 1)
+    }
+
+    private fun bumpThrottled() {
+        _stats.value = _stats.value.copy(throttled = _stats.value.throttled + 1)
+    }
+
+    private fun throttleBackoff(attempt: Int): Duration =
+        (THROTTLE_BASE_DELAY_MS * attempt).coerceAtMost(THROTTLE_MAX_DELAY_MS).milliseconds
+
+    private companion object {
+        const val READ_CHUNK = 64 * 1024
+
+        /**
+         * A 503 means the URL is at its connection cap; waiting is the whole
+         * remedy. The ceiling only exists so a permanently saturated URL fails
+         * instead of hanging.
+         */
+        const val MAX_THROTTLE_WAITS = 30
+        const val THROTTLE_BASE_DELAY_MS = 200L
+        const val THROTTLE_MAX_DELAY_MS = 2_000L
+    }
+}
+
+/**
+ * A [RangeReader] over [fileId] that refreshes its own URL via `getFile`.
+ * The common case: the caller has a file id and wants bytes.
+ */
+suspend fun PikPakClient.rangeReader(
+    fileId: String,
+    connectionBudget: Int = this.connectionBudget,
+): RangeReader = RangeReader(
+    client = this,
+    urlProvider = {
+        getFile(fileId).downloadUrl
+            ?: throw PikPakException(-1, "rangeReader: file $fileId has no octet-stream link")
+    },
+    connectionBudget = connectionBudget,
+)
