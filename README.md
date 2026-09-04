@@ -18,7 +18,7 @@ Small, atomic, well-typed surface over the PikPak HTTP API. The painful parts �
 ```kotlin
 repositories { mavenCentral() }
 dependencies {
-    implementation("io.github.nihildigit:pikpak-kotlin:0.4.2")
+    implementation("io.github.nihildigit:pikpak-kotlin:0.5.0")
 
     // Ktor is compileOnly in the SDK so it never upgrades the Ktor
     // version you've already pinned. Declare the pieces the SDK uses plus
@@ -54,7 +54,8 @@ Every shipped target is verified on a real runner before each release. Tag push 
 ## Design
 
 - **Atomic**: every endpoint is a focused `suspend` extension function on `PikPakClient`. No hidden orchestration unless you opt in.
-- **Hard problems abstracted**: session persistence, `access_token` refresh, captcha re-auth on `error_code=9`, exponential-backoff retry, token-bucket rate limiting, GCID content hashing, and OSS HMAC-SHA1 signing all run automatically.
+- **Hard problems abstracted**: session persistence, `access_token` refresh, re-authentication on a server-side 401, captcha re-auth on `error_code=9`, exponential-backoff retry, token-bucket rate limiting, GCID content hashing, and OSS HMAC-SHA1 signing all run automatically. Concurrent callers that trip the same expiry share one refresh.
+- **Streams, not buffers**: CDN and OSS bodies are consumed as they arrive. A range read costs no memory until you read it, and a `RangeReader` keeps concurrent reads inside the connection budget a signed URL accepts.
 - **Out of scope**: multi-account pools, sync/backup engines, recursive cleanup heuristics, CLIs. These are easy to build on top — the SDK does not bake them in. (For example, multi-account rotation is just `listOf(client1, client2).random()`.)
 - **Multiplatform**: `commonMain` depends only on multiplatform libraries (Ktor, kotlinx.serialization, kotlinx.coroutines, kotlinx.datetime, kotlinx-io, KotlinCrypto). Each platform uses its native HTTP engine.
 
@@ -63,19 +64,26 @@ Every shipped target is verified on a real runner before each release. Tag push 
 ```kotlin
 val client = PikPakClient(
     account = "you@example.com",
-    password = "your-password",
+    passwordSupplier = { vault.read("pikpak") },  // called only when a full sign-in is needed
+    // password = "..." is still accepted for the simple case
     // sessionStore = FileSessionStore() by default (~/.config/pikpak-kotlin on JVM)
     // rateLimiter = RateLimiter.Default (5 req/s, burst 5) by default
     // retryPolicy = RetryPolicy.Default (3 attempts, exp backoff) by default
+    // connectionBudget = 8: concurrent CDN connections per signed URL
 )
-client.login()                                // reuses cached session if still valid
+client.login()                                // optional: every call logs in on demand
+client.prewarm()                              // login + one cheap call, so the captcha
+                                              // handshake happens before the user waits
+client.sessionFlow                            // StateFlow<Session?> for sign-in state UI
 
 // Quota
 client.getQuota()                             // GET /drive/v1/about
 
 // Listing & lookup
 client.listFiles(parentId = "")               // root folder, follows pagination
+client.listFilesPaged(parentId, pageToken = "", extraFilters = mapOf(FileFilter.kind(FileKind.FOLDER)))
 client.getFile(fileId)                        // full FileDetail incl. download links
+client.getFile(fileId).octetStream.expiresAt  // when the signed link stops working
 client.getFolderId(parentId, name)            // immediate child folder by name
 client.getDeepFolderId(parentId, "a/b/c")     // resolve a path
 client.getPathFolderId("/a/b/c")              // shorthand for above from root
@@ -91,17 +99,21 @@ client.batchDelete(listOf(id1, id2))          // bulk hard-delete (bypasses tras
 // Transfer
 client.download(fileId, destPath)             // resumable, retries, byte-verified
 client.downloadFromUrl(url, dest, expected)   // when you already have a signed URL
+client.parallelDownloadFromUrl(url, dest, partCount = 8)
+client.streamRangeFromUrl(url, start, length) { range -> range.channel /* live */ }
 
 client.upload(parentId, sourcePath)           // GCID-hashed, instant-upload aware,
                                               // OSS multipart with HMAC-SHA1 signing
 
 // Offline-download queue
-when (val r = client.createUrlFile(parentId, "https://...")) {
-    is CreateUrlResult.Queued           -> r.task.id          // poll via listOfflineTasks()
-    is CreateUrlResult.InstantComplete  -> { /* PikPak already had this URL */ }
+when (val r = client.createUrlFile(parentId, "magnet:?xt=...")) {
+    is CreateUrlResult.Queued           -> r.task.id          // poll via getTask()
+    is CreateUrlResult.InstantComplete  -> r.file             // PikPak already had this URL
 }
+var task = client.getTask(taskId)             // one task, without pulling the table
+while (task.phase !in TaskPhase.TERMINAL) { delay(3.seconds); task = client.getTask(taskId) }
+task.fileId                                   // set once phase == TaskPhase.COMPLETE
 client.listOfflineTasks()                     // inspect running/errored tasks
-client.getTask(taskId)                        // one task, without pulling the table
 
 client.logout()                               // forget cached tokens
 client.close()                                // close internal HTTP client
@@ -122,7 +134,20 @@ reader.close()
 
 Construct `RangeReader` directly with your own `urlProvider` when the URL comes from somewhere other than `getFile`. `parallelDownloadFromUrl` is a thin wrapper over the same machinery.
 
+A range that runs past the end of the file ends at EOF. A signed URL that the CDN rejects with 401 or 403 surfaces as `UrlExpiredException` from the single-request calls; `RangeReader` handles it by asking `urlProvider` for a fresh one. Every `PikPakException` raised at the HTTP layer carries `httpStatus`, `headers` and `rawBody`.
+
+The 8-connection budget is a measured property of PikPak's CDN, not a tuning knob: one signed URL accepts 8 concurrent connections and answers the 9th with 503, each connection sustains under 1 MB/s, and throughput scales linearly with connection count up to that cap. The SDK builds a separate CDN client per platform whose per-host limit matches the budget, because every engine's default (OkHttp 5, Darwin 4 or 6) is lower. Pass `cdnHttpClient = PikPakClient.tunedCdnClient()` when you inject your own API client and still want the tuned pool.
+
 `SessionStore` defaults to a JSON file at `~/.config/pikpak-kotlin/session_<md5(account)>.json` on JVM. Provide your own (`InMemorySessionStore`, an Android-Context-aware one, etc.) by passing `sessionStore = ...` to the client.
+
+## Upgrading to 0.5.0
+
+- `FileDetail.links` is a `Map<String, DownloadLink>` keyed by content type. `detail.octetStream` and `detail.downloadUrl` cover the previous `links.octetStream` use.
+- `streamRangeFromUrl` takes a block and hands it a live `RangeStream`; the body is no longer read into memory before returning. `RangeStream` sizes are nullable instead of `-1`.
+- `PikPakClient`'s primary constructor takes `passwordSupplier`; the `password: String` overload remains.
+- `login()` before the first call is no longer required: every request logs in on demand and re-authenticates once on 401.
+- `createUrlFile` returns `InstantComplete(raw, file)` instead of a singleton.
+- Errors from `SessionStore.save` propagate instead of being swallowed.
 
 ## Local development
 
@@ -134,6 +159,11 @@ PIKPAK_PASSWORD=your-password
 ```
 
 `.env` is git-ignored. The library itself never reads `.env` — only the integration test suite does.
+
+Two tests go further than the API integration suite and are worth knowing about:
+
+- `RangeReaderSmokeTest` exercises the playback path end to end: it submits a magnet, polls the task, then reads the produced file with one and with eight connections and asserts the fan-out wins. It defaults to a freely redistributable Arch Linux ISO; set `PIKPAK_SMOKE_MAGNET` to read from something else and `PIKPAK_SMOKE_FOLDER` to change where it lands.
+- `CdnNetworkProbeTest` measures the CDN itself (HTTP version, per-connection rate, concurrency cap, idle survival) and writes `build/cdn-probe-report.txt`. It only runs with `PIKPAK_PROBE=1`.
 
 Requires JDK 21. The repo includes a Gradle 8.11 wrapper:
 
