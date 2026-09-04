@@ -11,12 +11,15 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -148,7 +151,71 @@ class RangeReaderMockTest {
         client.close()
     }
 
+    @Test
+    fun `a range past the end of the file stops at EOF instead of asking for more`() = runBlocking {
+        val ranges = mutableListOf<String>()
+        val client = clientWith { req ->
+            ranges += req.headers[HttpHeaders.Range].orEmpty()
+            clippedPartial(req, content)
+        }
+        val reader = RangeReader(client, { "https://cdn/file" })
+
+        var got = 0
+        reader.read(content.size - 100L, 300) { channel ->
+            val buf = ByteArray(1024)
+            while (true) {
+                val n = channel.readAvailable(buf, 0, buf.size)
+                if (n == -1) break
+                got += n
+            }
+        }
+        assertEquals(100, got, "only the bytes that exist are delivered")
+        assertEquals(1, ranges.size, "the clipped response must not be followed by a request past EOF: $ranges")
+        client.close()
+    }
+
+    @Test
+    fun `a cancelled read gives its connection slot back`() = runBlocking {
+        val holding = CompletableDeferred<Unit>()
+        val client = clientWith { req -> partial(req, content) }
+        val reader = RangeReader(client, { "https://cdn/file" }, connectionBudget = 1)
+
+        val stalled = async {
+            reader.read(0, 64) {
+                holding.complete(Unit)
+                awaitCancellation()
+            }
+        }
+        holding.await()
+        stalled.cancel()
+        stalled.join()
+
+        // With the only slot leaked this would hang, so bound the wait.
+        val bytes = withTimeout(2_000) { reader.readBytes(0, 64) }
+        assertContentEquals(content.copyOfRange(0, 64), bytes)
+        assertEquals(0, reader.stats.value.activeReads)
+        client.close()
+    }
+
     // --- helpers ---
+
+    /** Serves like a real CDN: clips the range at EOF and answers 416 past it. */
+    private fun MockRequestHandleScope.clippedPartial(req: HttpRequestData, body: ByteArray): HttpResponseData {
+        val (from, to) = parseRange(req.headers[HttpHeaders.Range]!!)
+        if (from >= body.size) {
+            return respond(ByteReadChannel(ByteArray(0)), HttpStatusCode.RequestedRangeNotSatisfiable)
+        }
+        val end = minOf(to, body.size - 1L)
+        val slice = body.copyOfRange(from.toInt(), end.toInt() + 1)
+        return respond(
+            content = ByteReadChannel(slice),
+            status = HttpStatusCode.PartialContent,
+            headers = Headers.build {
+                append(HttpHeaders.ContentRange, "bytes $from-$end/${body.size}")
+                append(HttpHeaders.ContentLength, slice.size.toString())
+            },
+        )
+    }
 
     private fun MockRequestHandleScope.partial(req: HttpRequestData, body: ByteArray): HttpResponseData {
         val (from, to) = parseRange(req.headers[HttpHeaders.Range]!!)

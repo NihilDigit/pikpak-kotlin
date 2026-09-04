@@ -15,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -114,6 +115,10 @@ class RangeReader(
      * that follows are invisible to it. Bytes arrive in order and exactly
      * once. The channel dies when [block] returns; do not let it escape.
      *
+     * A range that runs past the end of the file ends at EOF, like a file
+     * read: the channel closes after the bytes that exist, and [block] sees
+     * fewer than [length] bytes rather than an error.
+     *
      * @param priority higher wins a contended slot. Equal priorities are FIFO.
      */
     suspend fun <T> read(
@@ -182,6 +187,11 @@ class RangeReader(
      */
     suspend fun prewarm(): String = currentUrl()
 
+    /**
+     * Rejects further [read] calls. Reads already in progress are owned by the
+     * coroutines that started them and finish or cancel with those; nothing
+     * here holds a connection between reads, so there is nothing to tear down.
+     */
     override fun close() {
         closed = true
     }
@@ -227,10 +237,12 @@ class RangeReader(
             val attemptUrl = currentUrl()
             var delivered = 0L
             var announced: Long? = null
+            var clippedAtEof = false
 
             try {
                 client.streamRangeFromUrl(attemptUrl, offset, remaining) { stream ->
                     announced = stream.contentLength
+                    clippedAtEof = stream.endsBeforeRequested(offset, remaining)
                     val buffer = ByteArray(READ_CHUNK)
                     while (true) {
                         val n = stream.channel.readAvailable(buffer, 0, buffer.size)
@@ -282,8 +294,11 @@ class RangeReader(
             val truncated = announced != null && delivered < announced!!
             if (!truncated) {
                 // An open-ended read is done when the server's own
-                // Content-Length has been delivered in full.
-                if (remaining == null || remaining <= 0L) return
+                // Content-Length has been delivered in full. A closed range
+                // that the server clipped at EOF is done too: asking for the
+                // rest would be a request entirely past the end, which the
+                // CDN answers with 416 and no amount of retrying changes.
+                if (remaining == null || remaining <= 0L || clippedAtEof) return
             }
             if (delivered == 0L) {
                 failures++
@@ -322,28 +337,42 @@ class RangeReader(
             )
         }
         url = fresh
-        _stats.value = _stats.value.copy(
-            urlRefreshes = _stats.value.urlRefreshes + 1,
-            lastUrlRefreshAt = Clock.System.now(),
-        )
+        val now = Clock.System.now()
+        _stats.update { it.copy(urlRefreshes = it.urlRefreshes + 1, lastUrlRefreshAt = now) }
         fresh
     }
 
+    // Counters are bumped from every pump at once; a read-copy-write on
+    // StateFlow.value would lose increments, update() retries on contention.
+
     private fun updateStats() {
-        _stats.value = _stats.value.copy(activeReads = gate.inUse, queuedReads = gate.queued)
+        _stats.update { it.copy(activeReads = gate.inUse, queuedReads = gate.queued) }
     }
 
     private fun addBytes(count: Long) {
         if (count <= 0) return
-        _stats.value = _stats.value.copy(bytesRead = _stats.value.bytesRead + count)
+        _stats.update { it.copy(bytesRead = it.bytesRead + count) }
     }
 
     private fun bumpRetries() {
-        _stats.value = _stats.value.copy(retries = _stats.value.retries + 1)
+        _stats.update { it.copy(retries = it.retries + 1) }
     }
 
     private fun bumpThrottled() {
-        _stats.value = _stats.value.copy(throttled = _stats.value.throttled + 1)
+        _stats.update { it.copy(throttled = it.throttled + 1) }
+    }
+
+    /**
+     * True when the server's Content-Range stops short of the requested end
+     * because the file does. Distinguished from a plain short response by the
+     * total: the sent range must run up to it, or the total must be unknown.
+     */
+    private fun RangeStream.endsBeforeRequested(offset: Long, remaining: Long?): Boolean {
+        val requestedEnd = remaining?.let { offset + it - 1 } ?: return false
+        val sentEnd = rangeEndInclusive ?: return false
+        if (sentEnd >= requestedEnd) return false
+        val total = totalSize ?: return true
+        return sentEnd + 1 >= total
     }
 
     private fun throttleBackoff(attempt: Int): Duration =
@@ -367,7 +396,7 @@ class RangeReader(
  * A [RangeReader] over [fileId] that refreshes its own URL via `getFile`.
  * The common case: the caller has a file id and wants bytes.
  */
-suspend fun PikPakClient.rangeReader(
+fun PikPakClient.rangeReader(
     fileId: String,
     connectionBudget: Int = this.connectionBudget,
 ): RangeReader = RangeReader(

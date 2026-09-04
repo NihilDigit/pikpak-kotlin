@@ -2,8 +2,10 @@ package io.github.nihildigit.pikpak.internal
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * A counting semaphore that hands the next free slot to the highest-priority
@@ -49,18 +51,28 @@ internal class PriorityGate(private val capacity: Int) {
         try {
             waiter.granted.await()
         } catch (e: CancellationException) {
-            val stillQueued = mutex.withLock { waiters.remove(waiter) }
-            // Not in the queue means release() already handed us the slot and
-            // nobody will ever use it; give it back.
-            if (!stillQueued) release()
+            withContext(NonCancellable) {
+                val stillQueued = mutex.withLock { waiters.remove(waiter) }
+                // Not in the queue means release() already handed us the slot
+                // and nobody will ever use it; give it back.
+                if (!stillQueued) release()
+            }
             throw e
         }
     }
 
+    /**
+     * Safe to call from a cancelled coroutine. Taking the mutex is a suspension
+     * point, and a cancelled caller that had to wait for it would throw before
+     * the slot was returned; a slot lost that way is never recovered, and a
+     * gate that has lost all of them hangs every later acquire.
+     */
     suspend fun release() {
-        mutex.withLock {
-            val next = waiters.removeFirstOrNull()
-            if (next == null) inUse-- else next.granted.complete(Unit)
+        withContext(NonCancellable) {
+            mutex.withLock {
+                val next = waiters.removeFirstOrNull()
+                if (next == null) inUse-- else next.granted.complete(Unit)
+            }
         }
     }
 
