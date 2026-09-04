@@ -18,7 +18,7 @@ Small, atomic, well-typed surface over the PikPak HTTP API. The painful parts â€
 ```kotlin
 repositories { mavenCentral() }
 dependencies {
-    implementation("io.github.nihildigit:pikpak-kotlin:0.5.0")
+    implementation("io.github.nihildigit:pikpak-kotlin:0.5.1")
 
     // Ktor is compileOnly in the SDK so it never upgrades the Ktor
     // version you've already pinned. Declare the pieces the SDK uses plus
@@ -138,7 +138,27 @@ A range that runs past the end of the file ends at EOF. A signed URL that the CD
 
 The 8-connection budget is a measured property of PikPak's CDN, not a tuning knob: one signed URL accepts 8 concurrent connections and answers the 9th with 503, each connection sustains under 1 MB/s, and throughput scales linearly with connection count up to that cap. The SDK builds a separate CDN client per platform whose per-host limit matches the budget, because every engine's default (OkHttp 5, Darwin 4 or 6) is lower. Pass `cdnHttpClient = PikPakClient.tunedCdnClient()` when you inject your own API client and still want the tuned pool.
 
+#### Variants
+
+A video file on PikPak exists as the uploaded original plus, once PikPak has transcoded it, a set of MPEG-TS variants at 1080P, 720P and 480P. Each is a separate resource with its own signed link and its own byte count, so the choice is made once and then locked by `mediaId`.
+
+```kotlin
+val v = client.resolveVariant(fileId, VariantPreference.Resolution("720P"))
+v.mediaId                                     // null for the original; persist this
+val size = v.sizeBytes ?: client.remoteSize(v.link.url)
+
+val reader = client.rangeReader(fileId, v.mediaId)   // reopens the same bytes later
+```
+
+`resolveVariant` falls back to the original when the requested resolution is absent or still transcoding. That fallback happens at resolve time only: `rangeReader(fileId, mediaId)` refreshes an expired link by taking the same `mediaId` from a fresh file detail, and fails with `PikPakException` when that variant is gone, rather than reading another variant's bytes at an offset the caller committed to. `FileDetail.variant(mediaId)` is the same lookup without a network call.
+
+Transcodes carry no embedded subtitles and a lower audio bitrate than the original. Their length is not in the file metadata; `remoteSize` derives it from a one-byte range probe's `Content-Range`.
+
 `SessionStore` defaults to a JSON file at `~/.config/pikpak-kotlin/session_<md5(account)>.json` on JVM. Provide your own (`InMemorySessionStore`, an Android-Context-aware one, etc.) by passing `sessionStore = ...` to the client.
+
+## Upgrading to 0.5.1
+
+Additive; nothing breaks. `VariantPreference`, `ResolvedVariant`, `FileDetail.resolveVariant`, `FileDetail.variant`, `PikPakClient.resolveVariant`, `PikPakClient.remoteSize` and the `rangeReader(fileId, mediaId)` overload are new. The existing `rangeReader(fileId)` is unchanged and equivalent to `mediaId = null`.
 
 ## Upgrading to 0.5.0
 

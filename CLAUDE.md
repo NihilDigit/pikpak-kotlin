@@ -25,7 +25,7 @@ Published as `io.github.nihildigit:pikpak-kotlin` on Maven Central. Source of tr
 
 ### Request pipeline (read before touching the auth/retry code)
 
-Public endpoints are `suspend` extension functions (`Endpoints.kt`, `FolderEndpoints.kt`, `UploadEndpoint.kt`, `DownloadEndpoint.kt`, `UrlOfflineEndpoint.kt`, `RangeStreamEndpoint.kt`). They delegate to `PikPakClient.http.request(...)` with an optional `captchaAction`. `HttpEngine` (`internal/HttpEngine.kt`) handles rate-limit acquisition, standard PikPak headers, on-demand login, one-shot captcha refresh on `error_code=9`, one-shot re-authentication on HTTP 401, and exponential-backoff retry on transient transport errors and 5xx/429. `AuthApi` (`internal/AuthApi.kt`) owns the session state machine — in-memory session → store → refresh_token → full signin — plus the salt-cascade captcha signing flow.
+Public endpoints are `suspend` extension functions (`Endpoints.kt`, `FolderEndpoints.kt`, `UploadEndpoint.kt`, `DownloadEndpoint.kt`, `UrlOfflineEndpoint.kt`, `RangeStreamEndpoint.kt`, `VariantEndpoint.kt`). They delegate to `PikPakClient.http.request(...)` with an optional `captchaAction`. `HttpEngine` (`internal/HttpEngine.kt`) handles rate-limit acquisition, standard PikPak headers, on-demand login, one-shot captcha refresh on `error_code=9`, one-shot re-authentication on HTTP 401, and exponential-backoff retry on transient transport errors and 5xx/429. `AuthApi` (`internal/AuthApi.kt`) owns the session state machine — in-memory session → store → refresh_token → full signin — plus the salt-cascade captcha signing flow.
 
 Two invariants the concurrency fixes depend on:
 
@@ -35,6 +35,8 @@ Two invariants the concurrency fixes depend on:
 `sendRaw` streams (`prepareRequest { }.execute { }`, never `request()` + `save()`) and skips PikPak-specific headers so the OSS CDN (upload + download) doesn't get them and 406 us. It uses the CDN client, not the API client, and is not rate-limited. 401/403 on a signed URL become `UrlExpiredException` before the block runs.
 
 `RangeReader` (`RangeReader.kt`) is the playback primitive: one instance per remote file, reads share `connectionBudget` slots through `PriorityGate`, higher priority wins a contended slot, expiry goes back to `urlProvider`, 503 waits, a truncated body resumes from the delivered offset, a range past EOF ends at EOF. `PriorityGate.release()` runs under `NonCancellable` because a cancelled reader that had to wait for the mutex would otherwise leak its slot for good.
+
+`VariantEndpoint.kt` picks which representation of a media file to read — the octet-stream original or one of PikPak's transcoded MPEG-TS variants — and owns `remoteSize`, the one-byte Content-Range probe that `parallelDownloadFromUrl` also uses. One invariant: **a variant is chosen once and locked by `mediaId`; refresh never reselects.** `resolveVariant` is where a missing or still-transcoding variant falls back to the original, and it is the only place that fallback happens. `rangeReader(fileId, mediaId)` looks the id up again on every refresh and throws when it is gone, because the variants are different byte streams and a caller reading at a committed offset would otherwise get corruption instead of an error.
 
 ### Shipped targets
 

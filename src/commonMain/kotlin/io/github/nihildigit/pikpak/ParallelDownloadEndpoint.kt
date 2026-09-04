@@ -35,8 +35,8 @@ import kotlinx.io.write
  *    a wait rather than a failure. This is the difference from the previous
  *    revision, where one failed part discarded every other part's work.
  *  - If [expectedSize] >= 0 the caller's value is used verbatim. If < 0 the
- *    function issues one 1-byte probe range request to derive the total size
- *    from the response's `Content-Range` header.
+ *    size comes from [remoteSize], which derives it from a 1-byte probe's
+ *    `Content-Range` header.
  *
  * Failure modes — throws [PikPakException]:
  *  - [partCount] < 1 (caller bug — fail fast).
@@ -81,19 +81,7 @@ public suspend fun PikPakClient.parallelDownloadFromUrl(
         return downloadFromUrl(url, dest, expectedSize)
     }
 
-    val totalSize: Long = if (expectedSize >= 0L) {
-        expectedSize
-    } else {
-        val probed = streamRangeFromUrl(url, start = 0L, length = 1L) { it.totalSize } ?: -1L
-        if (probed <= 0L) {
-            throw PikPakException(
-                -1,
-                "parallelDownloadFromUrl: probe did not return a parseable Content-Range total " +
-                    "(got totalSize=$probed); server may have returned \"*\" or omitted Content-Range",
-            )
-        }
-        probed
-    }
+    val totalSize: Long = if (expectedSize >= 0L) expectedSize else remoteSize(url)
 
     if (totalSize == 0L) {
         SystemFileSystem.delete(dest, mustExist = false)
