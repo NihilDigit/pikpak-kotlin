@@ -4,6 +4,7 @@ import io.github.cdimascio.dotenv.dotenv
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
+import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -23,7 +24,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeSource
 
 /**
  * End-to-end check of the pieces animeko's playback path depends on, against
@@ -43,6 +46,15 @@ class RangeReaderSmokeTest {
     private val username = env["PIKPAK_USERNAME"]?.takeIf { it.isNotBlank() && !it.contains("@example.com") }
     private val password = env["PIKPAK_PASSWORD"]?.takeIf { it.isNotBlank() && it != "your-password" }
     private val folder = env["PIKPAK_SMOKE_FOLDER"] ?: "Animeko-Playing"
+
+    /**
+     * The release the smoke reads from. A magnet rather than a file id so the
+     * test can set itself up on any account: it is submitted once, and every
+     * later run finds the finished task by info hash and reuses its file.
+     * Override with `PIKPAK_SMOKE_MAGNET` to read from something else.
+     */
+    private val magnet = env["PIKPAK_SMOKE_MAGNET"]?.takeIf { it.startsWith("magnet:") } ?: TestFixtures.ARCH_ISO_MAGNET
+    private val infoHash = magnet.substringAfter("urn:btih:").substringBefore('&').lowercase()
 
     private val paths = ConcurrentHashMap<String, AtomicInteger>()
     private val statuses = ConcurrentHashMap<Int, AtomicInteger>()
@@ -101,19 +113,13 @@ class RangeReaderSmokeTest {
             )
             println("[smoke] auth calls after two logins: signin=${count("/v1/auth/signin")} token=${count("/v1/auth/token")}")
 
-            val parentId = client.getPathFolderId(folder)
-            // Releases usually land one level down, in a per-title folder.
-            val pool = client.listFiles(parentId).let { top ->
-                top + top.filter { it.isFolder }.flatMap { client.listFiles(it.id) }
-            }
-            println("[smoke] $folder holds ${pool.count { it.isFile }} files across ${pool.count { it.isFolder }} subfolders")
-            val target = pool.filter { it.isFile && it.sizeBytes > 4L * 1024 * 1024 }
-                .maxByOrNull { it.sizeBytes }
-            Assumptions.assumeTrue(target != null, "no file over 4 MB under $folder")
-            val detail = client.getFile(target!!.id)
+            val parentId = client.getOrCreateDeepFolderId("", folder)
+            val target = resolveRelease(client, parentId)
+            val detail = client.getFile(target.id)
             val url = detail.downloadUrl!!
             println("[smoke] file=${detail.name} size=${detail.sizeBytes} links=${detail.links.keys}")
             println("[smoke] expiresAt=${detail.octetStream.expiresAt} queryKeys=${queryKeys(url)}")
+            Assumptions.assumeTrue(detail.sizeBytes >= 64L * 1024 * 1024, "release is under 64 MB, too small to time")
 
             // 2. Eight concurrent reads must all land, with no 503 reaching us.
             val readerBudget = budget
@@ -128,9 +134,16 @@ class RangeReaderSmokeTest {
             assertTrue(results.all { it == chunk.toInt() }, "every concurrent read must deliver a full chunk")
             val seen503 = (statuses[503]?.get() ?: 0) - before503
             println("[smoke] 8 concurrent reads OK; wire 503s during the burst = $seen503; stats=${reader.stats.value}")
+
+            // 3. Throughput: one connection against eight, same file, disjoint
+            // offsets so neither run is served from a warm edge cache.
+            val single = timeRead(reader, offset = 16L shl 20, total = 8L shl 20, parts = 1)
+            val fanned = timeRead(reader, offset = 64L shl 20, total = 32L shl 20, parts = 8)
+            println("[smoke] throughput: 1 conn = ${"%.2f".format(single)} MB/s, 8 conn = ${"%.2f".format(fanned)} MB/s, x${"%.1f".format(fanned / single)}")
+            assertTrue(fanned > single * 2, "eight connections must beat one by a wide margin: $fanned vs $single MB/s")
             reader.close()
 
-            // 3. A tampered signature must be recovered from via the provider.
+            // 4. A tampered signature must be recovered from via the provider.
             val tampered = tamperExpiry(url)
             Assumptions.assumeTrue(tampered != null, "download URL has no recognizable expiry parameter")
             var handedStale = false
@@ -154,11 +167,11 @@ class RangeReaderSmokeTest {
             println("[smoke] recovered ${recovered.size} bytes after one refresh; stats=${refreshingReader.stats.value}")
             refreshingReader.close()
 
-            // 4. parallelDownloadFromUrl still writes a whole small file.
+            // 5. parallelDownloadFromUrl still writes a whole small file.
             // Downloading a 1.4 GB episode four ways proves nothing the small
             // case does not, and costs minutes; upload a scratch file when the
             // folder holds nothing small.
-            val existingSmall = pool.filter { it.isFile && it.sizeBytes in 1L..(8L * 1024 * 1024) }
+            val existingSmall = client.listFiles(parentId).filter { it.isFile && it.sizeBytes in 1L..(8L * 1024 * 1024) }
                 .minByOrNull { it.sizeBytes }
             val smallId = existingSmall?.id ?: uploadScratchFile(client, parentId).also { uploaded = it }
             // A just-uploaded file has no signed link until PikPak finishes
@@ -190,6 +203,82 @@ class RangeReaderSmokeTest {
             client.close()
             http.close()
         }
+    }
+
+    /**
+     * The video file the magnet produced, submitting it if this account has
+     * never fetched it. Finished tasks are matched by info hash in the task
+     * list, because PikPak has no lookup by URL and the file's name is
+     * whatever the torrent called it.
+     */
+    private suspend fun resolveRelease(client: PikPakClient, parentId: String): FileStat {
+        // The default `with=reference_resource` overlays the output file's
+        // state, so a task whose file was since deleted reads as ERROR here
+        // and is not reused. Another client can still delete the file between
+        // this listing and getFile, hence the 404 fallback.
+        val done = client.listOfflineTasks(phaseFilter = TaskPhase.COMPLETE).tasks
+            .firstOrNull { task -> task.params.values.any { it.lowercase().contains(infoHash) } && task.fileId.isNotEmpty() }
+        val reused = done?.let { task ->
+            try {
+                client.getFile(task.fileId)
+            } catch (e: PikPakException) {
+                if (e.httpStatus == 404) null else throw e
+            }
+        }
+        val produced = reused ?: client.getFile(submitAndAwait(client, parentId))
+        println("[smoke] task output ${produced.name} kind=${produced.kind} (${if (reused != null) "reused task ${done!!.id}" else "fresh task"})")
+        val video = if (produced.kind == FileKind.FOLDER) {
+            client.listFiles(produced.id).filter { it.isFile }.maxByOrNull { it.sizeBytes }
+                ?: error("task folder ${produced.name} holds no files")
+        } else {
+            FileStat(id = produced.id, name = produced.name, kind = produced.kind, size = produced.size)
+        }
+        return video
+    }
+
+    private suspend fun submitAndAwait(client: PikPakClient, parentId: String): String {
+        val task = when (val result = client.createUrlFile(parentId, magnet)) {
+            is CreateUrlResult.Queued -> result.task
+            is CreateUrlResult.InstantComplete ->
+                return result.file?.id ?: error("instant complete without a file node: ${result.raw}")
+        }
+        println("[smoke] submitted task ${task.id} phase=${task.phase} fileId=${task.fileId}")
+        val deadline = TimeSource.Monotonic.markNow() + 10.minutes
+        var latest = task
+        while (latest.phase !in TaskPhase.TERMINAL) {
+            check(deadline.hasNotPassedNow()) { "task ${task.id} still ${latest.phase} after 10 minutes" }
+            delay(3.seconds)
+            latest = client.getTask(task.id)
+            println("[smoke] task ${latest.id} phase=${latest.phase} progress=${latest.progress} message=${latest.message}")
+        }
+        check(latest.phase == TaskPhase.COMPLETE) { "task ${task.id} ended in ${latest.phase}: ${latest.message}" }
+        check(latest.fileId.isNotEmpty()) { "task ${task.id} completed without a file id" }
+        return latest.fileId
+    }
+
+    /** Reads [total] bytes from [offset] as [parts] concurrent equal ranges and returns MB/s. */
+    private suspend fun timeRead(reader: RangeReader, offset: Long, total: Long, parts: Int): Double {
+        val partSize = total / parts
+        val started = TimeSource.Monotonic.markNow()
+        val delivered = coroutineScope {
+            (0 until parts).map { i ->
+                async {
+                    var n = 0L
+                    reader.read(offset + i * partSize, partSize) { channel ->
+                        val buf = ByteArray(256 * 1024)
+                        while (true) {
+                            val read = channel.readAvailable(buf, 0, buf.size)
+                            if (read == -1) break
+                            n += read
+                        }
+                    }
+                    n
+                }
+            }.awaitAll().sum()
+        }
+        val seconds = started.elapsedNow().inWholeMilliseconds / 1000.0
+        assertEquals(total, delivered, "timed read must deliver every byte")
+        return delivered / (1024.0 * 1024.0) / seconds
     }
 
     /** Uploads 2 MiB of deterministic bytes and returns the new file id. */

@@ -101,7 +101,7 @@ class RateLimiterTest {
      * — and the bucket issued up to twice the configured rate.
      */
     @Test
-    fun `a latecomer cannot take a token already promised to a waiter`() = runBlocking {
+    fun `a latecomer cannot take a token already promised to a waiter`() = runBlocking<Unit> {
         val limiter = RateLimiter(capacity = 1, refillPerSecond = 5.0)
         limiter.acquire() // drains the bucket
         coroutineScope {

@@ -29,8 +29,7 @@ class IntegrationOfflineDownloadTest {
     private val username = env["PIKPAK_USERNAME"]?.takeIf { it.isNotBlank() && !it.contains("@example.com") }
     private val password = env["PIKPAK_PASSWORD"]?.takeIf { it.isNotBlank() && it != "your-password" }
 
-    private val magnet =
-        "magnet:?xt=urn:btih:157e0a57e1af0e1cfd46258ba6c62938c21b6ee8&dn=archlinux-2026.04.01-x86_64.iso"
+    private val magnet = TestFixtures.ARCH_ISO_MAGNET
 
     @Test
     fun `createUrlFile accepts a magnet and surfaces it in listOfflineTasks`() = runBlocking {
