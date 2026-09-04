@@ -136,14 +136,18 @@ internal class AuthApi(private val pikpak: PikPakClient) {
         return signInLocked()
     }
 
-    suspend fun refreshCaptchaToken(action: String) {
-        // Snapshot before queuing for the lock. N coroutines that all hit
-        // error_code=9 on the same stale token would otherwise each issue a
-        // captcha/init; whoever gets the lock first refreshes, and the rest
-        // find the token already changed and reuse it.
-        val stale = pikpak.state.captchaToken
+    /**
+     * Replaces [rejected], the token the failed request was sent with. N
+     * coroutines that all hit error_code=9 on the same token must produce one
+     * captcha/init: whoever takes the lock first refreshes, and the rest find
+     * the token already changed and reuse it. The caller supplies [rejected]
+     * because a snapshot taken here would be taken too late — a coroutine
+     * that reaches this point after the first refresh has completed would
+     * snapshot the fresh token and refresh it again.
+     */
+    suspend fun refreshCaptchaToken(action: String, rejected: String) {
         pikpak.mutex.withLock {
-            if (pikpak.state.captchaToken != stale) return
+            if (pikpak.state.captchaToken != rejected) return
             refreshCaptchaTokenLocked(action)
         }
     }

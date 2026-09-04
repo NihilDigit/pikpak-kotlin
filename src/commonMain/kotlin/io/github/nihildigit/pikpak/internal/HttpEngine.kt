@@ -71,7 +71,12 @@ internal class HttpEngine(
         var captchaRetried = false
         var reauthRetried = false
         while (true) {
+            // Both snapshots are taken before the request goes out, not when
+            // its failure comes back: by then another coroutine may already
+            // have replaced the value, and a snapshot of the replacement
+            // would not match the state that was actually rejected.
             val sessionUsed = pikpak.state.session
+            val captchaUsed = pikpak.state.captchaToken
             val element = try {
                 requestRaw(method, url) {
                     applyAuthHeaders()
@@ -92,7 +97,7 @@ internal class HttpEngine(
             val errorCode = element.tryGetErrorCode()
             if (errorCode == ErrorCodes.OK) return element
             if (errorCode == ErrorCodes.CAPTCHA_REQUIRED && captchaAction != null && !captchaRetried) {
-                pikpak.auth.refreshCaptchaToken(captchaAction)
+                pikpak.auth.refreshCaptchaToken(captchaAction, captchaUsed)
                 captchaRetried = true
                 continue
             }
