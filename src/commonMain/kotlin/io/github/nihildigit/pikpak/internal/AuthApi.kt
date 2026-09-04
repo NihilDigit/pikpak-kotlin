@@ -95,10 +95,18 @@ internal class AuthApi(private val pikpak: PikPakClient) {
             put("grant_type", "refresh_token")
             put("refresh_token", refreshToken)
         }
-        val response = pikpak.http.requestRaw(
-            HttpMethod.Post,
-            "${PikPakConstants.USER_BASE}/v1/auth/token",
-        ) { jsonBody(pikpak.json, body) }
+        // The server reports a dead refresh token either as a 2xx envelope
+        // or as a 4xx carrying the same envelope; requestRaw throws for the
+        // latter, so both shapes are checked.
+        val response = try {
+            pikpak.http.requestRaw(
+                HttpMethod.Post,
+                "${PikPakConstants.USER_BASE}/v1/auth/token",
+            ) { jsonBody(pikpak.json, body) }
+        } catch (e: PikPakException) {
+            if (e.isRefreshTokenInvalid) return signInLocked()
+            throw e
+        }
         val errorCode = (response as? JsonObject)?.get("error_code")
             ?.let { (it as? JsonPrimitive)?.intOrNull } ?: 0
         if (errorCode == ErrorCodes.REFRESH_TOKEN_INVALID) {

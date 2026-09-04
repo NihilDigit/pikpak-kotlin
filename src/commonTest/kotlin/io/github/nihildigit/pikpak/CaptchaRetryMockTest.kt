@@ -32,7 +32,7 @@ class CaptchaRetryMockTest {
 
     private val callLog = mutableListOf<String>()
 
-    private fun newClient(): PikPakClient {
+    private fun newClient(captchaRejectionStatus: HttpStatusCode = HttpStatusCode.OK): PikPakClient {
         val engine = MockEngine { request ->
             val path = request.url.encodedPath
             callLog += "${request.method.value} $path"
@@ -47,6 +47,7 @@ class CaptchaRetryMockTest {
                 )
                 path.endsWith("/drive/v1/files") && filesGetCount == 1 -> json(
                     """{"error_code":9,"error":"captcha_required"}""",
+                    status = captchaRejectionStatus,
                 )
                 path.endsWith("/drive/v1/files") -> json(
                     """{"next_page_token":"","files":[
@@ -69,9 +70,9 @@ class CaptchaRetryMockTest {
         )
     }
 
-    private fun MockRequestHandleScope.json(body: String) = respond(
+    private fun MockRequestHandleScope.json(body: String, status: HttpStatusCode = HttpStatusCode.OK) = respond(
         content = ByteReadChannel(body),
-        status = HttpStatusCode.OK,
+        status = status,
         headers = headersOf(HttpHeaders.ContentType, "application/json"),
     )
 
@@ -100,6 +101,26 @@ class CaptchaRetryMockTest {
 
             val signinCalls = callLog.count { it.endsWith("/v1/auth/signin") }
             assertEquals(1, signinCalls, "we must NOT fall back to a fresh signin on captcha-9")
+        } finally {
+            client.close()
+        }
+    }
+
+    /**
+     * The live server sends captcha_invalid as HTTP 400 with the envelope in
+     * the body, not as a 2xx. 0.5.0 turned any non-2xx into a bare "HTTP 400"
+     * before looking at the body, so the refresh never fired.
+     */
+    @Test
+    fun `error_code 9 on HTTP 400 still refreshes captcha and retries`() = runBlocking {
+        val client = newClient(captchaRejectionStatus = HttpStatusCode.BadRequest)
+        try {
+            client.login()
+            val files = client.listFiles(parentId = "root-folder")
+            assertEquals("hello.txt", files.single().name)
+            assertEquals(2, callLog.count { it.endsWith("/v1/shield/captcha/init") })
+            assertEquals(2, callLog.count { it == "GET /drive/v1/files" })
+            assertEquals("CAPTCHA-2", client.state.captchaToken)
         } finally {
             client.close()
         }

@@ -92,6 +92,13 @@ internal class HttpEngine(
                     pikpak.mutex.withLock { pikpak.auth.reauthenticateLocked(sessionUsed) }
                     continue
                 }
+                // Captcha rejection arrives as HTTP 400 with error_code 9 in
+                // the body, not as a 2xx envelope; same recovery as below.
+                if (e.isCaptchaRequired && captchaAction != null && !captchaRetried) {
+                    pikpak.auth.refreshCaptchaToken(captchaAction, captchaUsed)
+                    captchaRetried = true
+                    continue
+                }
                 throw e
             }
             val errorCode = element.tryGetErrorCode()
@@ -133,13 +140,21 @@ internal class HttpEngine(
     ) { response ->
         val text = response.bodyAsText()
         if (!response.status.isSuccess()) {
-            throw PikPakException(
-                errorCode = -1,
-                errorMessage = "HTTP ${response.status.value}",
-                httpStatus = response.status.value,
-                headers = response.headerMap(),
-                rawBody = text.truncateForError(),
-            )
+            // A 4xx from the API usually still carries the normal error
+            // envelope: captcha_invalid (error_code 9) rides on HTTP 400,
+            // refresh-token rejection on 401. Keep those fields on the
+            // exception so request() can refresh the captcha and AuthApi can
+            // fall back to a fresh signin. 0.5.0 threw a bare "HTTP 400" here,
+            // which silently disabled both recoveries.
+            val envelope = parseErrorEnvelopeOrNull(text)
+            throw envelope?.toException(response.status.value, response.headerMap())
+                ?: PikPakException(
+                    errorCode = -1,
+                    errorMessage = "HTTP ${response.status.value}",
+                    httpStatus = response.status.value,
+                    headers = response.headerMap(),
+                    rawBody = text.truncateForError(),
+                )
         }
         // Some PikPak endpoints (e.g. DELETE) legitimately return an empty 2xx body.
         if (text.isBlank()) return@execute JsonObject(emptyMap())
@@ -298,13 +313,32 @@ internal class HttpEngine(
         return code.intOrNull ?: ErrorCodes.OK
     }
 
-    private fun JsonElement.toException(): PikPakException {
+    private fun JsonElement.toException(
+        httpStatus: Int? = null,
+        headers: Map<String, List<String>> = emptyMap(),
+    ): PikPakException {
         val obj = this as? JsonObject
-            ?: return PikPakException(-1, "unexpected response", this.toString())
+            ?: return PikPakException(-1, "unexpected response", this.toString(), httpStatus, headers)
         val code = (obj["error_code"] as? JsonPrimitive)?.intOrNull ?: -1
         val msg = (obj["error"] as? JsonPrimitive)?.contentOrNull.orEmpty()
         val desc = (obj["error_description"] as? JsonPrimitive)?.contentOrNull
-        return PikPakException(code, msg, desc, rawBody = obj.toString().truncateForError())
+        return PikPakException(
+            code, msg, desc, httpStatus, headers,
+            rawBody = obj.toString().truncateForError(),
+        )
+    }
+
+    /** The body as a PikPak error envelope, or null when it is not one (non-JSON, or no numeric `error_code`). */
+    private fun parseErrorEnvelopeOrNull(text: String): JsonObject? {
+        if (text.isBlank()) return null
+        val element = try {
+            pikpak.json.parseToJsonElement(text)
+        } catch (e: SerializationException) {
+            return null
+        }
+        val obj = element as? JsonObject ?: return null
+        val code = (obj["error_code"] as? JsonPrimitive)?.intOrNull ?: return null
+        return if (code != ErrorCodes.OK) obj else null
     }
 
     companion object {
