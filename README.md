@@ -18,7 +18,7 @@ Small, atomic, well-typed surface over the PikPak HTTP API. The painful parts â€
 ```kotlin
 repositories { mavenCentral() }
 dependencies {
-    implementation("io.github.nihildigit:pikpak-kotlin:0.5.1")
+    implementation("io.github.nihildigit:pikpak-kotlin:0.5.2")
 
     // Ktor is compileOnly in the SDK so it never upgrades the Ktor
     // version you've already pinned. Declare the pieces the SDK uses plus
@@ -155,6 +155,10 @@ val reader = client.rangeReader(fileId, v.mediaId)   // reopens the same bytes l
 Transcodes carry no embedded subtitles and a lower audio bitrate than the original. Their length is not in the file metadata; `remoteSize` derives it from a one-byte range probe's `Content-Range`.
 
 `SessionStore` defaults to a JSON file at `~/.config/pikpak-kotlin/session_<md5(account)>.json` on JVM. Provide your own (`InMemorySessionStore`, an Android-Context-aware one, etc.) by passing `sessionStore = ...` to the client.
+
+## Upgrading to 0.5.2
+
+No API change. A non-2xx response now has its error envelope parsed, so `PikPakException` carries the real `errorCode` and `httpStatus` instead of `-1` and `HTTP 400`. A captcha rejection delivered with HTTP 400 is retried once with a fresh captcha token, and an invalid refresh token falls back to a password sign-in, as 0.4.x did; 0.5.0 and 0.5.1 surfaced both as failures.
 
 ## Upgrading to 0.5.1
 
