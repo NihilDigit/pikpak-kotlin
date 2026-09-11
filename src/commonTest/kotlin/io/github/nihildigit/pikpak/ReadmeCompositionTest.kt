@@ -6,8 +6,10 @@ import io.ktor.client.engine.mock.respond
 import io.ktor.http.HttpStatusCode
 import io.ktor.utils.io.ByteReadChannel
 import kotlinx.coroutines.runBlocking
+import kotlinx.io.files.Path
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -57,6 +59,41 @@ class ReadmeCompositionTest {
         handle.close()
         client.close()
         assertTrue(plain is RangeSource)
+    }
+
+    /**
+     * The opening example reaches for `use`, which only works while `close`
+     * stays non-suspending — and it is non-suspending on purpose, so that a
+     * player can release its input from a lifecycle callback. Nothing else
+     * would catch that pairing breaking.
+     */
+    @Test
+    fun `a stream can be closed by use`() = runBlocking<Unit> {
+        val client = newClient()
+        val handle = PikPakFileHandle(client, gcid = "C".repeat(40), size = 64, name = "x.mkv")
+        var entered = false
+        try {
+            handle.openStream(size = 64).use { stream ->
+                entered = true
+                assertEquals(64L, stream.bytesRemaining)
+            }
+        } finally {
+            handle.close()
+            client.close()
+        }
+        assertTrue(entered, "the use block never ran")
+    }
+
+    /** The download line in the README, on the same handle the playback line uses. */
+    @Test
+    fun `a handle is also what downloadTo takes`() {
+        // Compiled, not called: a real download would need a network. What is
+        // being checked is that `handle.downloadTo(...)` resolves at all, since
+        // downloadTo is an extension on RangeSource and PikPakFileHandle is one.
+        val call: suspend (PikPakFileHandle, Path) -> Long = { handle, dest ->
+            handle.downloadTo(dest, totalSize = 1_000, priority = 1)
+        }
+        assertNotNull(call)
     }
 
     /**
