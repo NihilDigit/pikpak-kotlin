@@ -20,12 +20,12 @@ Published as `io.github.nihildigit:pikpak-kotlin` on Maven Central. Source of tr
 - `src/jvmMain/`, `src/androidMain/`, `src/appleMain/`, `src/linuxMain/`, `src/mingwMain/` — per-platform actuals: `defaultSessionDir()` and `defaultCdnHttpClient()` (`internal/CdnClient.*.kt`), the latter tuning each engine's per-host connection cap to the CDN budget.
 - `src/nativeMain/` — `defaultSessionDir()` actual for all native targets (posix `getenv`).
 - `src/commonTest/` — unit tests that run on every target: gcid vectors, MockEngine-based auth/captcha/401 paths, `RangeReaderMockTest` for budget, refresh, 503, resume and EOF behaviour.
-- `src/jvmTest/` — live PikPak API integration tests, opt-in via `.env`. `RangeReaderSmokeTest` is the end-to-end playback-path check (magnet → task → range reads → fan-out throughput); `CdnNetworkProbeTest` measures the CDN and runs only with `PIKPAK_PROBE=1`. Shared inputs live in `TestFixtures`.
+- `src/jvmTest/` — live PikPak API integration tests, opt-in via `.env`. `RangeReaderSmokeTest` is the end-to-end playback-path check (magnet → task → range reads → fan-out throughput); `CdnNetworkProbeTest` measures the CDN and runs only with `PIKPAK_PROBE=1`; `WeakLinkSmokeTest` measures what the fan-out is worth on the current link and runs only with `PIKPAK_WEAKLINK=1` — it asserts nothing about speed, because "no gain" is the correct answer on a short route. Shared inputs live in `TestFixtures`.
 - `internal/` sub-package — implementation helpers not meant for consumers: `HttpEngine`, `AuthApi`, `PriorityGate` (priority-ordered semaphore behind `RangeReader`), `FolderIdCache`, `CdnClient`.
 
 ### Request pipeline (read before touching the auth/retry code)
 
-Public endpoints are `suspend` extension functions (`Endpoints.kt`, `FolderEndpoints.kt`, `UploadEndpoint.kt`, `DownloadEndpoint.kt`, `UrlOfflineEndpoint.kt`, `RangeStreamEndpoint.kt`, `VariantEndpoint.kt`). They delegate to `PikPakClient.http.request(...)` with an optional `captchaAction`. `HttpEngine` (`internal/HttpEngine.kt`) handles rate-limit acquisition, standard PikPak headers, on-demand login, one-shot captcha refresh on `error_code=9`, one-shot re-authentication on HTTP 401, and exponential-backoff retry on transient transport errors and 5xx/429. `AuthApi` (`internal/AuthApi.kt`) owns the session state machine — in-memory session → store → refresh_token → full signin — plus the salt-cascade captcha signing flow.
+Public endpoints are `suspend` extension functions (`Endpoints.kt`, `FolderEndpoints.kt`, `UploadEndpoint.kt`, `DownloadEndpoint.kt`, `UrlOfflineEndpoint.kt`, `RangeStreamEndpoint.kt`, `VariantEndpoint.kt`, `MagnetResolveEndpoint.kt`). They delegate to `PikPakClient.http.request(...)` with an optional `captchaAction`. `HttpEngine` (`internal/HttpEngine.kt`) handles rate-limit acquisition, standard PikPak headers, on-demand login, one-shot captcha refresh on `error_code=9`, one-shot re-authentication on HTTP 401, and exponential-backoff retry on transient transport errors and 5xx/429. `AuthApi` (`internal/AuthApi.kt`) owns the session state machine — in-memory session → store → refresh_token → full signin — plus the salt-cascade captcha signing flow.
 
 Two invariants the concurrency fixes depend on:
 
@@ -36,7 +36,22 @@ Two invariants the concurrency fixes depend on:
 
 `RangeReader` (`RangeReader.kt`) is the playback primitive: one instance per remote file, reads share `connectionBudget` slots through `PriorityGate`, higher priority wins a contended slot, expiry goes back to `urlProvider`, 503 waits, a truncated body resumes from the delivered offset, a range past EOF ends at EOF. `PriorityGate.release()` runs under `NonCancellable` because a cancelled reader that had to wait for the mutex would otherwise leak its slot for good.
 
-`VariantEndpoint.kt` picks which representation of a media file to read — the octet-stream original or one of PikPak's transcoded MPEG-TS variants — and owns `remoteSize`, the one-byte Content-Range probe that `parallelDownloadFromUrl` also uses. One invariant: **a variant is chosen once and locked by `mediaId`; refresh never reselects.** `resolveVariant` is where a missing or still-transcoding variant falls back to the original, and it is the only place that fallback happens. `rangeReader(fileId, mediaId)` looks the id up again on every refresh and throws when it is gone, because the variants are different byte streams and a caller reading at a committed offset would otherwise get corruption instead of an error.
+`VariantEndpoint.kt` picks which representation of a media file to read — the octet-stream original or one of PikPak's transcoded MPEG-TS variants — and owns `remoteSize`, the one-byte Content-Range probe that `downloadFromUrl` also uses. One invariant: **a variant is chosen once and locked by `mediaId`; refresh never reselects.** `resolveVariant` is where a missing or still-transcoding variant falls back to the original, and it is the only place that fallback happens. `rangeReader(fileId, mediaId)` looks the id up again on every refresh and throws when it is gone, because the variants are different byte streams and a caller reading at a committed offset would otherwise get corruption instead of an error.
+
+### The gcid path (read before touching `MagnetResolveEndpoint` or `PikPakFileHandle`)
+
+PikPak stores content by hash, and both halves of that are reachable, which is why a magnet does not need an offline download. `resolveMagnet` (`POST /drive/v1/resource/list`) parses a magnet into a file tree carrying each file's gcid without creating a task or touching the drive; `instantCreate` turns a gcid into a file object in one request and zero bytes. Measured 2026-09-11: magnet to first CDN byte in 1.0–1.2 s across a 48-file BD pack, an 11-episode season pack and a single episode, against 5–10 s for an offline download of content PikPak already holds.
+
+Facts this rests on, all measured, none to be contradicted without new measurements:
+
+- Every file carries a 40-hex gcid in `hash`, offline-download products included (96 of 96 checked). Listing and detail return the same value.
+- Content PikPak's index has never seen comes back as a placeholder: the info hash as the name, `file_size` `"0"`, empty `meta.hash`. Recognising that costs 146 ms, and there is deliberately no fallback to an offline download — a caller with another source should use it.
+- An instant upload costs no quota reading and no bytes, and the signed link it yields outlives the file object, permanent deletion included.
+- Transcodes belong to the gcid, not to the file object: an instant upload of an already-transcoded gcid arrives with every variant present, and one with no prior transcode still had only the original after two minutes and after its bytes were read. Nothing schedules a transcode.
+
+`PikPakFileHandle` therefore treats the **gcid as the identity and the file id as a cache of it**. Its ladder is: expiry → re-read the detail (one request); rejection or a 404 on the detail → `instantCreate` a replacement and continue (two). Nothing in either rung needs the caller, which is why the `FileRelocator` interface and its `onRelocated` write-back no longer exist. A caller persisting state should persist the gcid; a file id is worth keeping only as an optimisation.
+
+The SDK deliberately owns no polling loop over offline tasks. `createUrlFile` / `getTask` / `listOfflineTasks` remain as atomic endpoints for callers who want that path, but nothing strings them together.
 
 ### Shipped targets
 
@@ -66,8 +81,9 @@ JDK 21 required. Gradle 8.11 wrapper included. No separate lint step — `ktlint
 ./gradlew mingwX64Test                          # the native cell that actually runs on a Windows host
 ./gradlew compileTestKotlinLinuxX64             # native commonTest compile only — fastest pre-push KMP check
 PIKPAK_PROBE=1 ./gradlew jvmTest --tests '*CdnNetworkProbe*' --rerun   # CDN measurements → build/cdn-probe-report.txt
+PIKPAK_WEAKLINK=1 ./gradlew jvmTest --tests '*WeakLinkSmoke*' --rerun  # what fan-out is worth on this link, run it throttled
 ./gradlew assemble -Pkotlin.native.ignoreDisabledTargets=true   # every target buildable on this host
-./gradlew publishToMavenLocal                   # verify publish wiring (no creds needed)
+./gradlew publishToMavenLocal                   # verify publish wiring — needs a GPG key, see below
 
 # Single test (FQCN, or a wildcard on method name)
 ./gradlew jvmTest --tests 'io.github.nihildigit.pikpak.IntegrationUploadTest'
@@ -76,6 +92,8 @@ PIKPAK_PROBE=1 ./gradlew jvmTest --tests '*CdnNetworkProbe*' --rerun   # CDN mea
 # Single native test (uses kotlin-test, same pattern)
 ./gradlew linuxX64Test --tests 'io.github.nihildigit.pikpak.PikPakHashTest.hello matches reference'
 ```
+
+`publishToMavenLocal` runs `signAllPublications()` unconditionally, so it needs a GPG signatory configured locally and fails with "no configured signatory" without one. It is not a credential-free wiring check; on a machine without the key, compiling every target is the closest equivalent.
 
 Live integration tests create/delete folders in the test account. `IntegrationUploadTest` + `CleanupOrphansTest` handle their own cleanup; if a run crashes mid-test, `CleanupOrphansTest` trashes leftover `pikpak-kotlin-*` folders on the next run.
 

@@ -3,6 +3,7 @@ package io.github.nihildigit.pikpak
 import io.github.nihildigit.pikpak.internal.AuthApi
 import io.github.nihildigit.pikpak.internal.FolderIdCache
 import io.github.nihildigit.pikpak.internal.HttpEngine
+import io.github.nihildigit.pikpak.internal.PriorityGate
 import io.github.nihildigit.pikpak.internal.defaultCdnHttpClient
 import io.ktor.client.HttpClient
 import kotlin.concurrent.Volatile
@@ -51,6 +52,14 @@ class PikPakClient(
     httpClient: HttpClient? = null,
     cdnHttpClient: HttpClient? = null,
     val connectionBudget: Int = DEFAULT_CONNECTION_BUDGET,
+    /**
+     * Ceiling on concurrent CDN connections across every file this client
+     * reads or downloads. See [DEFAULT_ACCOUNT_CONNECTION_BUDGET].
+     *
+     * Lower it to leave headroom for another client on the same account, or
+     * set it to [connectionBudget] to let one file at a time have the line.
+     */
+    val accountConnectionBudget: Int = DEFAULT_ACCOUNT_CONNECTION_BUDGET,
 ) {
     constructor(
         account: String,
@@ -61,6 +70,7 @@ class PikPakClient(
         httpClient: HttpClient? = null,
         cdnHttpClient: HttpClient? = null,
         connectionBudget: Int = DEFAULT_CONNECTION_BUDGET,
+        accountConnectionBudget: Int = DEFAULT_ACCOUNT_CONNECTION_BUDGET,
     ) : this(
         account,
         { password },
@@ -70,6 +80,7 @@ class PikPakClient(
         httpClient,
         cdnHttpClient,
         connectionBudget,
+        accountConnectionBudget,
     )
 
     val deviceId: String = MD5().digest(account.encodeToByteArray()).toHex()
@@ -94,6 +105,29 @@ class PikPakClient(
     private val cdn: Lazy<HttpClient> = lazy {
         cdnHttpClient ?: httpClient ?: defaultCdnHttpClient(connectionBudget)
     }
+    /**
+     * The account-wide half of the two-level connection limit.
+     *
+     * Every CDN read takes a slot here as well as one from its own file's
+     * budget, so a client cannot exceed [accountConnectionBudget] no matter
+     * how many files it has open. Priority is honoured across files: a
+     * playback read outranks a background download's even though they are
+     * reading different URLs, which is the whole reason this is not just N
+     * independent per-file gates.
+     */
+    internal val accountGate = PriorityGate(accountConnectionBudget)
+
+    init {
+        // A gate of zero never grants its first slot — nothing holds one, so
+        // nothing releases one — and every range read parks forever instead of
+        // reporting the misconfiguration. RangeReader checks its own budget the
+        // same way.
+        require(connectionBudget >= 1) { "connectionBudget must be >= 1, got $connectionBudget" }
+        require(accountConnectionBudget >= 1) {
+            "accountConnectionBudget must be >= 1, got $accountConnectionBudget"
+        }
+    }
+
     internal val json: Json = Json { ignoreUnknownKeys = true; encodeDefaults = false }
 
     internal val state = ClientState(passwordSupplier)
@@ -108,6 +142,17 @@ class PikPakClient(
      * or deleted through some other client.
      */
     suspend fun clearFolderIdCache() = folderIds.invalidateAll()
+
+    /**
+     * Drops one memoized folder and everything memoized beneath it.
+     *
+     * For the narrower case where a caller knows which folder is gone — it
+     * just watched that one answer 404. A rename or a move still needs
+     * [clearFolderIdCache], because the folder is then reachable under a
+     * different name and any cached path could have run through it.
+     */
+    suspend fun invalidateFolderId(path: String, parentId: String = "") =
+        folderIds.invalidate(parentId, path)
 
     /**
      * Ensures the client has a valid access token. Reuses a cached session if
@@ -162,8 +207,31 @@ class PikPakClient(
          * so the cap is per URL or per edge host rather than per client.
          * Per-connection throughput sits near 0.8 MB/s regardless of how many
          * are open, so the aggregate scales linearly to that ceiling.
+         *
+         * See [DEFAULT_ACCOUNT_CONNECTION_BUDGET] for the wider limit above it.
          */
         const val DEFAULT_CONNECTION_BUDGET = 8
+
+        /**
+         * Concurrent connections one account may hold across all files at once.
+         *
+         * A second, wider limit sits above the per-URL one: 8 on each of
+         * several URLs is eventually refused too, either with 503 or by
+         * dropping the TLS handshake before a status line. Measured 2026-09-10
+         * against a 54-file pack spread over 12 distinct edge hosts — 16 were
+         * admitted without a single refusal, while 32, 64 and 96 requested all
+         * settled at exactly 20 admitted.
+         *
+         * 16 is the largest round number under that ceiling, and it divides
+         * into the two consumers that matter: playback holding 8 on one file
+         * while a background download holds 8 on another. Nothing has to
+         * reserve them — the per-URL cap already stops one file from taking
+         * more than half, and priority decides the rest.
+         *
+         * Not a per-host limit; the refusals appeared with the connections
+         * spread across a dozen hosts.
+         */
+        const val DEFAULT_ACCOUNT_CONNECTION_BUDGET = 16
 
         /**
          * The per-platform CDN client the SDK would build for itself. Pass it

@@ -16,9 +16,26 @@ import kotlinx.io.files.SystemFileSystem
 import kotlinx.io.write
 
 /**
- * Downloads [fileId] to [dest]. Supports resume: if [dest] already exists,
- * the download starts at its current size via a `Range: bytes=N-` request.
- * Returns the total bytes on disk after success (== expected file size).
+ * Downloads [fileId] to [dest] over **one** connection.
+ *
+ * Usually not what you want. One connection to PikPak's CDN is bounded by the
+ * round trip rather than by the link — measured at 0.94 MB/s on a distant route
+ * against 4.7 MB/s on a short one, with the distant case scaling nearly
+ * linearly to eight connections. [downloadFromUrl] and
+ * [RangeSource.downloadTo] fan out and are the default path; this exists for
+ * the cases that genuinely want a single stream.
+ *
+ * Two consequences of being outside that path, both deliberate:
+ *  - It takes no slot from [PikPakClient.accountConnectionBudget], so running
+ *    it alongside playback puts the account over that budget and its bytes do
+ *    not compete for priority with anything else.
+ *  - The URL is resolved once. A signature that expires mid-download fails the
+ *    call; nothing refreshes it. Use a [PikPakFileHandle] when a download can
+ *    outlive a signature.
+ *
+ * Supports resume: if [dest] already exists, the download starts at its current
+ * size via a `Range: bytes=N-` request. Returns the total bytes on disk after
+ * success (== expected file size).
  *
  * Failure semantics:
  *  - Transient network errors are retried per the client's [RetryPolicy].
@@ -29,20 +46,26 @@ import kotlinx.io.write
  * Atomic: this method writes directly to [dest]. If you need a temp-then-rename
  * dance for crash safety, do it at the call site.
  */
-suspend fun PikPakClient.download(fileId: String, dest: Path): Long {
+suspend fun PikPakClient.downloadSingleConnection(fileId: String, dest: Path): Long {
     val detail = getFile(fileId)
     val url = detail.downloadUrl
-        ?: throw PikPakException(-1, "download: file has no octet-stream link")
+        ?: throw PikPakException(-1, "downloadSingleConnection: file has no octet-stream link")
     val expectedSize = detail.sizeBytes
-    return downloadFromUrl(url, dest, expectedSize)
+    return downloadSingleConnectionFromUrl(url, dest, expectedSize)
 }
 
 /**
- * Lower-level: downloads [url] to [dest] with resume + retry. Use this when
- * you already have a signed download URL (e.g. from a cached [FileDetail]).
- * If [expectedSize] is negative, no length verification is performed.
+ * [downloadSingleConnection] over a URL you already hold.
+ *
+ * Same trade-off, and the same two exemptions: one connection, and no slot
+ * taken from [PikPakClient.accountConnectionBudget]. If [expectedSize] is
+ * negative, no length verification is performed.
  */
-suspend fun PikPakClient.downloadFromUrl(url: String, dest: Path, expectedSize: Long = -1L): Long {
+suspend fun PikPakClient.downloadSingleConnectionFromUrl(
+    url: String,
+    dest: Path,
+    expectedSize: Long = -1L,
+): Long {
     var attempt = 0
     var restartCount = 0
     val maxRestarts = retryPolicy.maxAttempts

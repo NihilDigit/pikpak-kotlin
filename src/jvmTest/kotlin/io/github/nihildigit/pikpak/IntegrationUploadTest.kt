@@ -77,7 +77,7 @@ class IntegrationUploadTest {
                     runCatching { client.getFile(result.fileId).downloadUrl != null }.getOrDefault(false)
                 }
                 assertTrue(downloadable, "download link should appear within poll window")
-                val written = client.download(result.fileId, dst)
+                val written = client.downloadSingleConnection(result.fileId, dst)
                 assertEquals(payload.size.toLong(), written, "download should write expected byte count")
                 val downloaded = SystemFileSystem.source(dst).buffered().use { it.readByteArray(payload.size) }
                 assertTrue(downloaded.contentEquals(payload), "downloaded bytes should match the original payload")

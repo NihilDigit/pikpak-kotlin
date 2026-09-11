@@ -14,7 +14,8 @@ val client = PikPakClient(account = "you@example.com", password = "...")
 client.listFiles(parentId = "")                       // root folder, follows pagination
 val id = client.getOrCreateDeepFolderId("", "anime/2026")
 client.upload(id, sourcePath)                         // GCID-hashed, instant when PikPak has the bytes
-client.download(fileId, destPath)                     // resumable, byte-verified
+client.rangeReader(fileId).asRangeSource()
+    .downloadTo(destPath, totalSize)                  // parallel, resumable, byte-verified
 
 when (val r = client.createUrlFile(id, "magnet:?xt=...")) {
     is CreateUrlResult.Queued -> r.task.id            // poll with getTask()
@@ -107,15 +108,26 @@ client.batchDelete(listOf(id1, id2))                   // bypasses the trash
 
 ## Transfer
 
+Downloading goes through a `RangeSource`, so it fans out across connections, honours the account budget and competes on priority with whatever else is reading:
+
 ```kotlin
-client.download(fileId, destPath)                      // resumable, retries, byte-verified
-client.downloadFromUrl(url, dest, expected)            // with a signed URL you already hold
-client.parallelDownloadFromUrl(url, dest, partCount = 8)
+source.downloadTo(dest, totalSize, priority = 1)       // resumable, parallel, ordered writes
+client.downloadFromUrl(url, dest)                      // the same, with the reader built for you
+
 client.streamRangeFromUrl(url, start, length) { range -> range.channel }   // live, not buffered
 
 client.upload(parentId, sourcePath)                    // GCID hash, instant upload when PikPak has the bytes,
                                                        // otherwise OSS multipart with HMAC-SHA1 signing
 ```
+
+One connection is available but has to be asked for by name, because it is rarely what you want — a single connection to this CDN is bounded by the round trip, not by the link:
+
+```kotlin
+client.downloadSingleConnection(fileId, dest)
+client.downloadSingleConnectionFromUrl(url, dest, expectedSize)
+```
+
+These two take no slot from the account budget and do not refresh an expiring signature.
 
 CDN and OSS bodies are consumed as they arrive; a range read costs no memory until it is read.
 
@@ -145,9 +157,13 @@ reader.stats.value                                    // active reads, bytes, re
 reader.close()
 ```
 
-Construct `RangeReader` directly with your own `urlProvider` when the URL does not come from `getFile`. `parallelDownloadFromUrl` is a thin wrapper over the same class. A range past the end of the file ends at EOF. A URL the CDN rejects with 401 or 403 surfaces as `UrlExpiredException` from the single-request calls; `RangeReader` asks `urlProvider` for a fresh one instead.
+Construct `RangeReader` directly with your own `urlProvider` when the URL does not come from `getFile`. `downloadFromUrl` is a thin wrapper over the same class. A range past the end of the file ends at EOF. A URL the CDN rejects with 401 or 403 surfaces as `UrlExpiredException` from the single-request calls; `RangeReader` asks `urlProvider` for a fresh one instead.
 
-The connection budget of 8 is a measured property of PikPak's CDN: one signed URL accepts 8 concurrent connections and answers the ninth with 503, each connection sustains under 1 MB/s, and throughput scales linearly up to the cap. Because every engine's default per-host limit is lower (OkHttp 5, Darwin 4 or 6), the SDK builds a separate CDN client per platform whose limit matches the budget. Pass `cdnHttpClient = PikPakClient.tunedCdnClient()` when you inject your own API client and still want the tuned pool.
+The connection budget of 8 is a measured property of PikPak's CDN: one signed URL accepts 8 concurrent connections and answers the ninth with 503. Because every engine's default per-host limit is lower (OkHttp 5, Darwin 4 or 6), the SDK builds a separate CDN client per platform whose limit matches the budget. Pass `cdnHttpClient = PikPakClient.tunedCdnClient()` when you inject your own API client and still want the tuned pool.
+
+Per-connection throughput is bounded by the round trip rather than by a server-side rate limit: the same file on the same account served 0.94 MB/s per connection over one route and 4.7 MB/s over a shorter one. Opening 8 is the difference between unusable and fine on a distant route, and merely redundant on a close one, which is why the budget is a constant rather than something measured at runtime. Wider fan-out means more links, not more connections per link.
+
+A second, wider limit sits above it. `accountConnectionBudget`, 16 by default, caps concurrent connections across every file one client reads. Measured 2026-09-10 against a 54-file pack on a dozen edge hosts: 16 were admitted without a refusal, while 32, 64 and 96 requested all settled at exactly 20 admitted, refused either with 503 or by dropping the TLS handshake. Priority is honoured at both levels, so a playback read outranks a background download without either side knowing about the other, and nothing needs to reserve slots — the per-URL cap already stops one file from taking more than half.
 
 ### Transcoded variants
 
@@ -164,6 +180,62 @@ val reader = client.rangeReader(fileId, v.mediaId)    // reopens the same bytes 
 `resolveVariant` falls back to the original when the requested resolution is absent or still transcoding. The fallback happens at resolve time only: `rangeReader(fileId, mediaId)` refreshes an expired link with the same `mediaId` and fails with `PikPakException` when that variant is gone, rather than reading another variant's bytes at an offset the caller committed to. `FileDetail.variant(mediaId)` is the same lookup without a network call.
 
 Transcodes carry no embedded subtitles and a lower audio bitrate than the original. Their length is absent from the file metadata; `remoteSize` derives it from a one-byte range probe's `Content-Range`.
+
+## Playing a magnet
+
+A magnet reaches playable bytes without an offline download. PikPak stores content by hash, and both halves of that are reachable: a magnet can be resolved to the gcid of every file inside it, and a gcid creates a file object in one request and no bytes.
+
+```kotlin
+// 1. Resolve. No task is created, nothing lands in the drive. 150-300 ms.
+val resource = client.resolveMagnet(magnet)
+    ?: return NotOnPikPak            // not in PikPak's index; use another source
+
+val episode = resource.files.first { it.name.contains("[01]") }
+val gcid = episode.gcid ?: return NotOnPikPak   // this one file is not indexed
+
+// 2. Turn the gcid into a file object. Zero bytes transferred, ~200 ms.
+//    Name and location are yours; nothing creates the pack subfolder an
+//    offline task would.
+val fileId = client.instantCreate(episode, parentId = folderId)
+
+// 3. A handle. The gcid is the identity, so an expired signature and a file
+//    object that has been swept away are both absorbed without the caller.
+val handle = PikPakFileHandle(
+    client = client,
+    gcid = gcid,
+    size = episode.size,
+    name = episode.name,
+    initialFileId = fileId,          // optional: saves the first instantCreate
+)
+
+// 4. Play. Blocks are cached by offset and read ahead of the read position;
+//    a seek cancels only the requests outside the new window.
+val stream = handle.openStream()
+stream.seekTo(0)
+stream.read(buffer, 0, buffer.size)
+```
+
+Measured end to end on 2026-09-11 — magnet in, first CDN byte out — at 1.0 to 1.2 seconds across a 48-file BD pack, an 11-episode season pack and a single episode. An offline download reaches the same files in five to ten seconds when PikPak already holds the content, and in minutes when it has to fetch from the swarm.
+
+Content PikPak has never seen fails in 146 ms: `resolveMagnet` returns null, or the one file you want has a null `gcid`. There is no fallback to an offline download here, because a caller that has another source should use it rather than wait — `createUrlFile` and `getTask` are still there for one that does not.
+
+`instantCreate` leaves a real file object in the drive. Deleting it after reading is possible — a signed link outlives the file it came from — but a kept object is the cheaper path: refreshing an expired link is then one request rather than two, and a second playback of the same episode skips resolution entirely. Eviction is the caller's policy.
+
+### Transcodes
+
+`handle.variants()` reports what PikPak holds. A transcode exists only if someone has played that content on PikPak before; it belongs to the gcid, so an instant upload of an already-transcoded gcid arrives with every variant present. Nothing schedules one — a fresh file measured at t=0, +15 s, +60 s and +120 s, including after its bytes were read, still had only the original. A caller that finds no transcode should read the original rather than wait.
+
+### Downloading to disk
+
+`downloadTo` is the same handle, written to a file. Progress is the file's own length, so an interrupted download resumes from what is on disk and needs no bitmap. Writes are ordered but the fetches slide: the connections stay busy instead of draining at a round boundary, which matters most on the weak links this fan-out exists for.
+
+```kotlin
+handle.downloadTo(localPath, totalSize = episode.size, priority = 1)
+```
+
+It is a suspend function that throws; whether a background cache keeps retrying is the caller's policy. Playback and a download compete for the account budget, not for each other's slots — give the download a lower `priority` (1 against a playback read's 10) and the gate does the rest.
+
+Both consumers take a `RangeSource` rather than a `RangeReader`, which is what lets the handle swap the reader underneath them. `reader.asRangeSource()` is the other accepted shape, for a file whose id will not move.
 
 ## Development
 

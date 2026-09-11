@@ -35,6 +35,25 @@ internal class FolderIdCache {
         entries.clear()
     }
 
+    /**
+     * Drops one folder and everything cached beneath it.
+     *
+     * For a caller that has just watched one specific folder answer 404, which
+     * is narrower than what a rename or a move can break: the folder is gone
+     * rather than relocated, so the only entries that can be wrong are the ones
+     * whose path ran through it, and under a fixed parent those are exactly its
+     * descendants. Everything else still resolves, which is why this does not
+     * fall back on [invalidateAll].
+     *
+     * Descendants have to go as well — `pack` disappearing takes
+     * `pack/specials` with it, and that entry names an id that is equally dead.
+     */
+    suspend fun invalidate(parentId: String, path: String) = mutex.withLock {
+        val exact = key(parentId, path)
+        val subtree = exact + '/'
+        entries.keys.retainAll { it != exact && !it.startsWith(subtree) }
+    }
+
     // The separator is NUL because it can occur in neither a PikPak file id
     // nor a path segment, so no two distinct lookups can collide on it.
     private fun key(parentId: String, path: String): String =

@@ -147,10 +147,13 @@ suspend fun PikPakClient.getTask(taskId: String): OfflineTask {
  * tasks, which is what callers polling for completion usually want. Pass
  * e.g. `"PHASE_TYPE_COMPLETE,PHASE_TYPE_ERROR"` to inspect finished work.
  *
- * The SDK intentionally exposes no polling/timeout loop — callers decide when
- * a task counts as "done" (phase transition, disappearance from the running
- * list, a side-effect file landing in the drive, etc.). To follow one known
- * task, use [getTask]: the server has no `id` filter here (it answers 400).
+ * This is the raw listing and waits for nothing. To follow one known task use
+ * [getTask]; the server has no `id` filter here and answers 400.
+ *
+ * The SDK exposes no polling loop over these — callers decide when a task
+ * counts as done. For a magnet, prefer [resolveMagnet] and [instantCreate]
+ * instead: they reach the same files in about a second without a task at all,
+ * where an offline download takes five to ten and may queue behind the swarm.
  *
  * @param limit page size. The 10 000 default fetches the whole table in one
  *   request, which is right for a one-shot inventory and wrong for a poll

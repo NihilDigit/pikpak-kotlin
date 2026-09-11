@@ -23,14 +23,30 @@ data class FileStat(
     @SerialName("modified_time") val modifiedTime: String = "",
     @SerialName("icon_link") val iconLink: String = "",
     @SerialName("thumbnail_link") val thumbnailLink: String = "",
-    @SerialName("md5_checksum") val md5Checksum: String = "",
+    /**
+     * PikPak's gcid content hash, 40 uppercase hex. Present on every file,
+     * including the ones an offline task produced — checked against 96 of them
+     * on 2026-09-11, none empty. This is the stable identity of the content:
+     * [id] is one account's handle on it and dies with the file, while the gcid
+     * survives and can create the file again through an instant upload.
+     */
     val hash: String = "",
     val phase: String = "",
     val trashed: Boolean = false,
+    /**
+     * Server-supplied extras. `url` holds the original magnet for anything an
+     * offline task produced, which is the only place that association is
+     * recorded — the tasks endpoint cannot be queried by URL or info hash.
+     * Also carries `duration`, `width`, `height` for media.
+     */
+    val params: Map<String, String> = emptyMap(),
 ) {
     val isFolder: Boolean get() = kind == FileKind.FOLDER
     val isFile: Boolean get() = kind == FileKind.FILE
     val sizeBytes: Long get() = size.toLongOrNull() ?: 0L
+
+    /** The magnet this file came from, when an offline task produced it. */
+    val sourceUrl: String? get() = params["url"]
 }
 
 @Serializable
@@ -152,7 +168,7 @@ data class FileDetail(
     val size: String = "0",
     @SerialName("file_extension") val fileExtension: String = "",
     @SerialName("mime_type") val mimeType: String = "",
-    @SerialName("md5_checksum") val md5Checksum: String = "",
+    /** gcid content hash; see [FileStat.hash]. Identical in listing and detail. */
     val hash: String = "",
     val phase: String = "",
     val revision: String = "",
@@ -173,8 +189,13 @@ data class FileDetail(
     val medias: List<MediaVariant> = emptyList(),
     val trashed: Boolean = false,
     val writable: Boolean = true,
+    /** Server-supplied extras; see [FileStat.params]. */
+    val params: Map<String, String> = emptyMap(),
 ) {
     val sizeBytes: Long get() = size.toLongOrNull() ?: 0L
+
+    /** The magnet this file came from, when an offline task produced it. */
+    val sourceUrl: String? get() = params["url"]
 
     /** The `application/octet-stream` link — the raw file — or an empty one. */
     val octetStream: DownloadLink get() = links[OCTET_STREAM] ?: DownloadLink()

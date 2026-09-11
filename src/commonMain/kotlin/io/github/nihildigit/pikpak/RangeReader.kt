@@ -66,9 +66,13 @@ data class RangeReaderStats(
  *  - **Connection budget.** All reads on one instance share [connectionBudget]
  *    slots. A signed PikPak URL accepts 8 concurrent connections and answers
  *    the 9th with 503, so the budget is a hard property of the URL, not a
- *    tuning knob. Two readers on two different URLs get 8 each.
+ *    tuning knob. Every read also takes a slot from
+ *    [PikPakClient.accountConnectionBudget], which is what stops several
+ *    readers from together exceeding what the account is allowed.
  *  - **Priority.** When slots are contended, a higher [read] priority is
- *    served first. Playback-head reads should outrank read-ahead.
+ *    served first, both among this file's reads and against every other file
+ *    the client is reading. Playback-head reads should outrank read-ahead,
+ *    and both should outrank a background download.
  *  - **Expiry.** 401/403 calls [urlProvider] with [UrlRequest.Expired] and
  *    reissues the request. Concurrent reads share one refresh.
  *  - **Throttling.** 503 backs off and retries without spending a retry.
@@ -82,7 +86,7 @@ data class RangeReaderStats(
  * Cancelling the coroutine that called [read] closes that read's connection
  * and frees its slot.
  */
-class RangeReader(
+class RangeReader internal constructor(
     private val client: PikPakClient,
     private val urlProvider: suspend (UrlRequest) -> String,
     val connectionBudget: Int = PikPakClient.DEFAULT_CONNECTION_BUDGET,
@@ -91,14 +95,38 @@ class RangeReader(
      * truncated bodies and I/O errors; 503 and URL expiry do not count.
      */
     private val maxAttempts: Int = 5,
+    /**
+     * The per-file gate to take slots from, or null to own one.
+     *
+     * [PikPakFileHandle] passes its own, because it replaces this reader when
+     * a signature is about to expire and the reads already running on the old
+     * instance do not stop when it is closed. With a gate each, the two
+     * overlap and the file can briefly hold twice [connectionBudget]
+     * connections on one signed URL — which is exactly what the CDN answers
+     * with 503.
+     */
+    gate: PriorityGate?,
 ) : AutoCloseable {
+
+    constructor(
+        client: PikPakClient,
+        urlProvider: suspend (UrlRequest) -> String,
+        connectionBudget: Int = PikPakClient.DEFAULT_CONNECTION_BUDGET,
+        maxAttempts: Int = 5,
+    ) : this(client, urlProvider, connectionBudget, maxAttempts, null)
 
     init {
         require(connectionBudget >= 1) { "connectionBudget must be >= 1, got $connectionBudget" }
         require(maxAttempts >= 1) { "maxAttempts must be >= 1, got $maxAttempts" }
     }
 
-    private val gate = PriorityGate(connectionBudget)
+    private val gate = gate ?: PriorityGate(connectionBudget)
+
+    /** Identity of the gate, so a test can tell a shared one from a fresh one. */
+    internal fun gateForTest(): Any = gate
+
+    /** Whether [close] has been called, for a test asserting it has not. */
+    internal fun isClosedForTest(): Boolean = closed
     private val urlMutex = Mutex()
     private var url: String? = null
     private var closed = false
@@ -196,11 +224,26 @@ class RangeReader(
         closed = true
     }
 
+    /**
+     * Takes a slot from this file's budget, then one from the account's.
+     *
+     * The order is not arbitrary. This way a reader holds at most
+     * [connectionBudget] account slots, so one busy file can never occupy the
+     * whole account budget and starve another. The reverse order would let a
+     * reader take every account slot for reads still queued behind its own
+     * per-file gate, which cannot proceed and would hold the account gate shut
+     * while doing nothing.
+     */
     private suspend fun <T> withSlot(priority: Int, body: suspend () -> T): T {
         gate.acquire(priority)
         updateStats()
         try {
-            return body()
+            client.accountGate.acquire(priority)
+            try {
+                return body()
+            } finally {
+                client.accountGate.release()
+            }
         } finally {
             gate.release()
             updateStats()

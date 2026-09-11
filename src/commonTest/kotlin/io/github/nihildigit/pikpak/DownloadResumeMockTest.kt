@@ -21,7 +21,7 @@ import kotlin.test.assertFailsWith
 import kotlin.time.Duration.Companion.milliseconds
 
 /**
- * Verifies the resume + retry branches of [downloadFromUrl]:
+ * Verifies the resume + retry branches of [downloadSingleConnectionFromUrl]:
  *  - no local file → full 200 OK download
  *  - partial local file → Range request → 206 → append
  *  - partial local file → server returns 200 (no range support) → restart
@@ -47,7 +47,7 @@ class DownloadResumeMockTest {
             respondOk(body)
         }
 
-        val written = client.downloadFromUrl("https://cdn/x", dest, expectedSize = body.size.toLong())
+        val written = client.downloadSingleConnectionFromUrl("https://cdn/x", dest, expectedSize = body.size.toLong())
         assertEquals(body.size.toLong(), written)
         assertEquals("0123456789", readFile(dest))
         client.close()
@@ -65,7 +65,7 @@ class DownloadResumeMockTest {
             respondPartialContent(tail)
         }
 
-        val written = client.downloadFromUrl("https://cdn/x", dest, expectedSize = 10L)
+        val written = client.downloadSingleConnectionFromUrl("https://cdn/x", dest, expectedSize = 10L)
         assertEquals(10L, written)
         assertEquals("0123456789", readFile(dest))
         client.close()
@@ -90,7 +90,7 @@ class DownloadResumeMockTest {
             }
         }
 
-        val written = client.downloadFromUrl("https://cdn/x", dest, expectedSize = body.size.toLong())
+        val written = client.downloadSingleConnectionFromUrl("https://cdn/x", dest, expectedSize = body.size.toLong())
         assertEquals(body.size.toLong(), written)
         assertEquals("freshfresh", readFile(dest))
         client.close()
@@ -108,7 +108,7 @@ class DownloadResumeMockTest {
             respondOk(body)
         }
 
-        val written = client.downloadFromUrl("https://cdn/x", dest, expectedSize = 5L)
+        val written = client.downloadSingleConnectionFromUrl("https://cdn/x", dest, expectedSize = 5L)
         assertEquals(5L, written)
         assertEquals("abcde", readFile(dest))
         assertEquals(false, sawRange, "oversize local file must NOT lead to a range request")
@@ -126,7 +126,7 @@ class DownloadResumeMockTest {
             respondOk("ignored".encodeToByteArray())
         }
 
-        val written = client.downloadFromUrl("https://cdn/x", dest, expectedSize = 5L)
+        val written = client.downloadSingleConnectionFromUrl("https://cdn/x", dest, expectedSize = 5L)
         assertEquals(5L, written)
         assertEquals(0, calls, "already-complete file must short-circuit before HTTP")
         client.close()
@@ -147,7 +147,7 @@ class DownloadResumeMockTest {
         ) { _ -> respondOk(body) }
 
         assertFailsWith<PikPakException> {
-            client.downloadFromUrl("https://cdn/x", dest, expectedSize = 10L)
+            client.downloadSingleConnectionFromUrl("https://cdn/x", dest, expectedSize = 10L)
         }
         client.close()
     }
