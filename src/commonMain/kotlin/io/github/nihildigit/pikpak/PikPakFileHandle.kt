@@ -41,6 +41,11 @@ data class VariantLink(
  * it held the magnet and the path. With the gcid in hand the SDK can rebuild
  * the file itself, so that interface and its `onRelocated` write-back are gone.
  *
+ * A caller that treats file objects as leases — creating one only to mint a
+ * link, since a link outlives the object that produced it — hears about every
+ * object through [onObjectMinted], the rebuilt ones included. Without it the
+ * second rung of the ladder would strand an object nobody can name.
+ *
  * Expiry replaces the reader rather than telling it to refresh, because
  * [RangeReader] exposes no such call. Replacing is safe: a reader holds no
  * connection between reads, and a read already in flight keeps the instance it
@@ -73,10 +78,28 @@ class PikPakFileHandle(
     /** Where a rebuilt file object lands. Empty is the root drive. */
     private val parentId: String = "",
     private val connectionBudget: Int = client.connectionBudget,
+    /**
+     * Called once with each file object this handle has finished with, meaning
+     * a link has been minted from it and that link now stands on its own.
+     *
+     * A caller that treats a file object as a lease deletes it here. Without
+     * this, an object created by [rebuild] would be reachable by nobody: the
+     * caller never learns its id, and this handle has already replaced it.
+     * [initialFileId] is reported the same way, so one rule covers every object
+     * that exists, however it came to be.
+     */
+    private val onObjectMinted: (suspend (String) -> Unit)? = null,
     private val clock: Clock = Clock.System,
     private val refreshMargin: Duration = DEFAULT_REFRESH_MARGIN,
 ) : RangeSource, AutoCloseable {
     private val mutex = Mutex()
+
+    /** Guards [unreportedObject] alone, so it is never held across a network call. */
+    private val reportMutex = Mutex()
+
+    /** The object [onObjectMinted] still owes a report for, if any. */
+    @Volatile
+    private var unreportedObject: String? = initialFileId
 
     /** Outlives any one reader; see where it is handed to [RangeReader]. */
     private val fileGate = PriorityGate(connectionBudget)
@@ -255,7 +278,17 @@ class PikPakFileHandle(
         val link = linkOf(detail)
             ?: throw PikPakException(-1, "file ${detail.id} has no readable link for variant $mediaId")
         expiresAt = link.expiresAt
+        // After the link, never before it: the object still has to answer the
+        // lookups above, and a caller that deletes on this signal would pull it
+        // out from under them.
+        reportMinted()
         return link.url
+    }
+
+    private suspend fun reportMinted() {
+        val report = onObjectMinted ?: return
+        val id = reportMutex.withLock { unreportedObject.also { unreportedObject = null } } ?: return
+        report(id)
     }
 
     /**
@@ -310,6 +343,7 @@ class PikPakFileHandle(
         )
         fileId = created
         expiresAt = null
+        reportMutex.withLock { unreportedObject = created }
         return created
     }
 
