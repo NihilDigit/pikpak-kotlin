@@ -153,7 +153,13 @@ mavenPublishing {
     // plugin handles staging upload, GPG signing of every artifact, POM
     // validation, and (with automaticRelease=true) the staging→release promotion.
     publishToMavenCentral(automaticRelease = true)
-    signAllPublications()
+    // Signing is a Central requirement, not a local one, and the task fails
+    // outright without a signatory, which made publishToMavenLocal impossible on
+    // a machine holding no key. CI supplies signingInMemoryKey (see
+    // .github/workflows/release.yml), so a real release still signs.
+    if (providers.gradleProperty("signingInMemoryKey").isPresent) {
+        signAllPublications()
+    }
 
     pom {
         name.set("pikpak-kotlin")
