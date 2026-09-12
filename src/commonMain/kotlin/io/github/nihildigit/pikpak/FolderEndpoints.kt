@@ -130,54 +130,51 @@ suspend fun PikPakClient.deleteFile(fileId: String) {
  * recoverable from the trash UI for ~30 days. No-op when [ids] is empty.
  * For permanent removal that bypasses the trash, see [batchDelete].
  */
-suspend fun PikPakClient.batchTrash(ids: List<String>) {
-    if (ids.isEmpty()) return
-    val body = buildJsonObject {
-        putJsonArray("ids") { ids.forEach { add(it) } }
-    }
-    http.request(
-        method = HttpMethod.Post,
-        url = "$DRIVE$FILES_PATH:batchTrash",
-        captchaAction = "POST:/drive/v1/files:batchTrash",
-    ) { jsonBody(json, body) }
-    folderIds.invalidateAll()
-}
+suspend fun PikPakClient.batchTrash(ids: List<String>) =
+    batchOperate(ids, "batchTrash")
 
 /**
  * Permanently removes multiple files/folders, bypassing the trash. Items are
  * not recoverable. No-op when [ids] is empty. For soft-delete semantics that
  * stage items in the trash for 30 days, use [batchTrash] instead.
  */
-suspend fun PikPakClient.batchDelete(ids: List<String>) {
-    if (ids.isEmpty()) return
-    val body = buildJsonObject {
-        putJsonArray("ids") { ids.forEach { add(it) } }
-    }
-    http.request(
-        method = HttpMethod.Post,
-        url = "$DRIVE$FILES_PATH:batchDelete",
-        captchaAction = "POST:/drive/v1/files:batchDelete",
-    ) { jsonBody(json, body) }
-    folderIds.invalidateAll()
-}
+suspend fun PikPakClient.batchDelete(ids: List<String>) =
+    batchOperate(ids, "batchDelete")
 
 /**
  * Restores trashed items back to their original parent folder. Counterpart to
  * [batchTrash]. No-op when [ids] is empty. Ids must reference items currently
  * in the trash; untrashing a non-trashed item is a no-op on PikPak's side.
  */
-suspend fun PikPakClient.batchUntrash(ids: List<String>) {
+suspend fun PikPakClient.batchUntrash(ids: List<String>) =
+    batchOperate(ids, "batchUntrash")
+
+/**
+ * One `files:<op>` call per [BATCH_ID_LIMIT] ids.
+ *
+ * PikPak caps how many ids one call may name: measured 2026-09-12, 200 are
+ * accepted and 1000 answer `operating_file_count_exceeded` (error_code 11).
+ * Callers that hand over a whole folder listing cannot know how long it is, so
+ * the split happens here rather than at each call site. Chunks are sent in
+ * order and a failing one leaves the chunks before it applied.
+ */
+private suspend fun PikPakClient.batchOperate(ids: List<String>, op: String) {
     if (ids.isEmpty()) return
-    val body = buildJsonObject {
-        putJsonArray("ids") { ids.forEach { add(it) } }
+    for (chunk in ids.chunked(BATCH_ID_LIMIT)) {
+        val body = buildJsonObject {
+            putJsonArray("ids") { chunk.forEach { add(it) } }
+        }
+        http.request(
+            method = HttpMethod.Post,
+            url = "$DRIVE$FILES_PATH:$op",
+            captchaAction = "POST:/drive/v1/files:$op",
+        ) { jsonBody(json, body) }
     }
-    http.request(
-        method = HttpMethod.Post,
-        url = "$DRIVE$FILES_PATH:batchUntrash",
-        captchaAction = "POST:/drive/v1/files:batchUntrash",
-    ) { jsonBody(json, body) }
     folderIds.invalidateAll()
 }
+
+/** Half of the smallest count measured to fail, so a future tightening has room. */
+private const val BATCH_ID_LIMIT = 100
 
 /**
  * Relocates [ids] to [toParentId] (empty string for the root drive). The "update"
