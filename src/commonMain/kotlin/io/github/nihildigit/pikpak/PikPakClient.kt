@@ -230,6 +230,18 @@ class PikPakClient(
          *
          * Not a per-host limit; the refusals appeared with the connections
          * spread across a dozen hosts.
+         *
+         * What this bounds is what PikPak tolerates, which is not the same as
+         * what a consumer's line can carry, and the smaller of the two governs.
+         * At the ~0.8 MB/s per connection measured above, eight connections
+         * already fill 50 Mbit/s; opening sixteen there does not move more
+         * bytes, it only makes each one slower and the slowest ones much
+         * slower. A consumer on a constrained line should lower this to roughly
+         * its bandwidth divided by that per-connection figure — on such a line
+         * playback stalls and long-tail latency were measured getting worse,
+         * and total throughput falling by a third, purely from the extra
+         * concurrency. Raise it towards this default only with the bandwidth to
+         * use it.
          */
         const val DEFAULT_ACCOUNT_CONNECTION_BUDGET = 16
 

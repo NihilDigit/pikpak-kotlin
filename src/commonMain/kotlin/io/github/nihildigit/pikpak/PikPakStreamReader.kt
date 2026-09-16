@@ -644,7 +644,24 @@ class PikPakStreamReader internal constructor(
         /** Attempts per block. RangeReader already retries transport failures and refreshes expired links. */
         const val MAX_ATTEMPTS = 3
 
-        private const val BLOCKING_PRIORITY = 100
-        private const val READ_AHEAD_PRIORITY = 10
+        /**
+         * What this reader asks for the block a caller is waiting on.
+         *
+         * Public so a caller can place its own reads on the same scale. The one
+         * thing that reasonably outranks this is a fetch that has to land
+         * before playback can begin at all — a container index the demuxer
+         * needs before it will report a seek table, say — since until that
+         * arrives there is no playback position for anything to block at.
+         */
+        const val BLOCKING_PRIORITY = 100
+
+        /**
+         * What this reader asks for blocks ahead of the read position.
+         *
+         * Anything a caller wants served ahead of its own read-ahead but behind
+         * the block playback is stopped on belongs between this and
+         * [BLOCKING_PRIORITY].
+         */
+        const val READ_AHEAD_PRIORITY = 10
     }
 }

@@ -156,8 +156,10 @@ private fun collect(
  *
  * Known flake: creating the same gcid twice in one folder has been observed to
  * return a file node complete enough to carry an id but not yet resolvable —
- * an immediate `getFile` came back without a download link. Retrying is the
- * caller's call, and deliberately not done here.
+ * an immediate `getFile` came back without a download link. This does not check
+ * for that, because checking costs a `getFile` that a caller about to read the
+ * detail anyway would pay twice; see [instantCreateResolvable] for the variant
+ * that does.
  */
 suspend fun PikPakClient.instantCreate(
     file: ResolvedFile,
@@ -200,6 +202,44 @@ suspend fun PikPakClient.instantCreate(
     }
     return fileNode.str("id")?.takeIf { it.isNotEmpty() }
         ?: throw PikPakException(-1, "instantCreate: completed response carries no file id for $name")
+}
+
+/**
+ * [instantCreate], then a [getFile] to confirm the new object actually resolves
+ * to a link, recreating it up to [attempts] times while it does not.
+ *
+ * For the flake described on [instantCreate]: the id comes back but the detail
+ * carries no readable link, and a caller that treats the id as good then fails
+ * on the read instead of on the create. Each attempt costs one extra request
+ * over [instantCreate], so this is for callers who cannot cheaply retry at
+ * their own level — one whose next step is a [getFile] anyway should call
+ * [instantCreate] and judge the detail it was going to fetch regardless.
+ *
+ * An object that failed to resolve is deleted before the next attempt, so a
+ * caller treating objects as leases is not left holding ids it never saw. The
+ * last attempt's id is returned even when its detail had no link: by then the
+ * failure belongs to the read, which reports it in context.
+ *
+ * @param attempts total creates to make, at least one.
+ */
+suspend fun PikPakClient.instantCreateResolvable(
+    file: ResolvedFile,
+    parentId: String,
+    name: String = file.name,
+    attempts: Int = 2,
+): String {
+    require(attempts >= 1) { "attempts must be >= 1, got $attempts" }
+    var created = ""
+    repeat(attempts) { attempt ->
+        created = instantCreate(file, parentId = parentId, name = name)
+        val resolvable = runCatching { getFile(created) }
+            .map { detail -> detail.medias.any { it.link.url.isNotBlank() } || detail.links.isNotEmpty() }
+            .getOrDefault(false)
+        if (resolvable || attempt == attempts - 1) return created
+        // Nothing else will ever name this one: the caller has not been told the id.
+        runCatching { batchDelete(listOf(created)) }
+    }
+    return created
 }
 
 private fun JsonElement.asObject(): JsonObject? = this as? JsonObject
