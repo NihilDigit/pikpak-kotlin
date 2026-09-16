@@ -49,6 +49,13 @@ jobs:
           java-version: 21
       - if: matrix.setup_android
         uses: android-actions/setup-android@v4
+        with:
+          # The action's default list names `tools`, a package cmdline-tools 20
+          # no longer ships, and sdkmanager exits 1 on it rather than skipping
+          # it — the cell failed in setup, before Gradle ever ran. The runner
+          # image already carries the SDK, so nothing needs installing; the
+          # licence acceptance this action is here for happens either way.
+          packages: ''
       - uses: gradle/actions/setup-gradle@v6
       - run: ./gradlew ${{ matrix.task }}
 
