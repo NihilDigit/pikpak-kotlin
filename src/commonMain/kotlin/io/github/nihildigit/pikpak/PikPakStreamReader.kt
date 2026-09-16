@@ -607,7 +607,10 @@ class PikPakStreamReader internal constructor(
 
     internal suspend fun abandonForTest(fetch: Fetch): Unit = abandon(fetch)
 
-    internal companion object {
+    // Public: every member here is a documented default or a point on the priority scale, and a
+    // caller placing its own reads among these needs to name them. An internal companion made the
+    // `public` on each of them mean nothing.
+    companion object {
         /**
          * Cache and fetch granularity. A range request costs roughly 200 ms
          * before its first byte, which at the ~0.2 MB/s one PikPak connection
