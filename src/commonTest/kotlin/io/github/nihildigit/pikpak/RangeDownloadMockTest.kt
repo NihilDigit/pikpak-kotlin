@@ -285,13 +285,19 @@ class DirectDownloadMockTest {
         body: ByteArray,
         delayPerRequest: kotlin.time.Duration = kotlin.time.Duration.ZERO,
         onRange: (Long, Long) -> Unit = { _, _ -> },
-    ): suspend MockRequestHandleScope.(io.ktor.client.request.HttpRequestData) -> io.ktor.client.request.HttpResponseData =
-        { req ->
+    ): suspend MockRequestHandleScope.(io.ktor.client.request.HttpRequestData) -> io.ktor.client.request.HttpResponseData {
+        // Callers record into plain lists while a download has several requests in flight, so the
+        // callback is serialised here instead of asking each of them to bring its own lock. Without
+        // it a concurrent `list +=` loses entries, and the test reads that as the download having
+        // left a hole in the file.
+        val recording = Mutex()
+        return { req ->
             val (start, end) = parseRangeHeader(req.headers[HttpHeaders.Range] ?: error("no Range header"))
-            onRange(start, end)
+            recording.withLock { onRange(start, end) }
             if (delayPerRequest > kotlin.time.Duration.ZERO) delay(delayPerRequest)
             respondSlice(body, start, end)
         }
+    }
 
     private fun MockRequestHandleScope.respondSlice(body: ByteArray, start: Long, end: Long) = respond(
         content = ByteReadChannel(body.copyOfRange(start.toInt(), (end + 1).toInt())),
