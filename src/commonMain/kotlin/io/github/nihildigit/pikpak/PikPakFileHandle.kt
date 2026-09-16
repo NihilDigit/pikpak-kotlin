@@ -79,14 +79,19 @@ class PikPakFileHandle(
     private val parentId: String = "",
     private val connectionBudget: Int = client.connectionBudget,
     /**
-     * Called once with each file object this handle has finished with, meaning
-     * a link has been minted from it and that link now stands on its own.
+     * Called once with each file object this handle has finished with: either a
+     * link has been minted from it and that link now stands on its own, or a
+     * rebuild replaced it before it produced one.
      *
      * A caller that treats a file object as a lease deletes it here. Without
      * this, an object created by [rebuild] would be reachable by nobody: the
      * caller never learns its id, and this handle has already replaced it.
      * [initialFileId] is reported the same way, so one rule covers every object
      * that exists, however it came to be.
+     *
+     * A report can still be outstanding when a handle is abandoned — a rebuild
+     * whose detail lookup then failed owes one. [closeAndReport] collects it;
+     * [close] cannot, not being suspending.
      */
     private val onObjectMinted: (suspend (String) -> Unit)? = null,
     private val clock: Clock = Clock.System,
@@ -226,6 +231,20 @@ class PikPakFileHandle(
     }
 
     /**
+     * [close], plus the report this handle still owes, if any.
+     *
+     * [close] cannot do it: reporting suspends and `AutoCloseable.close` does
+     * not. A handle whose rebuild succeeded and whose following detail lookup
+     * then failed holds an id nothing else has ever seen, so a caller that
+     * deletes leases gives a handle up through this rather than through
+     * [close].
+     */
+    suspend fun closeAndReport() {
+        close()
+        reportMinted()
+    }
+
+    /**
      * A reader whose signature will still be valid for a while.
      *
      * Callers must not hold the result across reads; ask again each time, or
@@ -331,9 +350,10 @@ class PikPakFileHandle(
      * Creates a fresh file object for [gcid] and adopts it.
      *
      * Not synchronised against concurrent readers on purpose: two rebuilds race
-     * to create two file objects, and the loser's is simply orphaned. Serialising
-     * them would mean holding a lock across two network round trips on the path
-     * that is already the slow one.
+     * to create two file objects and one of them goes unused. Serialising them
+     * would mean holding a lock across two network round trips on the path that
+     * is already the slow one. The unused object is reported rather than
+     * dropped, so a caller deleting leases still collects it.
      */
     private suspend fun rebuild(): String {
         val created = client.instantCreate(
@@ -343,7 +363,12 @@ class PikPakFileHandle(
         )
         fileId = created
         expiresAt = null
-        reportMutex.withLock { unreportedObject = created }
+        // Hand the replaced object over instead of overwriting the slot. Nothing looks it up
+        // again, fileId having moved on, and a caller that deletes leases is the only thing
+        // left that can name it. Two rebuilds racing used to strand the loser's object here:
+        // the slot kept whichever wrote last, and the other id was gone for good.
+        val replaced = reportMutex.withLock { unreportedObject.also { unreportedObject = created } }
+        replaced?.let { onObjectMinted?.invoke(it) }
         return created
     }
 

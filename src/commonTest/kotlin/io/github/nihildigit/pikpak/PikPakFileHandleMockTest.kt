@@ -189,6 +189,38 @@ class PikPakFileHandleMockTest {
     }
 
     /**
+     * A rebuild replaces the object the handle was holding, and that object's
+     * id is about to be forgotten. Overwriting the slot with the replacement
+     * used to lose it, which is how two racing rebuilds stranded one object per
+     * race. The object left over when the ladder gives up is owed too, and only
+     * [PikPakFileHandle.closeAndReport] can collect that one.
+     */
+    @Test
+    fun `a rebuild reports the object it replaces and close reports the last one`() = runBlocking<Unit> {
+        val client = newClient()
+        val minted = mutableListOf<String>()
+        val handle = PikPakFileHandle(
+            client = client,
+            gcid = GCID,
+            size = 1000,
+            name = "ep.mkv",
+            initialFileId = "f1",
+            onObjectMinted = { minted += it },
+        )
+        live.clear()
+        createsAreBornDead = true
+        try {
+            assertFailsWith<PikPakException> { handle.provideUrl(UrlRequest.Initial) }
+            assertEquals(listOf("f1"), minted, "the object the rebuild replaced was not handed over")
+
+            handle.closeAndReport()
+            assertEquals(listOf("f1", "f2"), minted, "the rebuilt object was left with nobody able to name it")
+        } finally {
+            client.close()
+        }
+    }
+
+    /**
      * A variant that is not in the detail response must fail rather than fall
      * back to another one: a different variant is different bytes, and a caller
      * reading at a committed offset would get corruption instead of an error.
