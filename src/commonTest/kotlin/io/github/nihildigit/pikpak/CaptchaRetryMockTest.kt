@@ -11,6 +11,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -142,11 +144,17 @@ class CaptchaRetryMockTest {
         val firstArrived = CompletableDeferred<Unit>()
         val bothArrived = CompletableDeferred<Unit>()
         val log = mutableListOf<String>()
+        // Two requests are in flight for the whole test, and the token handed out is derived from
+        // the log, so recording and counting have to happen as one step. The lock is not held
+        // across the awaits below, which is where the two requests deliberately meet.
+        val logLock = Mutex()
 
         val engine = MockEngine { request ->
             val path = request.url.encodedPath
-            log += "${request.method.value} $path"
-            val captchaInitCount = log.count { it.endsWith("/v1/shield/captcha/init") }
+            val captchaInitCount = logLock.withLock {
+                log += "${request.method.value} $path"
+                log.count { it.endsWith("/v1/shield/captcha/init") }
+            }
             when {
                 path.endsWith("/v1/shield/captcha/init") -> json(
                     """{"captcha_token":"CAPTCHA-$captchaInitCount","expires_in":300,"url":""}""",
