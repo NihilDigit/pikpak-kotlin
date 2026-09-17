@@ -352,7 +352,18 @@ class RangeReader internal constructor(
                     }
                 }
             } catch (t: Throwable) {
-                if (t is CancellationException) throw t
+                if (t is CancellationException) {
+                    // An attempt is reported when it stops delivering, and that can be the
+                    // consumer's doing: read() cancels the pump the moment its block has the
+                    // bytes it wanted, which lands while this attempt is suspended in the one
+                    // more channel read it takes to see EOF. Whether the pump reaches the
+                    // report below first is then a race -- one the JVM wins, because there
+                    // the last read returns -1 without suspending, and Kotlin/Native loses.
+                    // The attempt delivered what it delivered either way, and one nobody
+                    // reports is one that did not happen as far as any measurement can tell.
+                    report(attempt, outcomeFor(announced, delivered))
+                    throw t
+                }
                 offset += delivered
                 remaining = remaining?.minus(delivered)
                 addBytes(delivered)
@@ -391,11 +402,7 @@ class RangeReader internal constructor(
             // A body that stopped short of its own Content-Length ends this
             // attempt the same way a transport error does; only the loop below
             // knows that yet, so the outcome is decided here and not in catch.
-            report(
-                attempt,
-                if (announced != null && delivered < announced!!) RangeAttempt.Outcome.Failed
-                else RangeAttempt.Outcome.Complete,
-            )
+            report(attempt, outcomeFor(announced, delivered))
 
             offset += delivered
             remaining = remaining?.minus(delivered)
@@ -467,6 +474,16 @@ class RangeReader internal constructor(
      * does not apply, because the caller supplied the code that threw and it is
      * not on the path the bytes take.
      */
+    /**
+     * What an attempt that stopped delivering should be called.
+     *
+     * A body that stopped short of its own Content-Length ended the same way a transport
+     * error does, whether it stopped by itself or because the read was cancelled.
+     */
+    private fun outcomeFor(announced: Long?, delivered: Long): RangeAttempt.Outcome =
+        if (announced != null && delivered < announced) RangeAttempt.Outcome.Failed
+        else RangeAttempt.Outcome.Complete
+
     private fun report(recorder: RangeAttemptRecorder, outcome: RangeAttempt.Outcome) {
         val observer = onAttempt ?: return
         try {
