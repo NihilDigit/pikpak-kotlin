@@ -107,6 +107,26 @@ class PikPakStreamReader internal constructor(
     private val cache = LinkedHashMap<Int, ByteArray>()
     private var cachedBytes = 0L
 
+    /** Cached slots nobody has read yet. See [wastedBytes]. */
+    private val unreadSlots = HashSet<Int>()
+
+    /**
+     * Bytes fetched and then evicted without ever being served to the consumer.
+     *
+     * The other half of a read-ahead measurement. A read that waits says the
+     * window was too small; nothing said it was too big, so the depth could
+     * only be set by guessing -- and a guess in the narrow direction made a
+     * cold open two and a half times slower before this existed. Read-ahead
+     * that guessed wrong looks exactly like read-ahead that guessed right until
+     * the block is evicted unread, so that is where it is counted.
+     *
+     * Written under [mutex]; volatile so a reporter can sample it without
+     * contending for the lock.
+     */
+    @Volatile
+    var wastedBytes: Long = 0
+        private set
+
     /** Slot -> the fetch that will fill it. One fetch may own several slots. */
     private val inFlight = HashMap<Int, Fetch>()
 
@@ -432,7 +452,9 @@ class PikPakStreamReader internal constructor(
         val lastSlot = slotOf((windowEnd - 1).coerceAtLeast(pos))
         while (cachedBytes + inFlightBytes() + blockSize > memoryCapBytes) {
             val victim = cache.keys.firstOrNull { it < firstSlot || it > lastSlot } ?: return false
-            cachedBytes -= (cache.remove(victim)?.size ?: 0).toLong()
+            val size = (cache.remove(victim)?.size ?: 0).toLong()
+            cachedBytes -= size
+            if (unreadSlots.remove(victim)) wastedBytes += size
         }
         return true
     }
@@ -549,6 +571,11 @@ class PikPakStreamReader internal constructor(
     private fun hit(slot: Int): ByteArray? {
         val data = cache.remove(slot) ?: return null
         cache[slot] = data
+        // A hit is the only evidence a block was wanted. Read-ahead that guessed
+        // right is indistinguishable from read-ahead that guessed wrong until
+        // someone asks for it, which is why the counter is kept the other way
+        // round: a slot is presumed wasted until it is served.
+        unreadSlots.remove(slot)
         return data
     }
 
@@ -556,6 +583,7 @@ class PikPakStreamReader internal constructor(
     private fun put(slot: Int, data: ByteArray) {
         val previous = cache.put(slot, data)
         cachedBytes += data.size - (previous?.size ?: 0)
+        unreadSlots.add(slot)
     }
 
     /**

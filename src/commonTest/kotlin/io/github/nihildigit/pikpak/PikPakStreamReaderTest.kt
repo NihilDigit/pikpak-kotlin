@@ -298,6 +298,48 @@ class PikPakStreamReaderTest {
         }
     }
 
+    /**
+     * The measurement that says read-ahead was too deep.
+     *
+     * A read that waits says the window was too small, and nothing said it was
+     * too large, so the depth could only be set by guessing. Read-ahead that
+     * guessed wrong is indistinguishable from read-ahead that guessed right
+     * until the block is dropped unread, so that is the moment to count it.
+     */
+    @Test
+    fun `blocks evicted before anyone reads them are counted as waste`() = runBlocking<Unit> {
+        val window = unit * 4
+        val cap = window + unit * (2 * 1 + 1)
+        val content = payload((unit * 64).toInt())
+        val source = FakeRangeSource(content, latency = 2.milliseconds)
+        val reader = reader(source, content.size.toLong(), concurrency = 1, readAhead = window, cap = cap)
+
+        try {
+            val buffer = ByteArray(unit.toInt())
+            assertEquals(buffer.size, reader.read(buffer, 0, buffer.size), "short read at the head")
+            waitUntil("read-ahead has filled the window") { reader.readAheadDepthForTest() == window }
+            assertEquals(0, reader.wastedBytes, "nothing has been dropped yet")
+
+            // Far enough that none of what was fetched is in the new window,
+            // then read on: eviction only happens when a worker wants room the
+            // cap will not give, so the blocks left behind are dropped by the
+            // fetches that follow the seek, not by the seek itself.
+            reader.seekTo(unit * 32)
+            repeat(6) { round ->
+                assertEquals(buffer.size, reader.read(buffer, 0, buffer.size), "short read in round $round")
+            }
+            waitUntil("the abandoned blocks are evicted") { reader.wastedBytes > 0 }
+
+
+            assertTrue(
+                reader.wastedBytes >= window - unit,
+                "the whole window but the block that was read is waste, saw ${reader.wastedBytes}",
+            )
+        } finally {
+            reader.close()
+        }
+    }
+
     @Test
     fun `a fetch abandoned before its body runs releases its slots and wakes its waiters`() = runBlocking<Unit> {
         // A seek can cancel the lazy fetch job after it is registered and
