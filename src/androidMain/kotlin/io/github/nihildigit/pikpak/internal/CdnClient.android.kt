@@ -9,8 +9,10 @@ import okhttp3.Connection
 import okhttp3.ConnectionPool
 import okhttp3.EventListener
 import okhttp3.Dispatcher
+import okhttp3.Handshake
 import okhttp3.Protocol
 import java.io.IOException
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
@@ -67,17 +69,45 @@ private fun unconfiguredCdnClient(): HttpClient = HttpClient {
  * A fresh TCP and TLS handshake is three to four round trips and a pooled
  * connection is one, and nothing above this layer can tell which a given
  * request paid -- both land in the same measurement. OkHttp builds one listener
- * per call, so the start time can be a field here rather than a map keyed by
+ * per call, so the start times can be fields here rather than a map keyed by
  * call.
+ *
+ * The callbacks arrive as dnsStart, dnsEnd, connectStart, secureConnectStart,
+ * secureConnectEnd, connectEnd: TLS is nested inside the connect span and DNS
+ * sits outside it, so connectEnd - connectStart is the whole handshake and the
+ * transport part only comes out by subtracting TLS from it. A call may run
+ * through this sequence more than once -- another address, or a proxy tunnel --
+ * and the runs do not overlap, so overwriting the fields is safe.
  *
  * Duplicated in the JVM and Android source sets because they do not share one
  * and the client builders above are already near-duplicates.
  */
 private class CdnConnectionListener : EventListener() {
+    private var dnsStartedAt = 0L
     private var connectStartedAt = 0L
+    private var secureStartedAt = 0L
+    private var secureNanos = 0L
+
+    override fun dnsStart(call: Call, domainName: String) {
+        dnsStartedAt = System.nanoTime()
+    }
+
+    override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) {
+        CdnConnectionStats.recordResolved((System.nanoTime() - dnsStartedAt).nanoseconds)
+    }
 
     override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
         connectStartedAt = System.nanoTime()
+        secureNanos = 0L
+        CdnConnectionStats.recordConnectStart()
+    }
+
+    override fun secureConnectStart(call: Call) {
+        secureStartedAt = System.nanoTime()
+    }
+
+    override fun secureConnectEnd(call: Call, handshake: Handshake?) {
+        secureNanos = System.nanoTime() - secureStartedAt
     }
 
     override fun connectEnd(
@@ -86,7 +116,10 @@ private class CdnConnectionListener : EventListener() {
         proxy: Proxy,
         protocol: Protocol?,
     ) {
-        CdnConnectionStats.recordOpened((System.nanoTime() - connectStartedAt).nanoseconds)
+        CdnConnectionStats.recordOpened(
+            (System.nanoTime() - connectStartedAt).nanoseconds,
+            secureNanos.nanoseconds,
+        )
     }
 
     override fun connectFailed(
@@ -96,7 +129,11 @@ private class CdnConnectionListener : EventListener() {
         protocol: Protocol?,
         ioe: IOException,
     ) {
-        CdnConnectionStats.recordFailed()
+        CdnConnectionStats.recordFailed(
+            ioe.javaClass.simpleName,
+            ioe.message,
+            (System.nanoTime() - connectStartedAt).nanoseconds,
+        )
     }
 
     override fun connectionAcquired(call: Call, connection: Connection) {

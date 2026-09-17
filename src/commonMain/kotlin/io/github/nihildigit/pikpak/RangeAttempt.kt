@@ -1,5 +1,6 @@
 package io.github.nihildigit.pikpak
 
+import io.github.nihildigit.pikpak.internal.AttemptRetries
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
@@ -34,9 +35,10 @@ import kotlin.time.TimeSource
  * transport errors before the body reaches the pump, so a request the CDN
  * answered 503 twice arrives here as a single attempt with an unusually long
  * [timeToFirstByte] and no [Outcome.Throttled] to show for it. A large time to
- * first byte therefore means "the bytes were late", not "the route is long" —
- * the [timeline] is what separates the two, an internal retry showing as empty
- * slots rather than slow ones.
+ * first byte therefore means "the bytes were late", not "the route is long".
+ * [retriedServerErrors] and the counters beside it say which of the two, per
+ * request rather than per client, and [retryBackoff] is how much of
+ * [timeToHeaders] was spent waiting rather than on the wire.
  */
 class RangeAttempt(
     /** Offset the request asked from. Later attempts of one read start further in. */
@@ -89,6 +91,20 @@ class RangeAttempt(
      * of a long attempt is lost.
      */
     val timeline: LongArray,
+    /**
+     * 5xx responses the HTTP layer retried inside this attempt.
+     *
+     * On a CDN range request this is the per-URL connection cap being hit: the
+     * request eventually succeeded, so the read never reported
+     * [Outcome.Throttled], but it paid a round trip and a backoff for each one.
+     */
+    val retriedServerErrors: Int = 0,
+    /** 429 responses retried inside this attempt. */
+    val retriedRateLimited: Int = 0,
+    /** Transport failures retried inside this attempt, which carry no status. */
+    val retriedTransport: Int = 0,
+    /** Time this attempt spent in retry backoff, included in [duration]. */
+    val retryBackoff: Duration = Duration.ZERO,
 ) {
     /** How the attempt ended. Everything but [Complete] means another attempt followed. */
     enum class Outcome {
@@ -128,6 +144,10 @@ class RangeAttempt(
             return delivered * 1000 / body.inWholeMilliseconds.coerceAtLeast(1)
         }
 
+    /** Retries of every reason the HTTP layer performed inside this attempt. */
+    val retries: Int
+        get() = retriedServerErrors + retriedRateLimited + retriedTransport
+
     /** The timeline as `kB/s` per slot, trailing empty slots dropped. Diagnostics only. */
     fun renderTimeline(): String {
         val last = timeline.indexOfLast { it > 0 }
@@ -141,6 +161,14 @@ class RangeAttempt(
         append(" (headers ${timeToHeaders ?: "none"}, ttfb ${timeToFirstByte ?: "none"}, ${bytesPerSecond / 1024} kB/s")
         append(", ${bytesPerSecondAfterFirstByte / 1024} kB/s after first byte)")
         append(" $outcome, prio $priority, $activeReads active / $queuedReads queued")
+        if (retries > 0) {
+            val reasons = buildList {
+                if (retriedServerErrors > 0) add("$retriedServerErrors 5xx")
+                if (retriedRateLimited > 0) add("$retriedRateLimited 429")
+                if (retriedTransport > 0) add("$retriedTransport transport")
+            }
+            append(", retried ${reasons.joinToString(" + ")} waiting $retryBackoff")
+        }
         append(", kB/s per ${bucketDuration}: ${renderTimeline()}")
     }
 
@@ -169,6 +197,13 @@ internal class RangeAttemptRecorder(
     private val queuedReads: Int,
     private val priority: Int,
 ) {
+    /**
+     * Installed on the coroutine that issues this attempt's request, so the
+     * retries `HttpEngine` performs under it land here and not on whichever
+     * other connection happened to be running at the same time.
+     */
+    val retries = AttemptRetries()
+
     private val mark = TimeSource.Monotonic.markNow()
     private val timeline = LongArray(RangeAttempt.BUCKETS)
     private var headersAt: Duration? = null
@@ -210,5 +245,9 @@ internal class RangeAttemptRecorder(
         outcome = outcome,
         bucketDuration = RangeAttempt.BUCKET,
         timeline = timeline,
+        retriedServerErrors = retries.serverErrors,
+        retriedRateLimited = retries.rateLimited,
+        retriedTransport = retries.transport,
+        retryBackoff = retries.waited,
     )
 }

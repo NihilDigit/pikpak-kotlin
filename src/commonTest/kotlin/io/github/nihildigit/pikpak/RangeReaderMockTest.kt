@@ -25,6 +25,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
 /**
@@ -259,6 +260,64 @@ class RangeReaderMockTest {
         client.close()
     }
 
+    /**
+     * Two reads overlap, one of them retried twice below the pump.
+     *
+     * The clean read is held open for exactly as long as the other one is
+     * retrying — its handler waits for the second 5xx, and the retrying handler
+     * waits for the clean request to arrive first — so each window covers the
+     * other. That is what makes this an attribution test rather than a counting
+     * one: over that window the client-wide counter reads 2 for both reads, and
+     * only a per-request counter can say the clean one retried nothing.
+     */
+    @Test
+    fun `an internal retry is attributed to the request that caused it`() = runBlocking {
+        val cleanStarted = CompletableDeferred<Unit>()
+        val retriesDone = CompletableDeferred<Unit>()
+        var served = 0
+        val client = clientWith(
+            retryPolicy = RetryPolicy(maxAttempts = 4, initialDelay = 1.milliseconds, maxDelay = 2.milliseconds),
+        ) { req ->
+            if (req.url.parameters["role"] == "clean") {
+                cleanStarted.complete(Unit)
+                retriesDone.await()
+                partial(req, content)
+            } else {
+                cleanStarted.await()
+                served++
+                if (served <= 2) {
+                    if (served == 2) retriesDone.complete(Unit)
+                    respond(ByteReadChannel(ByteArray(0)), HttpStatusCode.InternalServerError)
+                } else {
+                    partial(req, content)
+                }
+            }
+        }
+
+        val retried = mutableListOf<RangeAttempt>()
+        val clean = mutableListOf<RangeAttempt>()
+        val retryingReader = RangeReader(client, { "https://cdn/file?role=retry" }, onAttempt = { retried += it })
+        val cleanReader = RangeReader(client, { "https://cdn/file?role=clean" }, onAttempt = { clean += it })
+
+        listOf(
+            async { retryingReader.readBytes(0, 64) },
+            async { cleanReader.readBytes(0, 64) },
+        ).awaitAll()
+
+        // One attempt each: the 5xx never reached the pump, which is the whole
+        // reason these counters exist.
+        assertEquals(RangeAttempt.Outcome.Complete, retried.single().outcome)
+        assertEquals(2, retried.single().retriedServerErrors, "both 5xx belong to the read that got them")
+        assertTrue(retried.single().retryBackoff > Duration.ZERO, "the backoff is latency this read paid")
+        assertEquals(0, clean.single().retries, "the concurrent read retried nothing and must report nothing")
+        assertEquals(
+            2,
+            client.httpRetries.value.serverErrors,
+            "the client-wide counter sees both retries but cannot say which read they belong to",
+        )
+        client.close()
+    }
+
     /** An observer that throws explains nothing, and must not be able to end the read either. */
     @Test
     fun `a failing observer does not break the read`() = runBlocking {
@@ -310,6 +369,7 @@ class RangeReaderMockTest {
     }
 
     private fun clientWith(
+        retryPolicy: RetryPolicy = RetryPolicy(maxAttempts = 2, initialDelay = 1.milliseconds, maxDelay = 2.milliseconds),
         cdnHandler: suspend MockRequestHandleScope.(HttpRequestData) -> HttpResponseData,
     ): PikPakClient {
         val engine = MockEngine { req ->
@@ -337,7 +397,7 @@ class RangeReaderMockTest {
             account = "mock@x",
             password = "pw",
             sessionStore = InMemorySessionStore(),
-            retryPolicy = RetryPolicy(maxAttempts = 2, initialDelay = 1.milliseconds, maxDelay = 2.milliseconds),
+            retryPolicy = retryPolicy,
             httpClient = mock,
             cdnHttpClient = mock,
         )

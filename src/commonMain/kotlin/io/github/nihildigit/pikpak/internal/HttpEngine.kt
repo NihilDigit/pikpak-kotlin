@@ -23,9 +23,12 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.contentType
 import io.ktor.http.isSuccess
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.SerializationException
@@ -252,18 +255,27 @@ internal class HttpEngine(
                 if (t is RetryableStatus) {
                     if (attempt >= policy.maxAttempts - 1) throw t.toPikPakException(url)
                     val waitFor = t.retryAfter ?: policy.delayFor(attempt)
-                    pikpak.recordHttpRetry(t.status, waitFor)
+                    recordRetry(t.status, waitFor)
                     delay(waitFor)
                     attempt++
                     continue
                 }
                 if (!isRetryable(t) || attempt >= policy.maxAttempts - 1) throw t
                 val waitFor = policy.delayFor(attempt)
-                pikpak.recordHttpRetry(null, waitFor)
+                recordRetry(null, waitFor)
                 delay(waitFor)
                 attempt++
             }
         }
+    }
+
+    /**
+     * Client-wide counters plus, when the caller installed one, that one
+     * request's own.
+     */
+    private suspend fun recordRetry(status: Int?, waited: Duration) {
+        pikpak.recordHttpRetry(status, waited)
+        currentCoroutineContext()[AttemptRetries]?.record(status, waited)
     }
 
     private class RetryableStatus(
@@ -371,6 +383,45 @@ internal class HttpEngine(
             // attempt counts in surprising ways.
             expectSuccess = false
         }
+    }
+}
+
+/**
+ * Retries [HttpEngine] performed for the one request the caller is in.
+ *
+ * The alternative was to read the client-wide counters before and after the
+ * request and subtract. That is wrong the moment two requests overlap: the
+ * window between the two reads contains every other connection's retries too,
+ * so a request that retried nothing can be handed three of someone else's. A
+ * context element cannot be misattributed, because the retry loop lives inside
+ * `execute` and `execute` runs on the coroutine that called it.
+ *
+ * Unsynchronised on purpose. `execute` retries in a plain `while` loop on that
+ * same coroutine — it never forks the retry to another one — and the one
+ * installer, `RangeReader.pump`, wraps a single `streamRangeFromUrl` call whose
+ * block only writes to its sink. Ktor does carry the caller's context into the
+ * request pipeline, so engine coroutines can see this element, but nothing down
+ * there calls [record].
+ */
+internal class AttemptRetries : AbstractCoroutineContextElement(AttemptRetries) {
+    companion object Key : CoroutineContext.Key<AttemptRetries>
+
+    var serverErrors: Int = 0
+        private set
+    var rateLimited: Int = 0
+        private set
+    var transport: Int = 0
+        private set
+    var waited: Duration = Duration.ZERO
+        private set
+
+    fun record(status: Int?, waitedFor: Duration) {
+        when {
+            status == null -> transport++
+            status == 429 -> rateLimited++
+            status >= 500 -> serverErrors++
+        }
+        waited += waitedFor
     }
 }
 

@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -301,21 +302,27 @@ class RangeReader internal constructor(
             val attempt = RangeAttemptRecorder(offset, remaining, gate.inUse, gate.queued, priority)
 
             try {
-                client.streamRangeFromUrl(attemptUrl, offset, remaining) { stream ->
-                    attempt.headersReceived()
-                    announced = stream.contentLength
-                    clippedAtEof = stream.endsBeforeRequested(offset, remaining)
-                    val buffer = ByteArray(READ_CHUNK)
-                    while (true) {
-                        val n = stream.channel.readAvailable(buffer, 0, buffer.size)
-                        if (n == -1) break
-                        if (n > 0) {
-                            // Recorded before the sink, so a consumer that is
-                            // slow to drain does not read as a slow CDN.
-                            attempt.record(n)
-                            sink.writeFully(buffer, 0, n)
-                            sink.flush()
-                            delivered += n
+                // Only an extra context element, so the block below still runs
+                // on this coroutine and this dispatcher; what it buys is that
+                // the retries HttpEngine performs under this one request are
+                // counted against this attempt and no other.
+                withContext(attempt.retries) {
+                    client.streamRangeFromUrl(attemptUrl, offset, remaining) { stream ->
+                        attempt.headersReceived()
+                        announced = stream.contentLength
+                        clippedAtEof = stream.endsBeforeRequested(offset, remaining)
+                        val buffer = ByteArray(READ_CHUNK)
+                        while (true) {
+                            val n = stream.channel.readAvailable(buffer, 0, buffer.size)
+                            if (n == -1) break
+                            if (n > 0) {
+                                // Recorded before the sink, so a consumer that
+                                // is slow to drain does not read as a slow CDN.
+                                attempt.record(n)
+                                sink.writeFully(buffer, 0, n)
+                                sink.flush()
+                                delivered += n
+                            }
                         }
                     }
                 }
