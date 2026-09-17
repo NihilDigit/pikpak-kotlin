@@ -10,10 +10,37 @@ import kotlin.concurrent.Volatile
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
+import kotlin.time.Duration
 import org.kotlincrypto.hash.md.MD5
+
+/**
+ * Retries the HTTP layer performed without the caller ever learning of one.
+ *
+ * See [PikPakClient.httpRetries] for why this is not simply part of
+ * [RangeReaderStats].
+ */
+data class HttpRetryStats(
+    /** 5xx responses retried. On a range request this is the CDN's connection cap. */
+    val serverErrors: Int = 0,
+    /** 429 responses retried. */
+    val rateLimited: Int = 0,
+    /** Transport failures retried, which carry no status. */
+    val transport: Int = 0,
+    /** Time spent in backoff across all of them, which is time a caller saw as latency. */
+    val waited: Duration = Duration.ZERO,
+) {
+    /** These counters only ever rise, so a caller keeps a baseline and subtracts it. */
+    operator fun minus(earlier: HttpRetryStats) = HttpRetryStats(
+        serverErrors = serverErrors - earlier.serverErrors,
+        rateLimited = rateLimited - earlier.rateLimited,
+        transport = transport - earlier.transport,
+        waited = waited - earlier.waited,
+    )
+}
 
 /**
  * Entry point to the PikPak SDK.
@@ -125,6 +152,34 @@ class PikPakClient(
         require(connectionBudget >= 1) { "connectionBudget must be >= 1, got $connectionBudget" }
         require(accountConnectionBudget >= 1) {
             "accountConnectionBudget must be >= 1, got $accountConnectionBudget"
+        }
+    }
+
+    private val _httpRetries = MutableStateFlow(HttpRetryStats())
+
+    /**
+     * Requests the HTTP layer retried on its own, by reason.
+     *
+     * A retry inside `execute` happens before the caller's block runs, so
+     * nothing above it can see one: a range request the CDN answered 503 twice
+     * arrives at [RangeReader] as a single request that merely took a second
+     * longer, and [RangeReaderStats.throttled] stays at zero because no 503
+     * ever reached it. On a long route that is the difference between a slow
+     * link and a connection cap being hit, which call for opposite fixes.
+     *
+     * Monotonic since construction and shared by every request on this client,
+     * so a caller reads it as a delta over a window rather than per request.
+     */
+    val httpRetries: StateFlow<HttpRetryStats> = _httpRetries.asStateFlow()
+
+    internal fun recordHttpRetry(status: Int?, waited: Duration) {
+        _httpRetries.update {
+            it.copy(
+                serverErrors = it.serverErrors + if (status != null && status >= 500) 1 else 0,
+                rateLimited = it.rateLimited + if (status == 429) 1 else 0,
+                transport = it.transport + if (status == null) 1 else 0,
+                waited = it.waited + waited,
+            )
         }
     }
 

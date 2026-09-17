@@ -94,6 +94,12 @@ class PikPakFileHandle(
      * [close] cannot, not being suspending.
      */
     private val onObjectMinted: (suspend (String) -> Unit)? = null,
+    /**
+     * Passed to every [RangeReader] this handle builds, the replacements a
+     * refresh makes included, so an observer outlives the reader it watches.
+     * See [RangeAttempt] for what it is for.
+     */
+    private val onRangeAttempt: ((RangeAttempt) -> Unit)? = null,
     private val clock: Clock = Clock.System,
     private val refreshMargin: Duration = DEFAULT_REFRESH_MARGIN,
 ) : RangeSource, AutoCloseable {
@@ -278,6 +284,7 @@ class PikPakFileHandle(
             // its own gate would let this handle hold up to twice the budget
             // on one signed URL for as long as the old reads take to drain.
             gate = fileGate,
+            onAttempt = onRangeAttempt,
         ).also { reader = it }
     }
 

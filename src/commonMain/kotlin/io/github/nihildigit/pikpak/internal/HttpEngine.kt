@@ -251,12 +251,16 @@ internal class HttpEngine(
                 if (blockEntered) throw t
                 if (t is RetryableStatus) {
                     if (attempt >= policy.maxAttempts - 1) throw t.toPikPakException(url)
-                    delay(t.retryAfter ?: policy.delayFor(attempt))
+                    val waitFor = t.retryAfter ?: policy.delayFor(attempt)
+                    pikpak.recordHttpRetry(t.status, waitFor)
+                    delay(waitFor)
                     attempt++
                     continue
                 }
                 if (!isRetryable(t) || attempt >= policy.maxAttempts - 1) throw t
-                delay(policy.delayFor(attempt))
+                val waitFor = policy.delayFor(attempt)
+                pikpak.recordHttpRetry(null, waitFor)
+                delay(waitFor)
                 attempt++
             }
         }

@@ -197,6 +197,78 @@ class RangeReaderMockTest {
         client.close()
     }
 
+    /**
+     * One read, three requests, three reports — and the bytes counted once.
+     *
+     * The observer is called from six places in the pump, one per way an
+     * attempt can end, and a path that forgets to call it is invisible until
+     * the capture it was added for comes back missing exactly the attempts
+     * worth looking at. Asserting the sum as well as the count is what pins
+     * `delivered` as per-attempt: a cumulative counter would pass on the count
+     * and report the resumed bytes twice.
+     *
+     * Single read, single pump coroutine, so the list needs no lock.
+     */
+    @Test
+    fun `every way an attempt can end is reported once`() = runBlocking {
+        // 503 is deliberately not among these: HttpEngine retries 5xx before
+        // the body ever reaches the pump, so a throttled request is not an
+        // attempt this observer can see — it lands inside one.
+        var served = 0
+        val client = clientWith { req ->
+            served++
+            when (served) {
+                1 -> respond(ByteReadChannel(ByteArray(0)), HttpStatusCode.Forbidden)
+                2 -> {
+                    // Announces its full length and stops halfway: a dropped
+                    // connection, which resumes rather than restarts.
+                    val (from, to) = parseRange(req.headers[HttpHeaders.Range]!!)
+                    val full = content.copyOfRange(from.toInt(), (to + 1).toInt())
+                    respond(
+                        content = ByteReadChannel(full.copyOfRange(0, full.size / 2)),
+                        status = HttpStatusCode.PartialContent,
+                        headers = Headers.build {
+                            append(HttpHeaders.ContentRange, "bytes $from-$to/${content.size}")
+                            append(HttpHeaders.ContentLength, full.size.toString())
+                        },
+                    )
+                }
+                else -> partial(req, content)
+            }
+        }
+        val seen = mutableListOf<RangeAttempt>()
+        var issued = 0
+        val reader = RangeReader(
+            client,
+            { "https://cdn/file?sig=${issued++}" },
+            onAttempt = { seen += it },
+        )
+
+        val bytes = reader.readBytes(0, 200)
+
+        assertContentEquals(content.copyOfRange(0, 200), bytes)
+        assertEquals(
+            listOf(RangeAttempt.Outcome.Expired, RangeAttempt.Outcome.Failed, RangeAttempt.Outcome.Complete),
+            seen.map { it.outcome },
+        )
+        assertEquals(listOf(0L, 100L), seen.take(2).map { it.delivered })
+        assertEquals(200L, seen.sumOf { it.delivered }, "the resumed bytes must be counted once, not twice")
+        assertEquals(listOf(0L, 0L, 100L), seen.map { it.start }, "each attempt starts where the last one stopped")
+        assertEquals(1, seen.count { it.timeToFirstByte == null }, "only the expired signature delivered nothing")
+        assertTrue(seen.all { it.timeline.sum() == it.delivered }, "the timeline must account for every byte")
+        client.close()
+    }
+
+    /** An observer that throws explains nothing, and must not be able to end the read either. */
+    @Test
+    fun `a failing observer does not break the read`() = runBlocking {
+        val client = clientWith { req -> partial(req, content) }
+        val reader = RangeReader(client, { "https://cdn/file" }, onAttempt = { error("observer is broken") })
+
+        assertContentEquals(content.copyOfRange(0, 64), reader.readBytes(0, 64))
+        client.close()
+    }
+
     // --- helpers ---
 
     /** Serves like a real CDN: clips the range at EOF and answers 416 past it. */

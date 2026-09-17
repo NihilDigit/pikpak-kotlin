@@ -106,6 +106,17 @@ class RangeReader internal constructor(
      * with 503.
      */
     gate: PriorityGate?,
+    /**
+     * Called with every HTTP request this reader finishes, successful or not.
+     *
+     * Off by default: [stats] is enough to watch a transfer, and this is for
+     * diagnosing a link where the aggregate looks healthy and one connection is
+     * not. See [RangeAttempt] for what that distinction needs.
+     *
+     * Invoked from whichever coroutine was pumping the attempt, so several may
+     * arrive at once and none of them may block.
+     */
+    private val onAttempt: ((RangeAttempt) -> Unit)? = null,
 ) : AutoCloseable {
 
     constructor(
@@ -113,7 +124,8 @@ class RangeReader internal constructor(
         urlProvider: suspend (UrlRequest) -> String,
         connectionBudget: Int = PikPakClient.DEFAULT_CONNECTION_BUDGET,
         maxAttempts: Int = 5,
-    ) : this(client, urlProvider, connectionBudget, maxAttempts, null)
+        onAttempt: ((RangeAttempt) -> Unit)? = null,
+    ) : this(client, urlProvider, connectionBudget, maxAttempts, null, onAttempt)
 
     init {
         require(connectionBudget >= 1) { "connectionBudget must be >= 1, got $connectionBudget" }
@@ -163,7 +175,7 @@ class RangeReader internal constructor(
             coroutineScope {
                 val channel = ByteChannel(autoFlush = true)
                 val failure = PumpFailure()
-                val pump = launchPump(this, channel, failure, start, length)
+                val pump = launchPump(this, channel, failure, start, length, priority)
                 try {
                     val result = block(channel)
                     // Cancelling a channel only tells the reader that bytes
@@ -256,9 +268,10 @@ class RangeReader internal constructor(
         failure: PumpFailure,
         start: Long,
         length: Long?,
+        priority: Int,
     ): Job = scope.launch {
         try {
-            pump(sink, start, length)
+            pump(sink, start, length, priority)
             sink.flushAndClose()
         } catch (t: Throwable) {
             // Record before cancelling: the reader wakes up the moment the
@@ -269,7 +282,7 @@ class RangeReader internal constructor(
         }
     }
 
-    private suspend fun pump(sink: ByteWriteChannel, start: Long, length: Long?) {
+    private suspend fun pump(sink: ByteWriteChannel, start: Long, length: Long?, priority: Int) {
         var offset = start
         var remaining = length
         var failures = 0
@@ -282,8 +295,14 @@ class RangeReader internal constructor(
             var announced: Long? = null
             var clippedAtEof = false
 
+            // Started even when nobody is listening: the branch would have to
+            // be repeated at all six places an attempt can end, and a recorder
+            // nothing reads costs one allocation per request.
+            val attempt = RangeAttemptRecorder(offset, remaining, gate.inUse, gate.queued, priority)
+
             try {
                 client.streamRangeFromUrl(attemptUrl, offset, remaining) { stream ->
+                    attempt.headersReceived()
                     announced = stream.contentLength
                     clippedAtEof = stream.endsBeforeRequested(offset, remaining)
                     val buffer = ByteArray(READ_CHUNK)
@@ -291,6 +310,9 @@ class RangeReader internal constructor(
                         val n = stream.channel.readAvailable(buffer, 0, buffer.size)
                         if (n == -1) break
                         if (n > 0) {
+                            // Recorded before the sink, so a consumer that is
+                            // slow to drain does not read as a slow CDN.
+                            attempt.record(n)
                             sink.writeFully(buffer, 0, n)
                             sink.flush()
                             delivered += n
@@ -305,9 +327,11 @@ class RangeReader internal constructor(
 
                 when {
                     t is UrlExpiredException -> {
+                        report(attempt, RangeAttempt.Outcome.Expired)
                         refreshUrl(UrlRequest.Expired(attemptUrl), attemptUrl)
                     }
                     t is PikPakException && t.httpStatus == 503 -> {
+                        report(attempt, RangeAttempt.Outcome.Throttled)
                         // Over the URL's connection cap. Somebody else's read
                         // will finish; this is a queue, not a failure.
                         throttles++
@@ -316,11 +340,13 @@ class RangeReader internal constructor(
                         delay(throttleBackoff(throttles))
                     }
                     t is PikPakException && t.httpStatus in 400..499 -> {
+                        report(attempt, RangeAttempt.Outcome.Rejected)
                         if (rejectionRefreshed) throw t
                         rejectionRefreshed = true
                         refreshUrl(UrlRequest.Rejected(attemptUrl, t.httpStatus!!), attemptUrl)
                     }
                     else -> {
+                        report(attempt, RangeAttempt.Outcome.Failed)
                         failures++
                         if (failures >= maxAttempts) throw t
                         bumpRetries()
@@ -329,6 +355,15 @@ class RangeReader internal constructor(
                 }
                 continue
             }
+
+            // A body that stopped short of its own Content-Length ends this
+            // attempt the same way a transport error does; only the loop below
+            // knows that yet, so the outcome is decided here and not in catch.
+            report(
+                attempt,
+                if (announced != null && delivered < announced!!) RangeAttempt.Outcome.Failed
+                else RangeAttempt.Outcome.Complete,
+            )
 
             offset += delivered
             remaining = remaining?.minus(delivered)
@@ -390,6 +425,24 @@ class RangeReader internal constructor(
 
     private fun updateStats() {
         _stats.update { it.copy(activeReads = gate.inUse, queuedReads = gate.queued) }
+    }
+
+    /**
+     * Hands a finished attempt to [onAttempt], never letting it end the read.
+     *
+     * An observer exists to explain a transfer, so a broken one must not be
+     * able to stop it: this is the one place the "don't swallow errors" rule
+     * does not apply, because the caller supplied the code that threw and it is
+     * not on the path the bytes take.
+     */
+    private fun report(recorder: RangeAttemptRecorder, outcome: RangeAttempt.Outcome) {
+        val observer = onAttempt ?: return
+        try {
+            observer(recorder.finish(outcome))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+        }
     }
 
     private fun addBytes(count: Long) {
