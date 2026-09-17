@@ -9,6 +9,7 @@ import io.ktor.utils.io.writeFully
 import kotlin.time.Instant
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -20,9 +21,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 /** Why [RangeReader] is asking for a URL. */
 sealed interface UrlRequest {
@@ -313,7 +316,29 @@ class RangeReader internal constructor(
                         clippedAtEof = stream.endsBeforeRequested(offset, remaining)
                         val buffer = ByteArray(READ_CHUNK)
                         while (true) {
-                            val n = stream.channel.readAvailable(buffer, 0, buffer.size)
+                            // Watched here rather than by the client's socket timeout, which
+                            // cannot tell the two silences apart: it covers the read that
+                            // waits for the response headers as well as the ones that pull
+                            // the body. Callers set it to three seconds reasoning that bytes
+                            // were arriving at megabytes a second, so three seconds of none
+                            // means the connection is gone. True of the body; false before
+                            // the CDN has answered at all. Measured on a weak link it killed
+                            // requests still waiting for headers, and the retry underneath
+                            // turned each into ten to twelve seconds having delivered nothing.
+                            val n = try {
+                                withTimeout(BODY_SILENCE) {
+                                    stream.channel.readAvailable(buffer, 0, buffer.size)
+                                }
+                            } catch (e: TimeoutCancellationException) {
+                                // Deliberately not left as a CancellationException: the catch
+                                // below rethrows those untouched, and this has to reach the
+                                // retry path the way a truncated body does.
+                                throw PikPakException(
+                                    -1,
+                                    "stream went silent for $BODY_SILENCE after $delivered bytes",
+                                    cause = e,
+                                )
+                            }
                             if (n == -1) break
                             if (n > 0) {
                                 // Recorded before the sink, so a consumer that
@@ -483,6 +508,18 @@ class RangeReader internal constructor(
 
     private companion object {
         const val READ_CHUNK = 64 * 1024
+
+        /**
+         * How long the body may go silent before the attempt is retried.
+         *
+         * The value callers used to put on the socket timeout, moved to where
+         * it applies. It stays short on purpose: once bytes are flowing this
+         * link sustains megabytes a second, so seconds of none means the
+         * connection is gone and re-issuing the range costs one round trip.
+         * The wait for the response headers is a different quantity and is
+         * left to the client's timeout.
+         */
+        val BODY_SILENCE = 3.seconds
 
         /**
          * A 503 means the URL is at its connection cap; waiting is the whole
