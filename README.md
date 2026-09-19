@@ -166,6 +166,8 @@ Transcodes carry no embedded subtitles and a lower audio bitrate than the origin
 
 ```kotlin
 client.getQuota()                                      // GET /drive/v1/about
+client.getUserProfile()                                // nickname, avatar, masked contact details
+client.getVipInfo()                                    // membership tier and expiry
 
 client.listFiles(parentId = "")
 client.listFilesPaged(parentId, pageToken = "", extraFilters = mapOf(FileFilter.kind(FileKind.FOLDER)))
@@ -184,6 +186,19 @@ client.batchDelete(listOf(id1, id2))                   // bypasses the trash
 ```
 
 Every file carries its content hash in `FileStat.hash`, offline-download products included, and `params.url` holds the magnet that produced it. Folder ids are memoized on the client; `invalidateFolderId` drops one subtree and `clearFolderIdCache` drops all of them.
+
+## Searching
+
+```kotlin
+client.searchFiles("ep01", parentId)                   // one folder deep
+client.searchFilesRecursive("ep01").collect { hit ->   // the whole subtree, streamed
+    println("${hit.path} (${hit.file.id})")
+}
+client.searchFilesRecursiveList("ep01", limits = RecursiveSearchLimits(maxDepth = 3))
+client.listTrash()
+```
+
+PikPak has no name search: `name` is refused as a filter field on `/drive/v1/files` under every operator, `q` and `search_text` are accepted and ignored, and no separate search endpoint exists. A subtree search is therefore one listing request per folder, walked breadth-first on the client. `RecursiveSearchLimits` bounds depth, folder count and wall-clock time; exhausting any of them ends the flow with the hits found so far rather than throwing. Each hit carries the folder names between the search root and itself, because a drive-wide search otherwise returns a list of identical names.
 
 ## Uploading
 
