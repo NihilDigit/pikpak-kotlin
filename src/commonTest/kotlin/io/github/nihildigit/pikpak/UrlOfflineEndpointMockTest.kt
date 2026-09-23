@@ -64,6 +64,56 @@ class UrlOfflineEndpointMockTest {
         client.close()
     }
 
+    @Test
+    fun `retry posts RETRY to the singular task path and returns the requeued task`() = runBlocking {
+        var method: String? = null
+        var body: String? = null
+        val client = clientWithAuth { req ->
+            if (req.url.encodedPath == "/drive/v1/task") {
+                method = req.method.value
+                body = req.body.toByteArrayText()
+                respondJson("""{"task":{"id":"TID","phase":"PHASE_TYPE_PENDING","file_id":"NEW","file_size":"0"}}""")
+            } else respond404()
+        }
+        val task = client.retryOfflineTask("TID")
+        assertEquals("POST", method)
+        val sent = body ?: error("request body was not captured")
+        assertTrue("\"create_type\":\"RETRY\"" in sent, sent)
+        assertTrue("\"id\":\"TID\"" in sent, sent)
+        assertTrue("\"type\":\"offline\"" in sent, sent)
+        assertEquals("NEW", task.fileId)
+        client.close()
+    }
+
+    @Test
+    fun `delete sends one task_ids parameter per id`() = runBlocking {
+        var method: String? = null
+        var query: String? = null
+        val client = clientWithAuth { req ->
+            if (req.url.encodedPath == "/drive/v1/tasks") {
+                method = req.method.value
+                query = req.url.encodedQuery
+                respondJson("{}")
+            } else respond404()
+        }
+        client.deleteOfflineTasks(listOf("A", "B"))
+        assertEquals("DELETE", method)
+        assertEquals("task_ids=A&task_ids=B&delete_files=false", query)
+        client.close()
+    }
+
+    @Test
+    fun `delete with no ids sends nothing`() = runBlocking {
+        var hits = 0
+        val client = clientWithAuth { req ->
+            if (req.url.encodedPath == "/drive/v1/tasks") hits++
+            respondJson("{}")
+        }
+        client.deleteOfflineTasks(emptyList())
+        assertEquals(0, hits)
+        client.close()
+    }
+
     private fun clientWithAuth(
         handler: suspend MockRequestHandleScope.(HttpRequestData) -> HttpResponseData,
     ): PikPakClient {

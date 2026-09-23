@@ -142,6 +142,58 @@ suspend fun PikPakClient.getTask(taskId: String): OfflineTask {
 }
 
 /**
+ * Queues an offline task again (`POST /drive/v1/task` with `create_type`
+ * `RETRY`; note the singular path) and returns the task as the server now
+ * reports it.
+ *
+ * Observed 2026-09-23: the server also accepts a task that is still RUNNING.
+ * The task keeps its id, goes back to PENDING, counts up
+ * `params["retry_times"]` and gets a new [OfflineTask.fileId], so a caller
+ * holding the old file id has to read it again from the returned task.
+ *
+ * Accepted is not the same as retried. A finished task whose file was later
+ * deleted went RUNNING and then, two seconds on, ERROR "Save failed, retry
+ * please" (observed 2026-09-23), and so did every retry of a real save
+ * failure tried that day. Submitting `params["url"]` again through
+ * [createUrlFile] completed where RETRY did not.
+ */
+suspend fun PikPakClient.retryOfflineTask(taskId: String): OfflineTask {
+    require(taskId.isNotEmpty()) { "taskId must not be empty" }
+    val body = buildJsonObject {
+        put("type", "offline")
+        put("create_type", "RETRY")
+        put("id", taskId)
+    }
+    val response = http.request(
+        method = HttpMethod.Post,
+        url = "${PikPakConstants.DRIVE_BASE}/drive/v1/task",
+        captchaAction = "POST:/drive/v1/task",
+    ) { jsonBody(json, body) }
+    val taskNode = (response as JsonObject)["task"]?.jsonObject
+        ?: throw PikPakException(-1, "retryOfflineTask: response missing task")
+    return json.decodeFromJsonElement(OfflineTask.serializer(), taskNode)
+}
+
+/**
+ * Deletes offline-task records (`DELETE /drive/v1/tasks`). No-op when
+ * [taskIds] is empty.
+ *
+ * The ids go out as one `task_ids` parameter per id. [deleteFiles] also
+ * removes what the tasks produced. Observed 2026-09-23 with it false: a
+ * finished task's file stays in the drive untouched, while an unfinished
+ * task's placeholder file goes away with the task regardless.
+ */
+suspend fun PikPakClient.deleteOfflineTasks(taskIds: List<String>, deleteFiles: Boolean = false) {
+    if (taskIds.isEmpty()) return
+    val query = taskIds.map { "task_ids" to it } + ("delete_files" to deleteFiles.toString())
+    http.request(
+        method = HttpMethod.Delete,
+        url = buildUrl(PikPakConstants.DRIVE_BASE, "/drive/v1/tasks", query),
+        captchaAction = "DELETE:/drive/v1/tasks",
+    )
+}
+
+/**
  * Lists offline-download tasks on the account. Server-side `filters` is a JSON
  * string wrapping a `phase.in` match — the default catches running + errored
  * tasks, which is what callers polling for completion usually want. Pass

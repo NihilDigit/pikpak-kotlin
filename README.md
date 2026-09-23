@@ -221,6 +221,8 @@ var task = client.getTask(taskId)
 while (task.phase !in TaskPhase.TERMINAL) { delay(3.seconds); task = client.getTask(taskId) }
 task.fileId                                            // set once phase == TaskPhase.COMPLETE
 client.listOfflineTasks()
+client.retryOfflineTask(taskId)                        // back to PENDING, with a new fileId
+client.deleteOfflineTasks(listOf(taskId))              // deleteFiles = false by default
 ```
 
 The SDK deliberately owns no polling loop over these — when a task counts as done is the caller's call.

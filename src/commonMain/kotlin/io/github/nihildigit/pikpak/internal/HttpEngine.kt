@@ -446,10 +446,14 @@ private fun HttpResponse.retryAfter(): Duration? {
     return seconds.coerceAtMost(30L).seconds
 }
 
-internal fun buildUrl(base: String, path: String, query: Map<String, String> = emptyMap()): String {
+internal fun buildUrl(base: String, path: String, query: Map<String, String> = emptyMap()): String =
+    buildUrl(base, path, query.toList())
+
+/** Pairs instead of a map, for endpoints that take one key several times (`task_ids`). */
+internal fun buildUrl(base: String, path: String, query: List<Pair<String, String>>): String {
     val full = base.trimEnd('/') + "/" + path.trimStart('/')
     if (query.isEmpty()) return full
-    val qs = query.entries.joinToString("&") { (k, v) -> "${encode(k)}=${encode(v)}" }
+    val qs = query.joinToString("&") { (k, v) -> "${encode(k)}=${encode(v)}" }
     val sep = if ('?' in full) '&' else '?'
     return "$full$sep$qs"
 }
