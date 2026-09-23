@@ -104,14 +104,14 @@ internal class HttpEngine(
                 }
                 throw e
             }
-            val errorCode = element.tryGetErrorCode()
-            if (errorCode == ErrorCodes.OK) return element
-            if (errorCode == ErrorCodes.CAPTCHA_REQUIRED && captchaAction != null && !captchaRetried) {
+            if (element.tryGetErrorCode() == ErrorCodes.OK) return element
+            val error = element.toException()
+            if (error.isCaptchaRequired && captchaAction != null && !captchaRetried) {
                 pikpak.auth.refreshCaptchaToken(captchaAction, captchaUsed)
                 captchaRetried = true
                 continue
             }
-            throw element.toException()
+            throw error
         }
     }
 

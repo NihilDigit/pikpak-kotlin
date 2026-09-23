@@ -22,7 +22,15 @@ open class PikPakException(
     cause: Throwable? = null,
 ) : RuntimeException(buildMessage(errorCode, errorMessage, errorDescription, httpStatus), cause) {
 
-    val isCaptchaRequired: Boolean get() = errorCode == ErrorCodes.CAPTCHA_REQUIRED
+    /**
+     * Code 9 is not captcha-only: a trashed file's detail answers
+     * `error_code=9, error="file_in_recycle_bin"` (observed 2026-09-23), and
+     * treating that as a captcha costs a captcha handshake and a retry before
+     * the real error surfaces. The captcha cases name themselves
+     * (`captcha_required`, `captcha_invalid`).
+     */
+    val isCaptchaRequired: Boolean
+        get() = errorCode == ErrorCodes.CAPTCHA_REQUIRED && errorMessage.startsWith("captcha")
     val isRefreshTokenInvalid: Boolean get() = errorCode == ErrorCodes.REFRESH_TOKEN_INVALID
 
     /** First value of [name] (case-insensitive), or null. */

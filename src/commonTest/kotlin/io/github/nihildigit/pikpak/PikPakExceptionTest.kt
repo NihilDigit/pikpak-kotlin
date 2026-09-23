@@ -37,8 +37,14 @@ class PikPakExceptionTest {
 
     @Test
     fun `captcha flag maps to code 9`() {
-        assertTrue(PikPakException(ErrorCodes.CAPTCHA_REQUIRED, "c").isCaptchaRequired)
+        assertTrue(PikPakException(ErrorCodes.CAPTCHA_REQUIRED, "captcha_required").isCaptchaRequired)
+        assertTrue(PikPakException(ErrorCodes.CAPTCHA_REQUIRED, "captcha_invalid").isCaptchaRequired)
         assertFalse(PikPakException(0, "").isCaptchaRequired)
+    }
+
+    @Test
+    fun `code 9 on a trashed file is not a captcha`() {
+        assertFalse(PikPakException(ErrorCodes.CAPTCHA_REQUIRED, "file_in_recycle_bin").isCaptchaRequired)
     }
 
     @Test
