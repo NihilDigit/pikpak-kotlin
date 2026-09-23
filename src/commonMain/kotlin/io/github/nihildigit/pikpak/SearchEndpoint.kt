@@ -44,6 +44,10 @@ suspend fun PikPakClient.searchFiles(
 /**
  * Lists every item currently in the account's trash (any parent). Pairs with
  * [batchUntrash] to restore and [batchDelete] to purge permanently.
+ *
+ * `parent_id=*` is what makes it any parent. Without it the server lists only
+ * items trashed from the root (observed 2026-09-23): a file trashed from a
+ * subfolder is in the trash, restorable, and missing from this listing.
  */
 suspend fun PikPakClient.listTrash(pageSize: Int = 500): List<FileStat> {
     val all = mutableListOf<FileStat>()
@@ -63,6 +67,7 @@ private suspend fun PikPakClient.listTrashPaged(
     val query = mutableMapOf(
         "thumbnail_size" to THUMBNAIL_SIZE,
         "limit" to pageSize.toString(),
+        "parent_id" to "*",
         "with_audit" to "false",
         "filters" to """{"trashed":{"eq":true}}""",
     )

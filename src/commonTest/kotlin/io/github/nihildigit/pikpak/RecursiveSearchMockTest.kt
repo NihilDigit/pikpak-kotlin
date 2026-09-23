@@ -160,6 +160,18 @@ class RecursiveSearchMockTest {
         concurrency = 2,
     )
 
+    @Test
+    fun `the trash listing asks for every parent`() = runBlocking {
+        val listed = mutableListOf<String>()
+        val client = treeClient(listed, tree = mapOf("*" to """{"files":[{"kind":"drive#file","id":"t1","name":"t","parent_id":"A","trashed":true}]}"""))
+        val trash = client.listTrash()
+        // Without parent_id=* the server answers only for the root, and a file
+        // trashed from a subfolder never shows up in the trash screen
+        assertEquals(listOf("*"), listed)
+        assertEquals(listOf("t1"), trash.map { it.id })
+        client.close()
+    }
+
     private fun treeClient(
         listed: MutableList<String>,
         tree: Map<String, String> = TREE,
