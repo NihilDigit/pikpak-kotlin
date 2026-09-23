@@ -34,6 +34,12 @@ data class FileStat(
     val phase: String = "",
     val trashed: Boolean = false,
     /**
+     * When a trashed item is purged for good, RFC 3339; empty outside the trash.
+     * Observed 2026-09-23: fifteen days after it was trashed, on a platinum
+     * account. The server sets it, so read it rather than add a fixed period.
+     */
+    @SerialName("delete_time") val deleteTime: String = "",
+    /**
      * Server-supplied extras. `url` holds the original magnet for anything an
      * offline task produced, which is the only place that association is
      * recorded — the tasks endpoint cannot be queried by URL or info hash.
