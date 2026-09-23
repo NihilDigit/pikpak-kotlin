@@ -113,8 +113,9 @@ suspend fun PikPakClient.createFolder(parentId: String, name: String): String {
 }
 
 /**
- * Moves [fileId] to the PikPak trash. PikPak's `DELETE /drive/v1/files/{id}`
- * is a soft delete — items are recoverable from the trash UI until purged.
+ * Deletes [fileId] permanently. `DELETE /drive/v1/files/{id}` bypasses the
+ * trash: observed 2026-09-23, the file answers 404 right after and is not in
+ * [listTrash]. Use [batchTrash] for a recoverable delete.
  */
 suspend fun PikPakClient.deleteFile(fileId: String) {
     http.request(
