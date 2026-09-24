@@ -33,7 +33,7 @@ class OfflinePruneMockTest {
     )
 
     @Test
-    fun `keeps picked paths, drops the rest, and deletes unpicked folders whole`() = runBlocking {
+    fun `keeps picked paths and deletes the rest with unpicked folders whole`() = runBlocking {
         val listed = mutableListOf<String>()
         val deleteBodies = mutableListOf<String>()
         val client = client { path, parentId, body ->
