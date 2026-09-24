@@ -6,9 +6,11 @@ import io.ktor.http.HttpMethod
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 
 /**
@@ -195,6 +197,33 @@ suspend fun PikPakClient.deleteOfflineTasks(taskIds: List<String>, deleteFiles: 
         url = buildUrl(PikPakConstants.DRIVE_BASE, "/drive/v1/tasks", query),
         captchaAction = "DELETE:/drive/v1/tasks",
     )
+}
+
+/**
+ * Deletes every offline task on the account whose phase is in [phases]
+ * (`POST /drive/v1/tasks:clear`) — the web client's "clear completed" and
+ * "clear unfinished", which pass `[TaskPhase.COMPLETE]` and
+ * `[TaskPhase.PENDING, TaskPhase.RUNNING, TaskPhase.ERROR]` respectively.
+ * [deleteFiles] has the meaning it has in [deleteOfflineTasks].
+ *
+ * `client_id` goes out empty, as the web client sends it by default, which
+ * reads as "tasks from every client"; the web client can scope it to its own
+ * client id instead. The request shape comes from the web client alone and was
+ * never run against a real account, since it cannot be aimed at test data.
+ */
+suspend fun PikPakClient.clearOfflineTasks(phases: Collection<String>, deleteFiles: Boolean = false) {
+    require(phases.isNotEmpty()) { "phases must not be empty" }
+    val body = buildJsonObject {
+        put("type", "offline")
+        putJsonArray("phases") { phases.forEach { add(it) } }
+        put("client_id", "")
+        put("delete_files", deleteFiles)
+    }
+    http.request(
+        method = HttpMethod.Post,
+        url = "${PikPakConstants.DRIVE_BASE}/drive/v1/tasks:clear",
+        captchaAction = "POST:/drive/v1/tasks:clear",
+    ) { jsonBody(json, body) }
 }
 
 /**

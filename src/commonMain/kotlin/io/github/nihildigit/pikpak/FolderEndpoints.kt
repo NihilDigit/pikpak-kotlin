@@ -195,6 +195,62 @@ suspend fun PikPakClient.batchMove(ids: List<String>, toParentId: String) {
     folderIds.invalidateAll()
 }
 
+/**
+ * Copies [ids] into [toParentId] (empty string for the root drive) and returns
+ * the server's task id for each [BATCH_ID_LIMIT]-sized chunk. No-op returning
+ * an empty list when [ids] is empty.
+ *
+ * The copy runs as a server task (`type` `copy`) that [getTask] can read.
+ * Observed 2026-09-24 on a folder with one empty subfolder: the task was
+ * already `PHASE_TYPE_COMPLETE` and the copy listed in the target when the
+ * call returned; nothing was measured for larger trees, so a caller that
+ * needs the copy in place should check the task rather than assume it.
+ * Copying into the item's own parent or into its own subtree is refused with
+ * `file_move_or_copy_to_cur` (error_code 9, same as [batchMove]).
+ *
+ * [unzipPassword] goes out as the `unzip_password` query parameter the web
+ * client sends when copying out of an archive; leave it null otherwise.
+ */
+suspend fun PikPakClient.batchCopy(
+    ids: List<String>,
+    toParentId: String,
+    unzipPassword: String? = null,
+): List<String> {
+    if (ids.isEmpty()) return emptyList()
+    val query = if (unzipPassword != null) mapOf("unzip_password" to unzipPassword) else emptyMap()
+    val taskIds = ids.chunked(BATCH_ID_LIMIT).map { chunk ->
+        val body = buildJsonObject {
+            putJsonArray("ids") { chunk.forEach { add(it) } }
+            putJsonObject("to") { put("parent_id", toParentId) }
+        }
+        val response = http.request(
+            method = HttpMethod.Post,
+            url = buildUrl(DRIVE, "$FILES_PATH:batchCopy", query),
+            captchaAction = "POST:/drive/v1/files:batchCopy",
+        ) { jsonBody(json, body) }
+        (response as JsonObject)["task_id"]?.jsonPrimitive?.contentOrNull
+            ?: throw PikPakException(-1, "batchCopy: response missing task_id")
+    }
+    folderIds.invalidateAll()
+    return taskIds
+}
+
+/**
+ * Permanently removes everything in the account's trash
+ * (`PATCH /drive/v1/files/trash:empty`, no body), the web client's "empty
+ * trash". Not recoverable. Never run against a real account while probing:
+ * the request shape comes from the web client alone, and its response is
+ * not checked.
+ */
+suspend fun PikPakClient.emptyTrash() {
+    http.request(
+        method = HttpMethod.Patch,
+        url = "$DRIVE$FILES_PATH/trash:empty",
+        captchaAction = "PATCH:/drive/v1/files/trash:empty",
+    )
+    folderIds.invalidateAll()
+}
+
 /** Renames [fileId] to [newName]. Empty names are rejected client-side. */
 suspend fun PikPakClient.rename(fileId: String, newName: String) {
     require(newName.isNotEmpty()) { "newName must not be empty" }
