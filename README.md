@@ -181,9 +181,58 @@ client.rename(fileId, newName)
 client.deleteFile(fileId)                              // permanent; bypasses the trash
 client.batchTrash(listOf(id1, id2))                    // recoverable for 30 days
 client.batchDelete(listOf(id1, id2))                   // bypasses the trash
+client.batchCopy(listOf(id1, id2), toParentId)         // a task; small copies are done on return
+client.emptyTrash()
+
+client.starFiles(listOf(id1, id2))
+client.unstarFiles(listOf(id1, id2))
+client.listStarred()                                   // every starred item on the drive
+file.isStarred                                         // from a listing's tags
 ```
 
-Every file carries its content hash in `FileStat.hash`, offline-download products included, and `params.url` holds the magnet that produced it. Folder ids are memoized on the client; `invalidateFolderId` drops one subtree and `clearFolderIdCache` drops all of them.
+Every file carries its content hash in `FileStat.hash`, offline-download products included, and `params.url` holds the magnet that produced it. A star shows only as a `STAR` entry in a listing's `tags`: the `starred` field of the detail response stays false, so read `FileStat.isStarred`. `listStarred` lists the whole drive when `parentId` is `*`, and a folder's direct children otherwise. Folder ids are memoized on the client; `invalidateFolderId` drops one subtree and `clearFolderIdCache` drops all of them.
+
+## Play history
+
+```kotlin
+client.listPlayHistory()                               // newest first, 100 a page
+client.reportPlay(fileId, positionSeconds = 754, durationSeconds = 1420)
+client.deleteEvents(listOf(eventId))
+client.clearEvents(listOf(EventType.PLAY))
+client.listEvents(listOf(EventType.UPLOAD, EventType.RESTORE))
+```
+
+Play history is the one the official clients keep, so a position reported here resumes there and the other way round. A file has one play event: reporting again overwrites its position, smaller or not, and moves it to the top. The server drops a report that follows the previous one for the same file by less than a few seconds and still answers `{}`, so report no more often than every five seconds, as the web client does. Each event carries the file it refers to as a full `FileStat`. An unfiltered event listing holds uploads and restores but no plays.
+
+## Sharing
+
+```kotlin
+val share = client.createShare(listOf(fileId), requirePassCode = true)   // share.shareUrl, share.passCode
+client.listMyShares()
+client.deleteShares(listOf(share.shareId))
+
+val shareId = shareIdFromUrl("https://mypikpak.com/s/VO...") ?: return
+val info = client.getShareInfo(shareId, passCode = "zq47")               // top level, and a pass code token
+client.listShareFiles(shareId, info.passCodeToken, parentId = folderId)  // any folder inside
+client.restoreShare(shareId, info.passCodeToken, fileIds, toParentId)    // a task; poll getTask
+```
+
+Reading a share needs no login. An unreadable one still answers HTTP 200 and says why in its status — pass code missing or wrong, share cancelled — so the read calls throw `ShareUnavailableException` rather than return an empty folder. `GET /share` ignores `parent_id`; folders below the top level go through `listShareFiles` with the token `getShareInfo` returned. A share of your own cannot be restored into your own drive (`file_restore_own`). `restoreShare` follows the request a captured web session sent and has not been run against a live share.
+
+## Archives
+
+```kotlin
+client.listArchive(file.id, file.hash, path = "", password = "")         // one level; folder paths end in "/"
+val task = client.decompressArchive(file.id, file.hash, toParentId, paths = listOf("Extras/"))
+client.getDecompressProgress(task.taskId)                                // 0-100; fileId is the new folder
+
+val tree = file.archiveTree ?: return                                    // after the first decompress
+client.listArchiveTreePaged(tree)                                        // browse like a folder
+client.getArchiveTreeFile(tree, entryId)                                 // signed link to one entry
+client.copyFromArchiveTree(tree, entryIds, toParentId)                   // extract the picked entries
+```
+
+zip, encrypted zip, 7z and rar list and extract; tar does not. Both paths want the password even when only the contents are encrypted and the names are not, and throw `ArchivePasswordException` without it. An archive's browsable tree appears only after it has been decompressed once. `packFolder` and `unpackFolder` are not compression: they turn a folder into one `.tar` file in place, same id, so it downloads as a single file, and back.
 
 ## Searching
 
@@ -221,6 +270,7 @@ task.fileId                                            // set once phase == Task
 client.listOfflineTasks()
 client.retryOfflineTask(taskId)                        // back to PENDING, with a new fileId
 client.deleteOfflineTasks(listOf(taskId))              // deleteFiles = false by default
+client.clearOfflineTasks(listOf(TaskPhase.COMPLETE))   // what the web client's clear buttons do
 client.pruneOfflineOutput(task, keep = setOf("01.mkv", "Extras/NCOP.mkv"))
 ```
 
