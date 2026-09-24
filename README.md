@@ -180,7 +180,7 @@ client.getOrCreateDeepFolderId(parentId, path)         // mkdir -p
 
 client.createFolder(parentId, name)
 client.rename(fileId, newName)
-client.deleteFile(fileId)                              // to trash; PikPak is soft-delete
+client.deleteFile(fileId)                              // permanent; bypasses the trash
 client.batchTrash(listOf(id1, id2))                    // recoverable for 30 days
 client.batchDelete(listOf(id1, id2))                   // bypasses the trash
 ```
