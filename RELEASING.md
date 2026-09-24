@@ -1,6 +1,6 @@
 # Releasing pikpak-kotlin
 
-End-to-end workflow for cutting a new version onto Maven Central via GitHub Actions. The repo is wired so that **pushing a `v*.*.*` git tag** triggers `.github/workflows/release.yml`, which fans out across a `strategy.matrix` (one cell per shipped target, each on the cheapest runner that can handle it — ubuntu-latest for JVM/Linux/Windows-cross-compile/Android, macos-latest for Apple targets) and then publishes signed artifacts to the Sonatype Central Portal once every cell passes.
+End-to-end workflow for cutting a new version onto Maven Central via GitHub Actions. The repo is wired so that **pushing a `v*.*.*` git tag** triggers `.github/workflows/release.yml`, which fans out across a `strategy.matrix` (one cell per shipped target, each on the cheapest runner that can handle it — ubuntu-latest for JVM and Android, macos-latest for iOS) and then publishes signed artifacts to the Sonatype Central Portal once every cell passes.
 
 This document is one-time setup plus the per-release ritual.
 
@@ -93,7 +93,7 @@ dependencies {
 }
 ```
 
-Gradle picks the right per-target artifact (`-jvm`, `-iosarm64`, `-linuxx64`, ...) automatically based on the consumer's build target — no extra coordinates needed.
+Gradle picks the right per-target artifact (`-jvm`, `-android`, `-iosarm64`, `-iossimulatorarm64`) automatically based on the consumer's build target — no extra coordinates needed.
 
 ---
 

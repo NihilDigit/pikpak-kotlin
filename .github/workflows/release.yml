@@ -29,15 +29,10 @@ jobs:
         include:
           # Runtime-tested (matches Kotlin/Native Tier 1/2 "Running Tests ✅")
           - { name: jvm,               runner: ubuntu-latest, task: jvmTest }
-          - { name: linuxX64,          runner: ubuntu-latest, task: linuxX64Test }
-          - { name: macosArm64,        runner: macos-latest,  task: macosArm64Test }
           - { name: iosSimulatorArm64, runner: macos-latest,  task: iosSimulatorArm64Test }
 
           # Compile-only (target shipped but upstream doesn't run tests either)
-          - { name: linuxArm64,        runner: ubuntu-latest, task: compileKotlinLinuxArm64 }
-          - { name: mingwX64,          runner: ubuntu-latest, task: compileKotlinMingwX64 }
           - { name: iosArm64,          runner: macos-latest,  task: compileKotlinIosArm64 }
-          - { name: iosX64,            runner: macos-latest,  task: compileKotlinIosX64 }
           # Android artefact is JVM bytecode; full instrumented tests belong in
           # a consumer app. A clean AAR assembly catches config regressions.
           - { name: android,           runner: ubuntu-latest, task: ':assembleAndroidMain', setup_android: true }
@@ -61,7 +56,7 @@ jobs:
 
   publish:
     name: Publish to Maven Central
-    # macOS runner so iOS/macOS targets can compile alongside JVM and Linux/Windows.
+    # macOS runner so the iOS targets can compile alongside JVM and Android.
     runs-on: macos-latest
     needs: [test]
     # Gate on a real tag push so workflow_dispatch runs never publish.

@@ -35,20 +35,13 @@ kotlin {
         }
     }
 
-    // Apple targets
-    iosX64()
     iosArm64()
     iosSimulatorArm64()
-    macosArm64()
 
-    // Other native
-    linuxX64()
-    linuxArm64()
-    mingwX64()
-
-    // Shared intermediate source sets so target-specific code only goes in
-    // the smallest set that needs it. The Apple group covers iOS + macOS;
-    // the broader native group covers anything that's not the JVM.
+    // With only iOS on the native side, native/apple/ios all hold the same
+    // two targets. The Darwin-specific actuals live in appleMain, the widest
+    // set that still sees platform.darwin, so an added macOS target would
+    // pick them up without moving files.
     applyDefaultHierarchyTemplate()
 
     sourceSets {
@@ -124,15 +117,6 @@ kotlin {
         // Apple targets share Ktor's Darwin engine.
         appleMain.dependencies {
             compileOnly("io.ktor:ktor-client-darwin:$ktorCompileVersion")
-        }
-        // Linux (x64 + arm64) and Windows native all ride on Ktor CIO.
-        // linuxMain is auto-created by applyDefaultHierarchyTemplate() and
-        // covers both linuxX64 and linuxArm64.
-        val linuxMain by getting {
-            dependencies { compileOnly("io.ktor:ktor-client-cio:$ktorCompileVersion") }
-        }
-        val mingwX64Main by getting {
-            dependencies { compileOnly("io.ktor:ktor-client-cio:$ktorCompileVersion") }
         }
     }
 }

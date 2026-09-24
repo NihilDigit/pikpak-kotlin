@@ -47,8 +47,8 @@ dependencies {
     implementation("io.ktor:ktor-client-core:<your-ktor-version>")
     implementation("io.ktor:ktor-client-content-negotiation:<your-ktor-version>")
     implementation("io.ktor:ktor-serialization-kotlinx-json:<your-ktor-version>")
-    // plus one engine: ktor-client-okhttp (JVM, Android), ktor-client-darwin (Apple),
-    // ktor-client-cio (Linux, Windows), or any other Ktor engine.
+    // plus one engine: ktor-client-okhttp (JVM, Android), ktor-client-darwin (iOS),
+    // or any other Ktor engine.
 }
 ```
 
@@ -60,13 +60,8 @@ Gradle resolves the per-target artifact from the module metadata. Android ships 
 | ------------------- | ------------ | ----------- |
 | `jvm`               | runtime test | OkHttp      |
 | `android`           | compile-only | OkHttp      |
-| `linuxX64`          | runtime test | CIO         |
-| `linuxArm64`        | compile-only | CIO         |
-| `mingwX64`          | compile-only | CIO         |
-| `macosArm64`        | runtime test | Darwin      |
 | `iosSimulatorArm64` | runtime test | Darwin      |
 | `iosArm64`          | compile-only | Darwin      |
-| `iosX64`            | compile-only | Darwin      |
 
 A release is published only after every cell of this matrix passes. Runtime tests run on the targets that [Kotlin/Native's tier table](https://kotlinlang.org/docs/native-target-support.html) also tests upstream; the others have to compile.
 
@@ -240,9 +235,7 @@ Requires JDK 21; the Gradle wrapper is included.
 ```bash
 ./gradlew jvmTest                     # unit tests plus the live integration suite
 ./gradlew jvmTest --tests '*Hash*'    # unit tests only, no network
-./gradlew linuxX64Test                # native runtime: GCID hash and captcha mock
-./gradlew macosArm64Test              # same, on Apple silicon
-./gradlew mingwX64Test                # same, on Windows
+./gradlew iosSimulatorArm64Test       # native runtime: GCID hash and captcha mock, macOS only
 ```
 
 The live integration tests read credentials from a git-ignored `.env` (copy `.env.example`); the library itself never reads it. Without `PIKPAK_USERNAME` they skip themselves, so the release workflow stays green.

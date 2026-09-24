@@ -17,8 +17,7 @@ Published as `io.github.nihildigit:pikpak-kotlin` on Maven Central. Source of tr
 ### Code layout
 
 - `src/commonMain/` — everything non-platform-specific. Depends only on KMP-capable libs: Ktor, kotlinx.serialization, kotlinx.coroutines, kotlinx.datetime, kotlinx-io, KotlinCrypto.
-- `src/jvmMain/`, `src/androidMain/`, `src/appleMain/`, `src/linuxMain/`, `src/mingwMain/` — per-platform actuals: `defaultSessionDir()` and `defaultCdnHttpClient()` (`internal/CdnClient.*.kt`), the latter tuning each engine's per-host connection cap to the CDN budget.
-- `src/nativeMain/` — `defaultSessionDir()` actual for all native targets (posix `getenv`).
+- `src/jvmMain/`, `src/androidMain/`, `src/appleMain/` — per-platform actuals: `defaultSessionDir()` and `defaultCdnHttpClient()` (`internal/CdnClient.*.kt`), the latter tuning each engine's per-host connection cap to the CDN budget. `appleMain` covers both iOS targets; there is no `nativeMain` code, since iOS is the only native platform.
 - `src/commonTest/` — unit tests that run on every target: gcid vectors, MockEngine-based auth/captcha/401 paths, `RangeReaderMockTest` for budget, refresh, 503, resume and EOF behaviour.
 - `src/jvmTest/` — live PikPak API integration tests, opt-in via `.env`. `RangeReaderSmokeTest` is the end-to-end playback-path check (magnet → task → range reads → fan-out throughput); `CdnNetworkProbeTest` measures the CDN and runs only with `PIKPAK_PROBE=1`; `WeakLinkSmokeTest` measures what the fan-out is worth on the current link and runs only with `PIKPAK_WEAKLINK=1` — it asserts nothing about speed, because "no gain" is the correct answer on a short route. Shared inputs live in `TestFixtures`.
 - `internal/` sub-package — implementation helpers not meant for consumers: `HttpEngine`, `AuthApi`, `PriorityGate` (priority-ordered semaphore behind `RangeReader`), `FolderIdCache`, `CdnClient`.
@@ -55,11 +54,11 @@ The SDK deliberately owns no polling loop over offline tasks. `createUrlFile` / 
 
 ### Shipped targets
 
-`jvm`, `android` (AAR, artifactId `pikpak-kotlin-android`), `linuxX64`, `linuxArm64`, `mingwX64`, `iosX64`, `iosArm64`, `iosSimulatorArm64`, `macosArm64`.
+`jvm`, `android` (AAR, artifactId `pikpak-kotlin-android`), `iosArm64`, `iosSimulatorArm64`.
 
-Which targets get runtime-tested in CI follows [Kotlin/Native's tier table](https://kotlinlang.org/docs/native-target-support.html): we run `*Test` for targets whose "Running Tests" column is ✅ upstream (`jvm`, `linuxX64`, `macosArm64`, `iosSimulatorArm64`), and only `compileKotlin<Target>` for the rest (`android` via `:assembleAndroidMain`, `linuxArm64`, `mingwX64`, `iosArm64`, `iosX64`). When adding a target, pick the cell type by what upstream Kotlin itself runs — don't shoulder runtime validation the toolchain vendor won't commit to.
+Which targets get runtime-tested in CI follows [Kotlin/Native's tier table](https://kotlinlang.org/docs/native-target-support.html): we run `*Test` for targets whose "Running Tests" column is ✅ upstream (`jvm`, `iosSimulatorArm64`), and only `compileKotlin<Target>` for the rest (`android` via `:assembleAndroidMain`, `iosArm64`). When adding a target, pick the cell type by what upstream Kotlin itself runs — don't shoulder runtime validation the toolchain vendor won't commit to.
 
-`macosX64` is deliberately not shipped (deprecated upstream from Kotlin 2.3.20). Add a target back only when a real user turns up.
+From 0.6.9 on, `linuxX64`, `linuxArm64`, `mingwX64`, `macosArm64` and `iosX64` are no longer shipped: each target multiplies the published files and the release size. `macosX64` was never shipped (deprecated upstream from Kotlin 2.3.20). Add a target back only when a real user turns up.
 
 ## Conventions
 
@@ -77,9 +76,7 @@ JDK 21 required. Gradle 8.11 wrapper included. No separate lint step — `ktlint
 ```bash
 ./gradlew build                                 # compile + full test suite
 ./gradlew jvmTest                               # JVM unit + live integration (needs .env)
-./gradlew linuxX64Test                          # native runtime: gcid + captcha mock
-./gradlew mingwX64Test                          # the native cell that actually runs on a Windows host
-./gradlew compileTestKotlinLinuxX64             # native commonTest compile only — fastest pre-push KMP check
+./gradlew iosSimulatorArm64Test                 # native runtime: gcid + captcha mock (macOS host only)
 PIKPAK_PROBE=1 ./gradlew jvmTest --tests '*CdnNetworkProbe*' --rerun   # CDN measurements → build/cdn-probe-report.txt
 PIKPAK_WEAKLINK=1 ./gradlew jvmTest --tests '*WeakLinkSmoke*' --rerun  # what fan-out is worth on this link, run it throttled
 ./gradlew assemble -Pkotlin.native.ignoreDisabledTargets=true   # every target buildable on this host
@@ -90,7 +87,7 @@ PIKPAK_WEAKLINK=1 ./gradlew jvmTest --tests '*WeakLinkSmoke*' --rerun  # what fa
 ./gradlew jvmTest --tests '*CaptchaRetry*'
 
 # Single native test (uses kotlin-test, same pattern)
-./gradlew linuxX64Test --tests 'io.github.nihildigit.pikpak.PikPakHashTest.hello matches reference'
+./gradlew iosSimulatorArm64Test --tests 'io.github.nihildigit.pikpak.PikPakHashTest.hello matches reference'
 ```
 
 `publishToMavenLocal` runs `signAllPublications()` unconditionally, so it needs a GPG signatory configured locally and fails with "no configured signatory" without one. It is not a credential-free wiring check; on a machine without the key, compiling every target is the closest equivalent.
@@ -99,7 +96,7 @@ Live integration tests create/delete folders in the test account. `IntegrationUp
 
 `RangeReaderSmokeTest` needs a file large enough to time, so it submits a magnet and keeps the result: later runs find the finished task by info hash and reuse it. The default is the Arch ISO in `TestFixtures`; `PIKPAK_SMOKE_MAGNET` overrides it locally. Gradle skips a test whose inputs did not change even when the environment did — add `--rerun` when only env vars moved.
 
-A green `jvmTest` says nothing about `commonTest` on Native: the JVM run never compiles the native test binaries, and the release matrix is where a Native-only compile error first shows up. The full pre-release check on a Windows host is `jvmTest mingwX64Test compileTestKotlinLinuxX64 --continue`; the Apple cells only run in CI.
+A green `jvmTest` says nothing about `commonTest` on Native: the JVM run never compiles the native test binaries, and the release matrix is where a Native-only compile error first shows up. Native `commonTest` runs only in the release CI's `iosSimulatorArm64` cell. On a macOS host `compileTestKotlinIosSimulatorArm64` is the fast local check. Off macOS, treat native as unchecked locally: Kotlin/Native runs iOS tests only on a Mac, and Windows on ARM64 has no Kotlin/Native distribution at all (`downloadKotlinNativeDistribution` fails). The local pre-release check there is `jvmTest`, with `commonTest` kept within the rules under Don't.
 
 ## CI philosophy
 
@@ -123,7 +120,7 @@ GPG key + Sonatype Central Portal namespace + GitHub repo secrets are already co
 - Don't introduce a dependency without checking it ships a klib for every target we support.
 - Don't expand the CI matrix on push/PR.
 - Don't add `@Volatile` from `kotlin.jvm` — use `kotlin.concurrent.Volatile` (KMP-safe).
-- Don't use JVM-only APIs in `commonMain` or `commonTest` — `kotlin.synchronized`, `java.util.concurrent.*`, `Thread.*`, `AtomicLong` from `j.u.c.atomic`, etc. JVM tests will pass; the release matrix's native cells (`linuxX64`, `macosArm64`, `iosSimulatorArm64`) fail at `compileTestKotlin<Target>`. Use `kotlinx.coroutines.sync.Mutex` for cross-coroutine sync, atomicfu for atomics, or move the test to `jvmTest` if JVM-specific.
+- Don't use JVM-only APIs in `commonMain` or `commonTest` — `kotlin.synchronized`, `java.util.concurrent.*`, `Thread.*`, `AtomicLong` from `j.u.c.atomic`, etc. JVM tests will pass; the release matrix's iOS cells fail at `compileTestKotlin<Target>`. Use `kotlinx.coroutines.sync.Mutex` for cross-coroutine sync, atomicfu for atomics, or move the test to `jvmTest` if JVM-specific.
 - Don't put `,` (and likely other punctuation beyond `=`, `-`, space) in backtick-quoted test names. Kotlin/JVM accepts anything between backticks, but Kotlin/Native rejects `,` — same failure mode as the previous bullet, surfaces at native commonTest compile time only.
 - Don't let a `commonTest` function return anything but `Unit`. `= runBlocking { ... }` whose last expression is a `List` or a `Deferred` compiles on JVM and fails on Native with "Test function must return Unit". Write `runBlocking<Unit> { ... }` or end the block with a statement.
 - Don't call a suspending release path from a possibly-cancelled coroutine without `NonCancellable`. `PriorityGate.release()` and `acquire()`'s cancellation branch are the precedent; a leaked slot is permanent.
