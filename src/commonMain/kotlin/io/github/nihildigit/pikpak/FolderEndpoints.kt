@@ -159,7 +159,7 @@ suspend fun PikPakClient.batchUntrash(ids: List<String>) =
  * the split happens here rather than at each call site. Chunks are sent in
  * order and a failing one leaves the chunks before it applied.
  */
-private suspend fun PikPakClient.batchOperate(ids: List<String>, op: String) {
+internal suspend fun PikPakClient.batchOperate(ids: List<String>, op: String) {
     if (ids.isEmpty()) return
     for (chunk in ids.chunked(BATCH_ID_LIMIT)) {
         val body = buildJsonObject {
@@ -175,7 +175,7 @@ private suspend fun PikPakClient.batchOperate(ids: List<String>, op: String) {
 }
 
 /** Half of the smallest count measured to fail, so a future tightening has room. */
-private const val BATCH_ID_LIMIT = 100
+internal const val BATCH_ID_LIMIT = 100
 
 /**
  * Relocates [ids] to [toParentId] (empty string for the root drive). The "update"

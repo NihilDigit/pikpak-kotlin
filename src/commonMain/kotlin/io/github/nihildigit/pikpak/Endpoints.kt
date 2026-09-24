@@ -40,6 +40,13 @@ object FileFilter {
 
     /** Match one of [FileKind.FOLDER] / [FileKind.FILE]. Verified working. */
     fun kind(value: String): Pair<String, JsonElement> = "kind" to eq(value)
+
+    /**
+     * Starred entries only: `system_tag` `{"in": "STAR"}`, the filter the web
+     * client sends. Verified 2026-09-24. See [listStarred] for how it behaves
+     * with `parent_id=*` and why the page size is ignored.
+     */
+    fun starred(): Pair<String, JsonElement> = "system_tag" to buildJsonObject { put("in", "STAR") }
 }
 
 /** Returns the storage quota for the authenticated account (`GET /drive/v1/about`). */
