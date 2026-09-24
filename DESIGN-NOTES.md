@@ -164,6 +164,22 @@ about six times; it wins on latency for a file or two, not on a whole pack.
 The SDK's requests count against the account, not the separate connected-apps
 share, which read zero throughout. `getTransferQuota` exposes all of this.
 
+**Fact.** An offline download of a magnet lands as the paths `resolveMagnet`
+reports: a torrent with one root folder becomes a folder of that name holding
+the same relative paths, subfolders included; a single-file torrent becomes
+the file itself. Checked 2026-09-24 on a flat ten-episode pack and on an album
+with a `Scans/` subfolder. PikPak drops some files on its own: an AV release
+that resolved to five files, two of them advertising `.txt` and `.html`,
+landed as three. Images were kept.
+
+**Shape.** `pruneOfflineOutput` is how a caller gets part of a torrent by
+offline download, since `createUrlFile` cannot pick files: download all of it,
+then permanently delete what was not picked. It is not a cleanup heuristic —
+the caller names what to keep, and the function only maps those names onto
+the output. A folder holding nothing to keep is deleted without being listed.
+It does not poll; the caller decides when the task is done, as everywhere
+else.
+
 **Fact.** A signed link outlives the file object it came from — readable after
 trashing and after permanent deletion. Only tested immediately; how long it
 survives is unknown.

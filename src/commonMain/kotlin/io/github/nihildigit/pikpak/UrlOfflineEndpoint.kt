@@ -95,6 +95,10 @@ sealed class CreateUrlResult {
  * poll via [listOfflineTasks]) or [CreateUrlResult.InstantComplete] when
  * PikPak recognized the URL and fulfilled it without a task. Pass `""`
  * for [parentId] to drop the result into the root drive.
+ *
+ * A magnet is always downloaded whole; to keep only some of its files, prune
+ * the completed task with [pruneOfflineOutput]. The full size is charged to
+ * the monthly offline allowance of [getTransferQuota].
  */
 suspend fun PikPakClient.createUrlFile(parentId: String, url: String): CreateUrlResult {
     val body = buildJsonObject {

@@ -92,7 +92,6 @@ client.instantCreate(file, parentId, name = file.name) // returns the new file i
 
 No bytes move, but the call is charged 15 % of the file's size against the account's monthly upload allowance (`getTransferQuota`). That makes it the fast path for a file or two and the expensive one for a whole pack — see [Offline download](#offline-download).
 
-
 ## Reading a file
 
 `RangeSource` is the type the SDK is built around: one remote file, readable at any offset, with priority honoured when connections are contended.
@@ -214,7 +213,7 @@ The GCID hash goes up first. If PikPak recognises it the upload is over — `Upl
 
 ## Offline download
 
-The endpoints are here, but reach for `resolveMagnet` first: this path takes five to ten seconds on content PikPak already holds, minutes on content it has to fetch from the swarm, and it drops the torrent into a subfolder of its own naming.
+This path takes five to ten seconds on content PikPak already holds and minutes on content it has to fetch from the swarm, where `resolveMagnet` plus `instantCreate` answers in about a second. It is still the cheaper one for more than a file or two: an offline download is charged its size against the monthly offline allowance, an instant copy 15 % of its size against the much smaller upload allowance, which comes to about six times more per byte. It keeps the torrent's folder layout, under a subfolder named after the torrent.
 
 ```kotlin
 when (val r = client.createUrlFile(parentId, "magnet:?xt=...")) {
@@ -227,7 +226,10 @@ task.fileId                                            // set once phase == Task
 client.listOfflineTasks()
 client.retryOfflineTask(taskId)                        // back to PENDING, with a new fileId
 client.deleteOfflineTasks(listOf(taskId))              // deleteFiles = false by default
+client.pruneOfflineOutput(task, keep = setOf("01.mkv", "Extras/NCOP.mkv"))
 ```
+
+A magnet always downloads whole. `pruneOfflineOutput` takes a completed task down to the files you name — paths as `resolveMagnet` reports them, which is how the output is laid out — and deletes the rest permanently. Paths it could not find come back in `missing`: PikPak drops some advertising files on its own.
 
 The SDK deliberately owns no polling loop over these — when a task counts as done is the caller's call.
 

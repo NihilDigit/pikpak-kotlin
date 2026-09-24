@@ -51,7 +51,7 @@ Facts this rests on, all measured, none to be contradicted without new measureme
 
 `PikPakFileHandle` therefore treats the **gcid as the identity and the file id as a cache of it**. Its ladder is: expiry → re-read the detail (one request); rejection or a 404 on the detail → `instantCreate` a replacement and continue (two). Nothing in either rung needs the caller, which is why the `FileRelocator` interface and its `onRelocated` write-back no longer exist. A caller persisting state should persist the gcid; a file id is worth keeping only as an optimisation.
 
-The SDK deliberately owns no polling loop over offline tasks. `createUrlFile` / `getTask` / `listOfflineTasks` remain as atomic endpoints for callers who want that path, but nothing strings them together.
+The SDK deliberately owns no polling loop over offline tasks. `createUrlFile` / `getTask` / `listOfflineTasks` remain as atomic endpoints for callers who want that path, but nothing strings them together. An offline download lands as the paths `resolveMagnet` reports, so `pruneOfflineOutput` can take a completed task down to the files a caller picked — the only way to fetch part of a torrent that way, since `createUrlFile` has no file selection.
 
 ### Shipped targets
 
