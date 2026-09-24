@@ -154,6 +154,11 @@ private fun collect(
  * [TaskPhase.COMPLETE] means the server wants the bytes — and we have none —
  * so it throws rather than returning a half-created object.
  *
+ * No bytes move, but it is not free: each call is charged 15 % of the file's
+ * size against the monthly upload allowance of [getTransferQuota], also for
+ * content the account already holds. Per byte, that is about six times what
+ * an offline download of the same content costs its own allowance.
+ *
  * Known flake: creating the same gcid twice in one folder has been observed to
  * return a file node complete enough to carry an id but not yet resolvable —
  * an immediate `getFile` came back without a download link. This does not check

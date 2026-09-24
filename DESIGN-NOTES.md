@@ -147,9 +147,22 @@ consulted.
 
 **Fact.** An instant upload moved neither `quota.usage` nor `quota.usageInTrash`
 across four readings (before, after create, after trash, after permanent
-delete). Treat this as "not observed to cost quota" rather than "free":
-rclone maps `file_space_not_enough` on this very request to a fatal error, so
-the check exists server-side and `about` may simply lag.
+delete). That is the storage quota only. rclone maps `file_space_not_enough`
+on this very request to a fatal error, so the check exists server-side and
+`about` may simply lag.
+
+**Fact, and a correction.** An instant upload is not free: it draws on the
+monthly *transfer* allowance, which `about` does not report. Measured
+2026-09-24 through `GET /vip/v1/quantity/list?type=transfer` on a premium
+account, an instant upload is charged 15 % of the file's size against
+`upload` — 4.6 GB drew 0.69 GB, 3.8 GB drew 0.57 GB, and content the account
+already held was charged the same as content it did not. An offline download
+is charged its full size against `offline` (Cloud Download). Neither touches
+`download`. With the premium limits of 1 TiB upload and 40 TiB offline a
+month, the instant path is the more expensive one per byte of content, by
+about six times; it wins on latency for a file or two, not on a whole pack.
+The SDK's requests count against the account, not the separate connected-apps
+share, which read zero throughout. `getTransferQuota` exposes all of this.
 
 **Fact.** A signed link outlives the file object it came from — readable after
 trashing and after permanent deletion. Only tested immediately; how long it

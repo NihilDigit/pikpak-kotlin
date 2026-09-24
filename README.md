@@ -90,6 +90,9 @@ client.instantCreate(file, parentId, name = file.name) // returns the new file i
 
 `instantCreate` needs PikPak to already hold the content, which is exactly what a non-null `gcid` says. Name and parent are yours, so nothing creates the pack subfolder an offline task would.
 
+No bytes move, but the call is charged 15 % of the file's size against the account's monthly upload allowance (`getTransferQuota`). That makes it the fast path for a file or two and the expensive one for a whole pack — see [Offline download](#offline-download).
+
+
 ## Reading a file
 
 `RangeSource` is the type the SDK is built around: one remote file, readable at any offset, with priority honoured when connections are contended.
@@ -165,7 +168,8 @@ Transcodes carry no embedded subtitles and a lower audio bitrate than the origin
 ## Files and folders
 
 ```kotlin
-client.getQuota()                                      // GET /drive/v1/about
+client.getQuota()                                      // storage: GET /drive/v1/about
+client.getTransferQuota()                              // monthly offline, downstream and upload allowances
 client.getUserProfile()                                // nickname, avatar, masked contact details
 client.getVipInfo()                                    // membership tier and expiry
 
