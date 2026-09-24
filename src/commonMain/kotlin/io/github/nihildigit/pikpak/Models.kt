@@ -46,13 +46,34 @@ data class FileStat(
      * Also carries `duration`, `width`, `height` for media.
      */
     val params: Map<String, String> = emptyMap(),
+    /**
+     * System tags on the item. A starred item carries one named `STAR`; this is
+     * the only place a listing reports it — the `starred` field of the detail
+     * response stayed false on starred items when probed on 2026-09-24.
+     */
+    val tags: List<FileTag> = emptyList(),
 ) {
     val isFolder: Boolean get() = kind == FileKind.FOLDER
+
+    /** Whether the item is starred; see [tags]. */
+    val isStarred: Boolean get() = tags.any { it.name == FileTag.STAR }
     val isFile: Boolean get() = kind == FileKind.FILE
     val sizeBytes: Long get() = size.toLongOrNull() ?: 0L
 
     /** The magnet this file came from, when an offline task produced it. */
     val sourceUrl: String? get() = params["url"]
+}
+
+/** One entry of [FileStat.tags]. */
+@Serializable
+data class FileTag(
+    val id: String = "",
+    val name: String = "",
+    val type: Int = 0,
+) {
+    companion object {
+        const val STAR = "STAR"
+    }
 }
 
 @Serializable
@@ -178,6 +199,7 @@ data class FileDetail(
     val hash: String = "",
     val phase: String = "",
     val revision: String = "",
+    /** Stayed false on starred items when probed on 2026-09-24; read [FileStat.isStarred] from a listing instead. */
     val starred: Boolean = false,
     @SerialName("web_content_link") val webContentLink: String = "",
     /**
