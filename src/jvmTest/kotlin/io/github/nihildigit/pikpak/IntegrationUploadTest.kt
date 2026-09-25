@@ -91,6 +91,38 @@ class IntegrationUploadTest {
         }
     }
 
+    @Test
+    fun `a failed upload leaves no pending file behind`() = runBlocking {
+        Assumptions.assumeTrue(username != null && password != null, "no .env credentials")
+        val client = PikPakClient(account = username!!, password = password!!, sessionStore = InMemorySessionStore())
+        try {
+            client.login()
+            val ts = Clock.System.now().toEpochMilliseconds()
+            val folderId = client.createFolder(parentId = "", name = "pikpak-kotlin-upload-test-$ts")
+            try {
+                // Random content PikPak cannot know, so init goes the resumable way. The
+                // source runs dry after the first part, which fails the upload mid-transfer.
+                val declared = Random(ts).nextBytes(1024 * 1024)
+                val shortSource = kotlinx.io.Buffer().apply { write(declared, 0, 300 * 1024) }
+                val result = runCatching {
+                    client.upload(
+                        parentId = folderId,
+                        name = "upload-$ts.bin",
+                        size = declared.size.toLong(),
+                        gcid = PikPakHash.fromSource(kotlinx.io.Buffer().apply { write(declared) }, declared.size.toLong()),
+                        open = { shortSource },
+                    )
+                }
+                assertTrue(result.isFailure, "a source that ends early must fail the upload")
+                assertTrue(client.listFiles(folderId).isEmpty(), "the pending file init created must be deleted")
+            } finally {
+                runCatching { client.deleteFile(folderId) }
+            }
+        } finally {
+            client.close()
+        }
+    }
+
     private suspend fun pollUntil(maxAttempts: Int, predicate: suspend () -> Boolean): Boolean {
         repeat(maxAttempts) { i ->
             if (predicate()) return true

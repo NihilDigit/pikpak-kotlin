@@ -255,6 +255,28 @@ client.upload(parentId, sourcePath)
 
 The GCID hash goes up first. If PikPak recognises it the upload is over — `UploadResult.instantUpload` is true and no bytes moved. Otherwise the file goes to Aliyun OSS as a signed multipart upload.
 
+Hashing reads the whole file. For content PikPak may already hold, 60 KB is enough: the Xunlei CID samples three 20 KB windows, and `gcidByCid` looks it up in PikPak's index, which covers content the account has never held.
+
+```kotlin
+val cid = XunleiCid.of(size) { offset, length -> readAt(offset, length) }
+val gcid = client.gcidByCid(cid, size)
+    ?: PikPakHash.fromSource(openSource(), size) { hashed -> showHashing(hashed) }
+client.upload(parentId, name, size, gcid, open = ::openSource) { sent -> showSending(sent) }
+```
+
+A miss has to be hashed, not skipped: PikPak requires a GCID at upload but does not check it, and keeps a wrong one. Content that is not a file-system `Path`, such as an Android `content:` URI, goes through the same overload. A failed or cancelled upload aborts the OSS transfer and deletes the pending file the upload created.
+
+An upload that should survive the process is three calls instead of one. `startUpload` creates the drive file, which stays visible in `PHASE_TYPE_PENDING` until the upload completes, and returns a serializable `UploadSession`; `continueUpload` asks OSS which parts arrived and sends the rest, from any process; `cancelUpload` removes it. The session carries OSS credentials that PikPak issues for 12 hours, after which the upload can only be cancelled.
+
+```kotlin
+when (val start = client.startUpload(parentId, name, size, gcid)) {
+    is UploadStart.Instant -> done(start.fileId)
+    is UploadStart.Pending -> save(start.session)
+}
+// later, possibly after a restart
+client.continueUpload(session, open = { offset -> openSourceAt(offset) }) { sent -> showSending(sent) }
+```
+
 ## Offline download
 
 This path takes five to ten seconds on content PikPak already holds and minutes on content it has to fetch from the swarm, where `resolveMagnet` plus `instantCreate` answers in about a second. It is still the cheaper one for more than a file or two: an offline download is charged its size against the monthly offline allowance, an instant copy 15 % of its size against the much smaller upload allowance, which comes to about six times more per byte. It keeps the torrent's folder layout, under a subfolder named after the torrent.
@@ -309,6 +331,8 @@ The HTTP wire format, captcha salt cascade and GCID content hash follow the Go r
 
 - [52funny/pikpakcli](https://github.com/52funny/pikpakcli): endpoint URLs, request and response shapes, captcha signing flow, OSS upload protocol
 - [52funny/pikpakhash](https://github.com/52funny/pikpakhash): GCID block-size table
+
+The Xunlei CID sampling and the `/drive/v1/resource/cid` lookup behind `gcidByCid` were first seen in [digbug82/PikPak_Enhancement_Master](https://github.com/digbug82/PikPak_Enhancement_Master), a userscript for the PikPak web client.
 
 All code here is written in Kotlin; only the public PikPak API behaviour is shared.
 

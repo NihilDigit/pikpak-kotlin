@@ -16,10 +16,14 @@ import io.ktor.http.contentType
 import io.ktor.http.headersOf
 import io.ktor.http.isSuccess
 import kotlin.time.Clock
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import kotlinx.io.RawSource
 import kotlinx.io.buffered
 import kotlinx.io.files.Path
 import kotlinx.io.files.SystemFileSystem
 import kotlinx.io.readByteArray
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -62,14 +66,111 @@ private const val OSS_CONTENT_TYPE = "application/octet-stream"
 suspend fun PikPakClient.upload(parentId: String, source: Path): UploadResult {
     val size = SystemFileSystem.metadataOrNull(source)?.size
         ?: throw IllegalArgumentException("upload source does not exist: $source")
-    val name = source.name
-    val hash = PikPakHash.fromPath(source)
+    return upload(
+        parentId = parentId,
+        name = source.name,
+        size = size,
+        gcid = PikPakHash.fromPath(source),
+        open = { SystemFileSystem.source(source) },
+    )
+}
 
+/**
+ * [upload] for content that is not a [Path] on this file system, an Android
+ * `content:` URI say, or whose [gcid] the caller already has: from
+ * [PikPakHash.fromSource], or from [gcidByCid] without reading the whole file.
+ *
+ * [gcid] must be the content's: PikPak requires one but does not check it.
+ * Measured 2026-09-25, an upload under a wrong 40-hex hash completed and kept
+ * the wrong value, so instant uploads of that value would be served these
+ * bytes. A [gcidByCid] miss therefore means hashing the file, not skipping it.
+ *
+ * [open] yields the content from its first byte and is called at most once,
+ * only when PikPak does not recognise [gcid]. [onProgress] receives the bytes
+ * sent so far after each part.
+ *
+ * This is [startUpload], [continueUpload] and, on any failure or
+ * cancellation, [cancelUpload]. Use those three directly for an upload that
+ * should survive the process.
+ */
+suspend fun PikPakClient.upload(
+    parentId: String,
+    name: String,
+    size: Long,
+    gcid: String,
+    open: () -> RawSource,
+    onProgress: (uploadedBytes: Long) -> Unit = {},
+): UploadResult {
+    val session = when (val start = startUpload(parentId, name, size, gcid)) {
+        is UploadStart.Instant -> return UploadResult(fileId = start.fileId, instantUpload = true, bytesUploaded = 0L)
+        is UploadStart.Pending -> start.session
+    }
+    try {
+        // A fresh session has no parts yet, so continueUpload asks for offset 0 only
+        continueUpload(session, open = { offset -> check(offset == 0L) { "unexpected offset $offset" }; open() }, onProgress)
+    } catch (e: Throwable) {
+        // A cancelled coroutine cannot send these without NonCancellable. Best
+        // effort: the original failure is what the caller needs to see.
+        withContext(NonCancellable) { runCatching { cancelUpload(session) } }
+        throw e
+    }
+    return UploadResult(fileId = session.fileId, instantUpload = false, bytesUploaded = size)
+}
+
+/** Outcome of [startUpload]. */
+sealed interface UploadStart {
+    /** PikPak recognised the gcid; the file is complete and no bytes move. */
+    data class Instant(val fileId: String) : UploadStart
+
+    /** The bytes have to go up: pass the session to [continueUpload]. */
+    data class Pending(val session: UploadSession) : UploadStart
+}
+
+/**
+ * Everything [continueUpload] needs to carry an upload on in another process,
+ * serializable so a caller can persist it. It holds live OSS credentials: keep
+ * it where the account's session is kept, not in logs.
+ */
+@Serializable
+data class UploadSession(
+    /** The drive file, in `PHASE_TYPE_PENDING` until the upload completes. */
+    val fileId: String,
+    val size: Long,
+    /** Fixed at start: every part but the last has this size. */
+    val partSize: Long,
+    val uploadId: String,
+    val bucket: String,
+    val endpoint: String,
+    val key: String,
+    val accessKeyId: String,
+    val accessKeySecret: String,
+    val securityToken: String,
+    /**
+     * When the credentials stop working, as PikPak sends it
+     * (`2026-09-26T02:42:09.000+08:00`); 12 hours after start, measured
+     * 2026-09-25. Past it the upload cannot be continued, only cancelled.
+     */
+    val expiration: String,
+)
+
+/**
+ * Creates the drive file for an upload of [size] bytes named [name] under
+ * [parentId] and, unless PikPak already holds [gcid], opens the OSS multipart
+ * upload its bytes go to. See the [upload] overload taking a gcid for why
+ * [gcid] must be right.
+ *
+ * A [UploadStart.Pending] result leaves a visible `PHASE_TYPE_PENDING` file
+ * and an upload task in the drive (measured 2026-09-25). Neither goes away by
+ * itself, and starting again does not pick them up: the new file is named
+ * "name(1)" beside the old one. Finish it with [continueUpload] or remove it
+ * with [cancelUpload].
+ */
+suspend fun PikPakClient.startUpload(parentId: String, name: String, size: Long, gcid: String): UploadStart {
     val initBody = buildJsonObject {
         put("kind", FileKind.FILE)
         put("name", name)
         put("size", size.toString())
-        put("hash", hash)
+        put("hash", gcid)
         put("upload_type", "UPLOAD_TYPE_RESUMABLE")
         if (parentId.isNotEmpty()) put("parent_id", parentId)
         putJsonObject("body") {
@@ -91,39 +192,119 @@ suspend fun PikPakClient.upload(parentId: String, source: Path): UploadResult {
     val phase = fileNode["phase"]?.jsonPrimitive?.contentOrNull.orEmpty()
     val fileId = fileNode["id"]?.jsonPrimitive?.contentOrNull.orEmpty()
 
-    if (phase == TaskPhase.COMPLETE) {
-        return UploadResult(fileId = fileId, instantUpload = true, bytesUploaded = 0L)
+    if (phase == TaskPhase.COMPLETE) return UploadStart.Instant(fileId)
+
+    try {
+        val params = initObj["resumable"]?.jsonObject?.get("params")?.jsonObject
+            ?: throw PikPakException(-1, "upload: missing resumable.params for phase=$phase")
+        fun param(name: String) = params[name]?.jsonPrimitive?.contentOrNull.orEmpty()
+        val withoutUploadId = UploadSession(
+            fileId = fileId,
+            size = size,
+            partSize = computeChunkSize(size),
+            uploadId = "",
+            bucket = param("bucket"),
+            endpoint = param("endpoint"),
+            key = param("key"),
+            accessKeyId = param("access_key_id"),
+            accessKeySecret = param("access_key_secret"),
+            securityToken = param("security_token"),
+            expiration = param("expiration"),
+        )
+        return UploadStart.Pending(withoutUploadId.copy(uploadId = ossInitiate(withoutUploadId)))
+    } catch (e: Throwable) {
+        // No session reaches the caller, so nobody else could remove the pending file
+        withContext(NonCancellable) { if (fileId.isNotEmpty()) runCatching { deleteFile(fileId) } }
+        throw e
     }
-
-    val params = initObj["resumable"]?.jsonObject?.get("params")?.jsonObject
-        ?: throw PikPakException(-1, "upload: missing resumable.params for phase=$phase")
-    val oss = OssParams(
-        bucket = params["bucket"]?.jsonPrimitive?.contentOrNull.orEmpty(),
-        accessKeyId = params["access_key_id"]?.jsonPrimitive?.contentOrNull.orEmpty(),
-        accessKeySecret = params["access_key_secret"]?.jsonPrimitive?.contentOrNull.orEmpty(),
-        endpoint = params["endpoint"]?.jsonPrimitive?.contentOrNull.orEmpty(),
-        key = params["key"]?.jsonPrimitive?.contentOrNull.orEmpty(),
-        securityToken = params["security_token"]?.jsonPrimitive?.contentOrNull.orEmpty(),
-    )
-
-    val uploadId = ossInitiate(oss)
-    val parts = ossUploadParts(oss, uploadId, source, size)
-    ossComplete(oss, uploadId, parts)
-    return UploadResult(fileId = fileId, instantUpload = false, bytesUploaded = size)
 }
 
-private data class OssParams(
-    val bucket: String,
-    val accessKeyId: String,
-    val accessKeySecret: String,
-    val endpoint: String,
-    val key: String,
-    val securityToken: String,
+/**
+ * Sends whatever of [session] is not on OSS yet and completes the upload; the
+ * file is then `PHASE_TYPE_COMPLETE`. Works from a fresh process: measured
+ * 2026-09-25, a session saved after one part was finished by another JVM and
+ * the file read back byte for byte.
+ *
+ * Asks OSS which parts arrived and reads only the rest. [open] yields the
+ * content from byte `offset`; it is called once per run of missing parts, so
+ * once for an upload that stopped partway. [onProgress] receives the bytes on
+ * OSS so far, first those already there, then after each part.
+ *
+ * A failure leaves the session as it was, to be continued again or given up
+ * with [cancelUpload]. Once [UploadSession.expiration] has passed, OSS refuses
+ * the credentials with a 403 and only [cancelUpload] is left.
+ */
+suspend fun PikPakClient.continueUpload(
+    session: UploadSession,
+    open: (offset: Long) -> RawSource,
+    onProgress: (uploadedBytes: Long) -> Unit = {},
+) {
+    val parts = listUploadedParts(session).toMutableMap()
+    val partCount = ((session.size + session.partSize - 1) / session.partSize).toInt().coerceAtLeast(1)
+    fun partLength(number: Int) = minOf(session.partSize, session.size - (number - 1) * session.partSize).toInt()
+    onProgress(parts.keys.sumOf { partLength(it).toLong() })
+
+    var input: kotlinx.io.Source? = null
+    var inputPart = 0 // the part the open input is positioned at
+    try {
+        for (number in 1..partCount) {
+            if (number in parts) continue
+            if (input == null || inputPart != number) {
+                input?.close()
+                input = open((number - 1) * session.partSize).buffered()
+                inputPart = number
+            }
+            val want = partLength(number)
+            val bytes = input.readByteArray(want)
+            if (bytes.size != want) throw PikPakException(-1, "upload: source ended early at part $number")
+            parts[number] = ossUploadPart(session, number, bytes)
+            inputPart = number + 1
+            onProgress(parts.keys.sumOf { partLength(it).toLong() })
+        }
+    } finally {
+        input?.close()
+    }
+    ossComplete(session, parts)
+}
+
+/**
+ * Gives an upload up: aborts the OSS multipart upload so its parts are not
+ * kept, then permanently deletes the pending drive file [startUpload] made.
+ * The abort is best effort, since expired credentials cannot send it; the
+ * delete goes through the account and throws on failure.
+ */
+suspend fun PikPakClient.cancelUpload(session: UploadSession) {
+    runCatching { ossRequest(method = HttpMethod.Delete, oss = session, rawQuery = "uploadId=${session.uploadId}") { } }
+    deleteFile(session.fileId)
+}
+
+/**
+ * Part number to ETag of every part OSS holds for [session]. OSS pages the
+ * list; [pageSize] is a parameter so a test can make three parts span pages.
+ */
+internal suspend fun PikPakClient.listUploadedParts(session: UploadSession, pageSize: Int = 1000): Map<Int, String> {
+    val parts = mutableMapOf<Int, String>()
+    var marker = 0
+    while (true) {
+        val xml = ossRequest(
+            method = HttpMethod.Get,
+            oss = session,
+            rawQuery = "uploadId=${session.uploadId}",
+            unsignedQuery = "max-parts=$pageSize&part-number-marker=$marker",
+        ) { it.bodyAsText() }
+        PART_PATTERN.findAll(xml).forEach { parts[it.groupValues[1].toInt()] = it.groupValues[2] }
+        val next = Regex("<NextPartNumberMarker>(\\d+)</NextPartNumberMarker>").find(xml)?.groupValues?.get(1)?.toInt()
+        if (!xml.contains("<IsTruncated>true</IsTruncated>") || next == null || next <= marker) return parts
+        marker = next
+    }
+}
+
+private val PART_PATTERN = Regex(
+    "<Part>.*?<PartNumber>(\\d+)</PartNumber>.*?<ETag>\"?([^<\"]+)\"?</ETag>.*?</Part>",
+    RegexOption.DOT_MATCHES_ALL,
 )
 
-private data class UploadedPart(val partNumber: Int, val eTag: String)
-
-private suspend fun PikPakClient.ossInitiate(oss: OssParams): String {
+private suspend fun PikPakClient.ossInitiate(oss: UploadSession): String {
     val xml = ossRequest(
         method = HttpMethod.Post,
         oss = oss,
@@ -133,63 +314,33 @@ private suspend fun PikPakClient.ossInitiate(oss: OssParams): String {
         ?: throw PikPakException(-1, "upload: OSS InitiateMultipartUpload missing UploadId\n$xml")
 }
 
-private suspend fun PikPakClient.ossUploadParts(
-    oss: OssParams,
-    uploadId: String,
-    source: Path,
-    size: Long,
-): List<UploadedPart> {
-    val chunkSize = computeChunkSize(size)
-    val parts = mutableListOf<UploadedPart>()
-    SystemFileSystem.source(source).buffered().use { input ->
-        var partNumber = 1
-        var remaining = size
-        while (remaining > 0) {
-            val want = minOf(remaining, chunkSize).toInt()
-            val bytes = input.readByteArray(want)
-            if (bytes.size != want) throw PikPakException(-1, "upload: source ended early at part $partNumber")
-
-            val eTag = ossUploadPart(oss, uploadId, partNumber, bytes)
-            parts += UploadedPart(partNumber, eTag)
-            remaining -= want
-            partNumber++
-        }
-    }
-    return parts
-}
-
 private suspend fun PikPakClient.ossUploadPart(
-    oss: OssParams,
-    uploadId: String,
+    session: UploadSession,
     partNumber: Int,
     body: ByteArray,
 ): String {
     val raw = ossRequest(
         method = HttpMethod.Put,
-        oss = oss,
-        rawQuery = "partNumber=$partNumber&uploadId=$uploadId",
+        oss = session,
+        rawQuery = "partNumber=$partNumber&uploadId=${session.uploadId}",
         body = body,
     ) { it.headers[HttpHeaders.ETag] }
         ?: throw PikPakException(-1, "upload: part $partNumber missing ETag")
     return raw.trim('"')
 }
 
-private suspend fun PikPakClient.ossComplete(
-    oss: OssParams,
-    uploadId: String,
-    parts: List<UploadedPart>,
-) {
+private suspend fun PikPakClient.ossComplete(session: UploadSession, parts: Map<Int, String>) {
     val xml = buildString {
         append("<CompleteMultipartUpload>")
-        for (p in parts) {
-            append("<Part><PartNumber>${p.partNumber}</PartNumber><ETag>${p.eTag}</ETag></Part>")
+        for ((number, eTag) in parts.toSortedMap()) {
+            append("<Part><PartNumber>$number</PartNumber><ETag>$eTag</ETag></Part>")
         }
         append("</CompleteMultipartUpload>")
     }
     ossRequest(
         method = HttpMethod.Post,
-        oss = oss,
-        rawQuery = "uploadId=$uploadId",
+        oss = session,
+        rawQuery = "uploadId=${session.uploadId}",
         body = xml.encodeToByteArray(),
     ) { }
 }
@@ -199,11 +350,17 @@ private suspend fun PikPakClient.ossComplete(
  * response to [block]: OSS answers an expired STS token with a 403 whose body
  * is an XML error document, and a caller that only reads a header off it
  * (ETag, say) would see "success with a missing header".
+ *
+ * [rawQuery] is signed whole, as the Go reference does; it must hold only OSS
+ * subresources (`uploads`, `uploadId`, `partNumber`). Paging parameters are
+ * not subresources, and OSS rejects a signature that covers them, so they go
+ * in [unsignedQuery].
  */
 private suspend fun <T> PikPakClient.ossRequest(
     method: HttpMethod,
-    oss: OssParams,
+    oss: UploadSession,
     rawQuery: String,
+    unsignedQuery: String = "",
     body: ByteArray? = null,
     block: suspend (HttpResponse) -> T,
 ): T {
@@ -221,7 +378,8 @@ private suspend fun <T> PikPakClient.ossRequest(
         accessKeyId = oss.accessKeyId,
         accessKeySecret = oss.accessKeySecret,
     )
-    val url = "https://${oss.endpoint}$ossPath?$rawQuery"
+    val query = if (unsignedQuery.isEmpty()) rawQuery else "$rawQuery&$unsignedQuery"
+    val url = "https://${oss.endpoint}$ossPath?$query"
     return http.sendRaw(
         method = method,
         url = url,

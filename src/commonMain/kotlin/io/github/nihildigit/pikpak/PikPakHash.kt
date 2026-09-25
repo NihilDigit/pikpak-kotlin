@@ -38,8 +38,14 @@ object PikPakHash {
     /**
      * Compute the gcid by streaming [size] bytes from [source]. Caller is
      * responsible for the lifetime of [source].
+     *
+     * [onProgress] receives the bytes hashed so far after each chunk. Hashing
+     * does not suspend and runs at about 3 s per GiB on a desktop JVM
+     * (measured 2026-09-25), so this is also where a caller stops it: calling
+     * `ensureActive()` on its coroutine context there throws once that
+     * coroutine is cancelled.
      */
-    fun fromSource(source: RawSource, size: Long): String {
+    fun fromSource(source: RawSource, size: Long, onProgress: (hashedBytes: Long) -> Unit = {}): String {
         if (size <= 0) return SHA1().digest(ByteArray(0)).toHex()
 
         val chunkSize = chunkSizeFor(size)
@@ -52,6 +58,7 @@ object PikPakHash {
             if (bytes.size != want) throw IllegalStateException("source ended early at offset ${size - remaining}")
             outer.update(SHA1().digest(bytes))
             remaining -= want
+            onProgress(size - remaining)
         }
         return outer.digest().toHex()
     }
