@@ -332,7 +332,7 @@ private suspend fun PikPakClient.ossUploadPart(
 private suspend fun PikPakClient.ossComplete(session: UploadSession, parts: Map<Int, String>) {
     val xml = buildString {
         append("<CompleteMultipartUpload>")
-        for ((number, eTag) in parts.toSortedMap()) {
+        for ((number, eTag) in parts.entries.sortedBy { it.key }) {
             append("<Part><PartNumber>$number</PartNumber><ETag>$eTag</ETag></Part>")
         }
         append("</CompleteMultipartUpload>")
