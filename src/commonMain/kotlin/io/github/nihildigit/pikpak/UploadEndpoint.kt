@@ -299,9 +299,9 @@ internal suspend fun PikPakClient.listUploadedParts(session: UploadSession, page
     }
 }
 
+// [\s\S] rather than DOT_MATCHES_ALL, which only the JVM has
 private val PART_PATTERN = Regex(
-    "<Part>.*?<PartNumber>(\\d+)</PartNumber>.*?<ETag>\"?([^<\"]+)\"?</ETag>.*?</Part>",
-    RegexOption.DOT_MATCHES_ALL,
+    "<Part>[\\s\\S]*?<PartNumber>(\\d+)</PartNumber>[\\s\\S]*?<ETag>\"?([^<\"]+)\"?</ETag>[\\s\\S]*?</Part>",
 )
 
 private suspend fun PikPakClient.ossInitiate(oss: UploadSession): String {
