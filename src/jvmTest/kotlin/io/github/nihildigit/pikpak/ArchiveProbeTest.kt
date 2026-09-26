@@ -91,7 +91,8 @@ class ArchiveProbeTest {
             val aEntry = entries.single { it.name == "a.bin" }
             val detail = client.getArchiveTreeFile(tree, aEntry.id)
             val fetched = File(work, "a.fetched")
-            client.downloadSingleConnectionFromUrl(assertNotNull(detail.downloadUrl), Path(fetched.absolutePath))
+            val entryUrl = assertNotNull(detail.downloadUrl)
+            RangeReader(client, { entryUrl }).asRangeSource().downloadTo(Path(fetched.absolutePath), totalSize = detail.sizeBytes)
             assertTrue(fetched.readBytes().contentEquals(a), "the entry's link serves the entry's bytes")
 
             val copied = client.createFolder(probe, "copied")
@@ -138,7 +139,7 @@ class ArchiveProbeTest {
         error("decompress $taskId did not finish in a minute")
     }
 
-    private suspend fun awaitTask(client: PikPakClient, taskId: String): OfflineTask {
+    private suspend fun awaitTask(client: PikPakClient, taskId: String): DriveTask {
         repeat(60) {
             val task = client.getTask(taskId)
             if (task.phase == TaskPhase.COMPLETE) return task

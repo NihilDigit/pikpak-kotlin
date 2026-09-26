@@ -38,16 +38,18 @@ data class PruneResult(
  * one per folder. Polling the task until it completes is the caller's job, as
  * for every offline endpoint here.
  */
-suspend fun PikPakClient.pruneOfflineOutput(task: OfflineTask, keep: Set<String>): PruneResult {
+suspend fun PikPakClient.pruneOfflineOutput(task: DriveTask, keep: Set<String>): PruneResult {
     require(task.phase == TaskPhase.COMPLETE) { "task ${task.id} is ${task.phase}, not complete" }
     require(task.fileId.isNotEmpty()) { "task ${task.id} has no output file" }
 
     val root = getFile(task.fileId)
     if (root.kind != FileKind.FOLDER) {
-        // Single-file torrent: the output is the file, named as resolveMagnet names it
-        if (root.name in keep) return PruneResult(deleted = emptyList(), missing = keep - root.name)
+        // A single-file torrent has one path, so a keep set that is not empty can only mean it.
+        // Not matched by name: PikPak renames a clash in the destination to "name(1)", and a
+        // name match then deleted, permanently, the only file the task produced.
+        if (keep.isNotEmpty()) return PruneResult(deleted = emptyList(), missing = emptySet())
         batchDelete(listOf(root.id))
-        return PruneResult(deleted = listOf(root.name), missing = keep)
+        return PruneResult(deleted = listOf(root.name), missing = emptySet())
     }
 
     val doomedIds = mutableListOf<String>()

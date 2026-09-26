@@ -3,9 +3,9 @@ package io.github.nihildigit.pikpak
 import io.github.nihildigit.pikpak.internal.buildUrl
 import io.github.nihildigit.pikpak.internal.jsonBody
 import io.ktor.http.HttpMethod
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
@@ -49,22 +49,10 @@ suspend fun PikPakClient.getFolderId(parentId: String, name: String): String {
  * path costs nothing. Any mutating call in this file drops the memo; see
  * [PikPakClient.clearFolderIdCache] to drop it after a change made elsewhere.
  */
-suspend fun PikPakClient.getDeepFolderId(parentId: String, path: String): String {
-    folderIds.get(parentId, path)?.let { return it }
-    val segments = path.trim('/').split('/').filter { it.isNotEmpty() }
-    var current = parentId
-    for (segment in segments) {
-        try {
-            current = getFolderId(current, segment)
-        } catch (_: FolderNotFoundException) {
-            // Report the path the caller asked for, not just the segment that
-            // was missing — the segment alone reads as a different lookup.
-            throw FolderNotFoundException(path)
-        }
-    }
-    folderIds.put(parentId, path, current)
-    return current
-}
+suspend fun PikPakClient.getDeepFolderId(parentId: String, path: String): String =
+    // Report the path the caller asked for, not just the segment that was
+    // missing — the segment alone reads as a different lookup.
+    walkFolders(parentId, path) { _, _ -> throw FolderNotFoundException(path) }
 
 /** `getDeepFolderId("", path)`. */
 suspend fun PikPakClient.getPathFolderId(path: String): String = getDeepFolderId("", path)
@@ -73,26 +61,41 @@ suspend fun PikPakClient.getPathFolderId(path: String): String = getDeepFolderId
  * `mkdir -p` for PikPak. Walks [path] from [parentId], creating any missing
  * folders, and returns the id of the deepest folder.
  *
- * Not atomic, and cannot be: PikPak has no create-if-absent call, so two
- * devices racing on the same missing segment both see "not found" and both
- * create it. PikPak permits duplicate names in one parent, so the result is
- * two folders with the same name and different ids rather than an error.
- * Callers that care should treat "first match wins" as the rule and reconcile
- * out of band; there is no server-side primitive that would let the SDK do
- * better.
+ * Not atomic across devices, and cannot be: PikPak has no create-if-absent
+ * call, so two devices racing on the same missing segment both see "not
+ * found" and both create it. PikPak permits duplicate names in one parent, so
+ * the result is two folders with the same name and different ids rather than
+ * an error. Callers that care should treat "first match wins" as the rule and
+ * reconcile out of band. Within one client the walks are serialised, so two
+ * coroutines of the same process do not do this to each other.
  */
 suspend fun PikPakClient.getOrCreateDeepFolderId(parentId: String, path: String): String {
     folderIds.get(parentId, path)?.let { return it }
-    val segments = path.trim('/').split('/').filter { it.isNotEmpty() }
+    return folderIds.creation.withLock {
+        walkFolders(parentId, path) { current, segment -> createFolder(current, segment) }
+    }
+}
+
+/**
+ * Resolves [path] one segment at a time from [parentId], asking [onMissing] for a segment that
+ * is not there, and memoizes the result unless the memo was dropped meanwhile; see FolderIdCache.
+ */
+private suspend fun PikPakClient.walkFolders(
+    parentId: String,
+    path: String,
+    onMissing: suspend (parentId: String, segment: String) -> String,
+): String {
+    folderIds.get(parentId, path)?.let { return it }
+    val generation = folderIds.generation()
     var current = parentId
-    for (segment in segments) {
+    for (segment in path.trim('/').split('/').filter { it.isNotEmpty() }) {
         current = try {
             getFolderId(current, segment)
         } catch (_: FolderNotFoundException) {
-            createFolder(current, segment)
+            onMissing(current, segment)
         }
     }
-    folderIds.put(parentId, path, current)
+    folderIds.put(parentId, path, current, generation)
     return current
 }
 
@@ -108,8 +111,9 @@ suspend fun PikPakClient.createFolder(parentId: String, name: String): String {
         url = "$DRIVE$FILES_PATH",
         captchaAction = "POST:/drive/v1/files",
     ) { jsonBody(json, body) }
-    return ((response as JsonObject)["file"]?.jsonObject)?.get("id")?.jsonPrimitive?.contentOrNull
-        ?: throw PikPakException(-1, "createFolder: response missing file.id")
+    // as? rather than jsonObject: an explicit "file": null must reach the error below, not throw a cast failure
+    return ((response as? JsonObject)?.get("file") as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull
+        ?: throw PikPakException(-1, "createFolder: response missing file.id", rawBody = response.toString())
 }
 
 /**
@@ -127,17 +131,19 @@ suspend fun PikPakClient.deleteFile(fileId: String) {
 }
 
 /**
- * Moves multiple files/folders to the PikPak trash in one call. Items remain
- * recoverable from the trash UI for ~30 days. No-op when [ids] is empty.
- * For permanent removal that bypasses the trash, see [batchDelete].
+ * Moves multiple files/folders to the PikPak trash. Items stay recoverable
+ * until their [FileStat.deleteTime], which the server sets per account (fifteen
+ * days on a platinum account, measured) — read it rather than assume a period.
+ * No-op when [ids] is empty. For permanent removal that bypasses the trash, see
+ * [batchDelete].
  */
 suspend fun PikPakClient.batchTrash(ids: List<String>) =
     batchOperate(ids, "batchTrash")
 
 /**
  * Permanently removes multiple files/folders, bypassing the trash. Items are
- * not recoverable. No-op when [ids] is empty. For soft-delete semantics that
- * stage items in the trash for 30 days, use [batchTrash] instead.
+ * not recoverable. No-op when [ids] is empty. For a recoverable delete, use
+ * [batchTrash].
  */
 suspend fun PikPakClient.batchDelete(ids: List<String>) =
     batchOperate(ids, "batchDelete")
@@ -157,21 +163,30 @@ suspend fun PikPakClient.batchUntrash(ids: List<String>) =
  * accepted and 1000 answer `operating_file_count_exceeded` (error_code 11).
  * Callers that hand over a whole folder listing cannot know how long it is, so
  * the split happens here rather than at each call site. Chunks are sent in
- * order and a failing one leaves the chunks before it applied.
+ * order and a failing one leaves the chunks before it applied — which is why
+ * the folder memo is dropped however the loop ends, not only after the last.
  */
-internal suspend fun PikPakClient.batchOperate(ids: List<String>, op: String) {
+internal suspend fun PikPakClient.batchOperate(
+    ids: List<String>,
+    op: String,
+    to: String? = null,
+) {
     if (ids.isEmpty()) return
-    for (chunk in ids.chunked(BATCH_ID_LIMIT)) {
-        val body = buildJsonObject {
-            putJsonArray("ids") { chunk.forEach { add(it) } }
+    try {
+        for (chunk in ids.chunked(BATCH_ID_LIMIT)) {
+            val body = buildJsonObject {
+                putJsonArray("ids") { chunk.forEach { add(it) } }
+                if (to != null) putJsonObject("to") { put("parent_id", to) }
+            }
+            http.request(
+                method = HttpMethod.Post,
+                url = "$DRIVE$FILES_PATH:$op",
+                captchaAction = "POST:/drive/v1/files:$op",
+            ) { jsonBody(json, body) }
         }
-        http.request(
-            method = HttpMethod.Post,
-            url = "$DRIVE$FILES_PATH:$op",
-            captchaAction = "POST:/drive/v1/files:$op",
-        ) { jsonBody(json, body) }
+    } finally {
+        folderIds.invalidateAll()
     }
-    folderIds.invalidateAll()
 }
 
 /** Half of the smallest count measured to fail, so a future tightening has room. */
@@ -180,20 +195,11 @@ internal const val BATCH_ID_LIMIT = 100
 /**
  * Relocates [ids] to [toParentId] (empty string for the root drive). The "update"
  * leg of CRUD: changes a file/folder's `parent_id`. No-op when [ids] is empty.
+ * Split into calls of [BATCH_ID_LIMIT] ids like the other batch operations; one
+ * call naming a whole large listing was refused with nothing moved.
  */
-suspend fun PikPakClient.batchMove(ids: List<String>, toParentId: String) {
-    if (ids.isEmpty()) return
-    val body = buildJsonObject {
-        putJsonArray("ids") { ids.forEach { add(it) } }
-        putJsonObject("to") { put("parent_id", toParentId) }
-    }
-    http.request(
-        method = HttpMethod.Post,
-        url = "$DRIVE$FILES_PATH:batchMove",
-        captchaAction = "POST:/drive/v1/files:batchMove",
-    ) { jsonBody(json, body) }
-    folderIds.invalidateAll()
-}
+suspend fun PikPakClient.batchMove(ids: List<String>, toParentId: String) =
+    batchOperate(ids, "batchMove", to = toParentId)
 
 /**
  * Copies [ids] into [toParentId] (empty string for the root drive) and returns
@@ -228,27 +234,11 @@ suspend fun PikPakClient.batchCopy(
             url = buildUrl(DRIVE, "$FILES_PATH:batchCopy", query),
             captchaAction = "POST:/drive/v1/files:batchCopy",
         ) { jsonBody(json, body) }
-        (response as JsonObject)["task_id"]?.jsonPrimitive?.contentOrNull
-            ?: throw PikPakException(-1, "batchCopy: response missing task_id")
+        (response as? JsonObject)?.get("task_id")?.jsonPrimitive?.contentOrNull
+            ?: throw PikPakException(-1, "batchCopy: response missing task_id", rawBody = response.toString())
     }
     folderIds.invalidateAll()
     return taskIds
-}
-
-/**
- * Permanently removes everything in the account's trash
- * (`PATCH /drive/v1/files/trash:empty`, no body), the web client's "empty
- * trash". Not recoverable. Never run against a real account while probing:
- * the request shape comes from the web client alone, and its response is
- * not checked.
- */
-suspend fun PikPakClient.emptyTrash() {
-    http.request(
-        method = HttpMethod.Patch,
-        url = "$DRIVE$FILES_PATH/trash:empty",
-        captchaAction = "PATCH:/drive/v1/files/trash:empty",
-    )
-    folderIds.invalidateAll()
 }
 
 /** Renames [fileId] to [newName]. Empty names are rejected client-side. */

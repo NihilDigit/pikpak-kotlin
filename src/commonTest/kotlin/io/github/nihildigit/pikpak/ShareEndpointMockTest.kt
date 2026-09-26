@@ -150,13 +150,6 @@ class ShareEndpointMockTest {
     }
 
     @Test
-    fun `restored file ids come out of the task params`() {
-        val task = OfflineTask(type = "restore", params = mapOf("trace_file_ids" to """{"F2":"N2","D1":"N1"}"""))
-        assertEquals(mapOf("F2" to "N2", "D1" to "N1"), task.restoredFileIds)
-        assertEquals(emptyMap<String, String>(), OfflineTask(params = mapOf("trace_file_ids" to "not json")).restoredFileIds)
-    }
-
-    @Test
     fun `share id from a link`() {
         assertEquals("VP2J59n2xU-aH3jyvst_a1UPo2", shareIdFromUrl("https://mypikpak.com/s/VP2J59n2xU-aH3jyvst_a1UPo2"))
         assertEquals("VOab_c", shareIdFromUrl(" https://mypikpak.com/s/VOab_c/VOfolder?act=play "))

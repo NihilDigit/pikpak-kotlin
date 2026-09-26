@@ -44,24 +44,22 @@ class IntegrationTrashLifecycleTest {
             assertTrue(folderId.isNotBlank())
 
             client.batchTrash(listOf(folderId))
-            assertEquals(
-                0,
-                client.listFiles().count { it.id == folderId },
+            assertTrue(
+                eventually("trashed folder gone from root") { client.listFiles().none { it.id == folderId } },
                 "trashed folder should not appear in root listing",
             )
-            assertNotNull(
-                client.listTrash().firstOrNull { it.id == folderId },
+            assertTrue(
+                eventually("trashed folder in trash") { client.listTrash().any { it.id == folderId } },
                 "trashed folder should appear in listTrash",
             )
 
             client.batchUntrash(listOf(folderId))
-            assertNotNull(
-                client.listFiles().firstOrNull { it.id == folderId },
+            assertTrue(
+                eventually("restored folder back in root") { client.listFiles().any { it.id == folderId } },
                 "untrashed folder should reappear at its original parent",
             )
-            assertEquals(
-                0,
-                client.listTrash().count { it.id == folderId },
+            assertTrue(
+                eventually("restored folder gone from trash") { client.listTrash().none { it.id == folderId } },
                 "restored folder should no longer appear in listTrash",
             )
 

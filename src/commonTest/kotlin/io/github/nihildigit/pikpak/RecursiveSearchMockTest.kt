@@ -9,11 +9,15 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import io.ktor.utils.io.ByteReadChannel
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.minutes
+
+private suspend fun PikPakClient.searchFilesRecursiveList(keyword: String, limits: RecursiveSearchLimits) =
+    searchFilesRecursive(keyword, limits = limits).toList()
 
 /**
  * The tree the walk is measured against. Four levels, one match per level, so

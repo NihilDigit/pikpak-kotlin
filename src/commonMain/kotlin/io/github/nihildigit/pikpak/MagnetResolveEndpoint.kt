@@ -10,7 +10,6 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonObject
 
 /** One leaf file inside a torrent, as PikPak's content index knows it. */
 data class ResolvedFile(
@@ -39,15 +38,14 @@ data class MagnetResource(
      * the torrent".
      */
     val files: List<ResolvedFile>,
+    /**
+     * The server paged the top level and [files] holds only its first page:
+     * more than the 500 entries asked for sat at the torrent's root. Following
+     * the page token on this endpoint has not been tried, so the SDK says so
+     * rather than presenting part of the torrent as all of it.
+     */
+    val truncated: Boolean = false,
 )
-
-/**
- * Depth cap on the inlined directory tree. PikPak sends the whole tree in one
- * response with no cursor between levels, so nothing but this cap bounds the
- * walk if a response ever contains a cycle. Entries below the cap are dropped,
- * not reported.
- */
-internal const val MAX_MAGNET_TREE_DEPTH = 8
 
 private const val RESOURCE_LIST_PATH = "/drive/v1/resource/list"
 
@@ -80,18 +78,21 @@ suspend fun PikPakClient.resolveMagnet(magnet: String): MagnetResource? {
         url = "${PikPakConstants.DRIVE_BASE}$RESOURCE_LIST_PATH",
         captchaAction = "POST:$RESOURCE_LIST_PATH",
     ) { jsonBody(json, body) }
-    return parseMagnetResource(response as JsonObject)
+    val obj = response as? JsonObject ?: throw PikPakException(-1, "resolveMagnet: bad response shape", rawBody = response.toString())
+    return parseMagnetResource(obj)
 }
 
 /**
  * Flattens a `/drive/v1/resource/list` response. Split out from the request so
  * the tree walk can be tested against recorded responses without an account.
+ *
+ * The tree arrives whole, nested inline, and is walked to its full depth. An
+ * earlier cap of eight levels guarded against a cycle a parsed JSON tree cannot
+ * contain, and its only effect was to drop deeper files without a word.
  */
-internal fun parseMagnetResource(
-    root: JsonObject,
-    maxDepth: Int = MAX_MAGNET_TREE_DEPTH,
-): MagnetResource? {
-    val top = root.obj("list")?.arr("resources").orEmpty()
+internal fun parseMagnetResource(root: JsonObject): MagnetResource? {
+    val list = root.obj("list")
+    val top = list?.arr("resources").orEmpty()
     if (top.isEmpty()) return null
 
     // A torrent with a folder at the root has exactly one top-level entry and
@@ -105,39 +106,36 @@ internal fun parseMagnetResource(
     for (entry in top) {
         val obj = entry.asObject() ?: continue
         if (singleRootDir) {
-            collect(obj.obj("dir")?.arr("resources").orEmpty(), prefix = "", depth = 1, maxDepth, files)
+            collect(obj.obj("dir")?.arr("resources").orEmpty(), prefix = "", files)
         } else {
-            collect(listOf(obj), prefix = "", depth = 0, maxDepth, files)
+            collect(listOf(obj), prefix = "", files)
         }
     }
     if (files.isEmpty()) return null
     if (files.all { it.gcid == null }) return null
 
     val name = top.firstOrNull()?.asObject()?.str("name").orEmpty()
-    return MagnetResource(name = name, files = files)
+    return MagnetResource(name = name, files = files, truncated = !list?.str("next_page_token").isNullOrEmpty())
 }
 
 private fun collect(
     entries: List<JsonElement>,
     prefix: String,
-    depth: Int,
-    maxDepth: Int,
     into: MutableList<ResolvedFile>,
 ) {
-    if (depth > maxDepth) return
     for (element in entries) {
         val obj = element.asObject() ?: continue
         val name = obj.str("name").orEmpty()
         if (name.isEmpty()) continue
         val path = if (prefix.isEmpty()) name else "$prefix/$name"
         if (obj.isDir()) {
-            collect(obj.obj("dir")?.arr("resources").orEmpty(), path, depth + 1, maxDepth, into)
+            collect(obj.obj("dir")?.arr("resources").orEmpty(), path, into)
         } else {
             into += ResolvedFile(
                 path = path,
                 // file_size arrives as a JSON string, not a number.
                 size = obj.str("file_size")?.toLongOrNull() ?: 0L,
-                gcid = obj.obj("meta")?.str("hash")?.takeIf { it.isNotBlank() },
+                gcid = obj.obj("meta")?.str("hash")?.takeIf { it.isNotBlank() }?.canonicalGcid(),
             )
         }
     }
@@ -148,11 +146,13 @@ private fun collect(
  * the existing blob into [parentId] and no bytes are transferred. Returns the
  * new file id.
  *
- * This is the init request of [upload] with the hash and size supplied by the
- * caller instead of read off a local file, which is why it can only ever
- * succeed on content PikPak already stores. A response whose phase is not
- * [TaskPhase.COMPLETE] means the server wants the bytes — and we have none —
- * so it throws rather than returning a half-created object.
+ * This is [startUpload] without the OSS half: the same request, with the hash
+ * and size supplied by the caller, which is why it can only ever succeed on
+ * content PikPak already stores. A response whose phase is not
+ * [TaskPhase.COMPLETE] means the server wants the bytes — and we have none.
+ * The server has created a pending node by then; it is deleted and
+ * [InstantContentUnavailableException] thrown, so a caller can fall back to an
+ * offline task without leaving a file that never completes in the folder.
  *
  * No bytes move, but it is not free: each call is charged 15 % of the file's
  * size against the monthly upload allowance of [getTransferQuota], also for
@@ -162,9 +162,8 @@ private fun collect(
  * Known flake: creating the same gcid twice in one folder has been observed to
  * return a file node complete enough to carry an id but not yet resolvable —
  * an immediate `getFile` came back without a download link. This does not check
- * for that, because checking costs a `getFile` that a caller about to read the
- * detail anyway would pay twice; see [instantCreateResolvable] for the variant
- * that does.
+ * for that: checking costs a `getFile` that a caller about to read the detail
+ * anyway would pay twice.
  */
 suspend fun PikPakClient.instantCreate(
     file: ResolvedFile,
@@ -174,77 +173,17 @@ suspend fun PikPakClient.instantCreate(
     val gcid = requireNotNull(file.gcid) {
         "instantCreate needs a gcid; ${file.path} is not in PikPak's index and has to go through an offline task"
     }
-    val body = buildJsonObject {
-        put("kind", FileKind.FILE)
-        put("name", name)
-        put("size", file.size.toString())
-        put("hash", gcid)
-        put("upload_type", "UPLOAD_TYPE_RESUMABLE")
-        if (parentId.isNotEmpty()) put("parent_id", parentId)
-        putJsonObject("body") {
-            put("duration", "")
-            put("width", "")
-            put("height", "")
-        }
-        putJsonObject("objProvider") { put("provider", "UPLOAD_TYPE_UNKNOWN") }
+    val node = createUploadNode(parentId, name, file.size, gcid)
+    if (node.phase != TaskPhase.COMPLETE) {
+        // The request has already created the node, waiting for bytes that
+        // will never come; left alone it sits in the folder as a pending file
+        // forever (observed 2026-09-26), and a retry adds a "(1)" copy next to
+        // it. Nothing else knows its id, so it is ours to remove.
+        node.fileId.takeIf { it.isNotEmpty() }?.let { runCatching { deleteFile(it) } }
+        throw InstantContentUnavailableException(gcid, name, node.phase)
     }
-
-    val response = http.request(
-        method = HttpMethod.Post,
-        url = "${PikPakConstants.DRIVE_BASE}/drive/v1/files",
-        captchaAction = "POST:/drive/v1/files",
-    ) { jsonBody(json, body) }
-
-    val fileNode = (response as JsonObject).obj("file")
-        ?: throw PikPakException(-1, "instantCreate: missing file in response for $name")
-    val phase = fileNode.str("phase").orEmpty()
-    if (phase != TaskPhase.COMPLETE) {
-        throw PikPakException(
-            errorCode = -1,
-            errorMessage = "instantCreate: PikPak does not hold hash $gcid (phase=$phase); " +
-                "$name needs a real upload or an offline task",
-        )
-    }
-    return fileNode.str("id")?.takeIf { it.isNotEmpty() }
+    return node.fileId.takeIf { it.isNotEmpty() }
         ?: throw PikPakException(-1, "instantCreate: completed response carries no file id for $name")
-}
-
-/**
- * [instantCreate], then a [getFile] to confirm the new object actually resolves
- * to a link, recreating it up to [attempts] times while it does not.
- *
- * For the flake described on [instantCreate]: the id comes back but the detail
- * carries no readable link, and a caller that treats the id as good then fails
- * on the read instead of on the create. Each attempt costs one extra request
- * over [instantCreate], so this is for callers who cannot cheaply retry at
- * their own level — one whose next step is a [getFile] anyway should call
- * [instantCreate] and judge the detail it was going to fetch regardless.
- *
- * An object that failed to resolve is deleted before the next attempt, so a
- * caller treating objects as leases is not left holding ids it never saw. The
- * last attempt's id is returned even when its detail had no link: by then the
- * failure belongs to the read, which reports it in context.
- *
- * @param attempts total creates to make, at least one.
- */
-suspend fun PikPakClient.instantCreateResolvable(
-    file: ResolvedFile,
-    parentId: String,
-    name: String = file.name,
-    attempts: Int = 2,
-): String {
-    require(attempts >= 1) { "attempts must be >= 1, got $attempts" }
-    var created = ""
-    repeat(attempts) { attempt ->
-        created = instantCreate(file, parentId = parentId, name = name)
-        val resolvable = runCatching { getFile(created) }
-            .map { detail -> detail.medias.any { it.link.url.isNotBlank() } || detail.links.isNotEmpty() }
-            .getOrDefault(false)
-        if (resolvable || attempt == attempts - 1) return created
-        // Nothing else will ever name this one: the caller has not been told the id.
-        runCatching { batchDelete(listOf(created)) }
-    }
-    return created
 }
 
 private fun JsonElement.asObject(): JsonObject? = this as? JsonObject

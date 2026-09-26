@@ -51,7 +51,7 @@ class CidPrecheckProbeTest {
                 val cid = cidOf(client, url, f.sizeBytes)
                 // The SDK's own implementation, end to end: it must agree with this probe's and hit
                 val sdkCid = XunleiCid.of(f.sizeBytes) { offset, length -> runBlocking { read(client, url, offset, length.toLong()) } }
-                println("[sdk] cid matches probe=${sdkCid == cid} gcidByCid matches hash=${client.gcidByCid(sdkCid, f.sizeBytes) == f.hash?.lowercase()}")
+                println("[sdk] cid matches probe=${sdkCid == cid} gcidByCid matches hash=${client.gcidByCid(sdkCid, f.sizeBytes) == f.hash}")
                 if (firstCid == null) firstCid = cid to f.sizeBytes
                 val r = query(client, cid.lowercase(), f.sizeBytes)
                 println("[file] mime=${f.mimeType} size=${f.sizeBytes} hash=${f.hash} cid=$cid")

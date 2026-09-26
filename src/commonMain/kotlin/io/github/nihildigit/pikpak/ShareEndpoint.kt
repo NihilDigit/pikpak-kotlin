@@ -6,10 +6,6 @@ import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.http.HttpMethod
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.SerializationException
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -159,8 +155,8 @@ data class ShareFolderPage(
 
 /**
  * Answer to [restoreShare]. The copy is queued, not done: poll
- * `getTask(restoreTaskId)` until [TaskPhase.TERMINAL], then read
- * [restoredFileIds] off the task.
+ * `getTask(restoreTaskId)` until [TaskPhase.TERMINAL], then find the copies by
+ * listing the destination; see [restoreShare].
  */
 @Serializable
 data class ShareRestore(
@@ -327,25 +323,24 @@ suspend fun PikPakClient.listShareFiles(
  * Copies items of someone else's share into this drive
  * (`POST /drive/v1/share/restore`). Returns at once with a task id; the copy
  * runs as a task of type `restore`, polled with [getTask] like an offline
- * download, and [restoredFileIds] on the finished task maps each shared id to
- * the new file's id.
+ * download.
  *
  * [fileIds] are ids from [ShareInfo.files] or [listShareFiles]. When they sit
  * below the top level, [ancestorIds] lists the shared folders from the top
  * level down to their parent. [toParentId] is the destination; empty means
- * the drive root. The copied items keep a
- * pointer back: `original_share_id`, `original_file_id` and `url` =
+ * the drive root.
+ *
+ * Measured with piko's `share --restore` probe: the task finished in seconds,
+ * and the copies land directly in [toParentId], without the share's folders
+ * above them. The task carries no map from shared ids to new ones — the
+ * `trace_file_ids` param the web client reads was absent — so a caller finds
+ * the copies by listing [toParentId]: each keeps a pointer back,
+ * `original_share_id`, `original_file_id` and `url` =
  * `https://mypikpak.com/s/<shareId>` in [FileStat.params].
  *
  * Restoring one's own share fails with `file_restore_own`, which PikPak sends
  * as error_code 9 like a captcha failure (observed 2026-09-24); the client
  * tells them apart by name and does not retry it.
- *
- * Not verified live: the probe account has no share but its own to restore
- * from. The request body is copied from a recorded exchange with Xunlei's
- * drive API, which is the same service under another host; the response
- * fields (`restore_task_id`, then `trace_file_ids` on the task) match what the
- * PikPak web client reads.
  */
 suspend fun PikPakClient.restoreShare(
     shareId: String,
@@ -380,23 +375,6 @@ suspend fun PikPakClient.restoreShare(
     }
     return result
 }
-
-/**
- * For a finished `restore` task from [restoreShare]: shared file id to the id
- * of its copy in this drive, read from the `trace_file_ids` param, which holds
- * a JSON object as a string. Empty for any other task, or while the task has
- * not written it yet.
- */
-val OfflineTask.restoredFileIds: Map<String, String>
-    get() {
-        val raw = params["trace_file_ids"] ?: return emptyMap()
-        val obj = try {
-            Json.parseToJsonElement(raw) as? JsonObject
-        } catch (e: SerializationException) {
-            null
-        } ?: return emptyMap()
-        return obj.mapNotNull { (key, value) -> (value as? JsonPrimitive)?.content?.let { key to it } }.toMap()
-    }
 
 /**
  * The share id in a share link: `https://mypikpak.com/s/<shareId>`, with or

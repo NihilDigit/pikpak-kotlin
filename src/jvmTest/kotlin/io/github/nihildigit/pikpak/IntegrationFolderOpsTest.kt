@@ -45,28 +45,24 @@ class IntegrationFolderOpsTest {
             val folderId = client.createFolder(parentId = "", name = initialName)
             assertTrue(folderId.isNotBlank(), "createFolder should return a non-blank id")
 
-            val rootAfterCreate = client.listFiles()
-            assertNotNull(
-                rootAfterCreate.firstOrNull { it.name == initialName && it.id == folderId },
+            assertTrue(
+                eventually("new folder listed") { client.listFiles().any { it.name == initialName && it.id == folderId } },
                 "newly-created folder should appear in root listing",
             )
 
             client.rename(folderId, renamedName)
-            val rootAfterRename = client.listFiles()
-            assertNotNull(
-                rootAfterRename.firstOrNull { it.name == renamedName && it.id == folderId },
-                "renamed folder should appear with new name",
-            )
-            assertEquals(
-                0, rootAfterRename.count { it.name == initialName },
-                "original name should no longer be present",
+            assertTrue(
+                eventually("renamed folder listed under its new name") {
+                    val root = client.listFiles()
+                    root.any { it.name == renamedName && it.id == folderId } && root.none { it.name == initialName }
+                },
+                "renamed folder should appear with the new name only",
             )
 
             client.deleteFile(folderId)
-            val rootAfterDelete = client.listFiles()
-            assertEquals(
-                0, rootAfterDelete.count { it.id == folderId },
-                "deleted folder should no longer appear (it's in trash)",
+            assertTrue(
+                eventually("deleted folder gone") { client.listFiles().none { it.id == folderId } },
+                "deleted folder should no longer appear (deleteFile is permanent)",
             )
         } finally {
             client.close()

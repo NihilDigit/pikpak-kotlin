@@ -34,7 +34,28 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * The whole point of [directDownloadFromUrl] is that the destination file is
+ * [RangeSource.downloadTo] over a fixed URL, which is all these tests need of a source.
+ * The SDK dropped this as public API: no consumer read from a URL it could not refresh.
+ */
+private suspend fun PikPakClient.downloadFromUrl(
+    url: String,
+    dest: Path,
+    totalSize: Long,
+    concurrency: Int = DIRECT_DOWNLOAD_CONCURRENCY,
+    priority: Int = 1,
+    blockSize: Long = DIRECT_DOWNLOAD_BLOCK_SIZE,
+    progress: MutableStateFlow<Long>? = null,
+): Long {
+    val reader = RangeReader(this, { url }, connectionBudget = maxOf(1, minOf(concurrency, connectionBudget)))
+    try {
+        return reader.asRangeSource().downloadTo(dest, totalSize, concurrency, priority, blockSize, progress)
+    } finally {
+        reader.close()
+    }
+}
+
+/**
+ * The whole point of [RangeSource.downloadTo] is that the destination file is
  * always a valid prefix of the remote one and its length is the progress.
  * Every test here is about some way that could stop being true: a resumed run
  * refetching bytes it already has, a round landing out of order, a cancelled

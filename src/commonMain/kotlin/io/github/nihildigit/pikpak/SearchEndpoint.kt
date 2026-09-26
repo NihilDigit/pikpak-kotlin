@@ -1,7 +1,5 @@
 package io.github.nihildigit.pikpak
 
-import io.github.nihildigit.pikpak.internal.buildUrl
-import io.ktor.http.HttpMethod
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeSource
@@ -10,10 +8,6 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.toList
-
-private const val DRIVE = PikPakConstants.DRIVE_BASE
-private const val FILES_PATH = "/drive/v1/files"
 
 /**
  * Substring search (case-insensitive) over entry names under [parentId]. Scope
@@ -49,36 +43,8 @@ suspend fun PikPakClient.searchFiles(
  * items trashed from the root (observed 2026-09-23): a file trashed from a
  * subfolder is in the trash, restorable, and missing from this listing.
  */
-suspend fun PikPakClient.listTrash(pageSize: Int = 500): List<FileStat> {
-    val all = mutableListOf<FileStat>()
-    var pageToken = ""
-    do {
-        val page = listTrashPaged(pageSize, pageToken)
-        all += page.files
-        pageToken = page.nextPageToken
-    } while (pageToken.isNotEmpty())
-    return all
-}
-
-private suspend fun PikPakClient.listTrashPaged(
-    pageSize: Int,
-    pageToken: String,
-): FileListPage {
-    val query = mutableMapOf(
-        "thumbnail_size" to THUMBNAIL_SIZE,
-        "limit" to pageSize.toString(),
-        "parent_id" to "*",
-        "with_audit" to "false",
-        "filters" to """{"trashed":{"eq":true}}""",
-    )
-    if (pageToken.isNotEmpty()) query["page_token"] = pageToken
-    val response = http.request(
-        method = HttpMethod.Get,
-        url = buildUrl(DRIVE, FILES_PATH, query),
-        captchaAction = "GET:/drive/v1/files",
-    )
-    return json.decodeFromJsonElement(FileListPage.serializer(), response)
-}
+suspend fun PikPakClient.listTrash(pageSize: Int = 500): List<FileStat> =
+    listFiles(parentId = "*", pageSize = pageSize, extraFilters = mapOf(FileFilter.trashed(true)))
 
 /**
  * One match from [searchFilesRecursive], with enough context to tell two
@@ -115,8 +81,10 @@ data class SearchHit(
  * @param maxDepth folder levels below the search root to descend into. `0`
  *   lists only the root, which is what [searchFiles] does. Default 8.
  * @param maxFolders folders listed in total, the search root included.
- *   Default 2000, i.e. at the default rate limit roughly the number of
- *   requests that fit in [timeout] anyway.
+ *   Default 2000, a backstop for a raised [timeout] rather than the limit that
+ *   binds by default: the default rate limit refills five requests a second,
+ *   so about 300 listings fit in the default minute, fewer when a folder takes
+ *   several pages.
  * @param timeout wall-clock budget for the whole traversal. Checked between
  *   batches, so an in-flight listing is allowed to finish. Default 60s.
  * @param concurrency folders listed at once. The ceiling that matters is the
@@ -212,15 +180,5 @@ fun PikPakClient.searchFilesRecursive(
         }
     }
 }
-
-/**
- * [searchFilesRecursive] collected into a list. The same walk with the same
- * budgets; the caller just waits for all of it.
- */
-suspend fun PikPakClient.searchFilesRecursiveList(
-    keyword: String,
-    parentId: String = "",
-    limits: RecursiveSearchLimits = RecursiveSearchLimits(),
-): List<SearchHit> = searchFilesRecursive(keyword, parentId, limits).toList()
 
 private class PendingFolder(val id: String, val breadcrumb: List<String>)

@@ -107,17 +107,6 @@ class FileOpsMockTest {
     }
 
     @Test
-    fun `emptyTrash is a bodiless PATCH`() = runBlocking {
-        val c = client()
-        c.emptyTrash()
-        val s = sent.single()
-        assertEquals("PATCH", s.method)
-        assertEquals("/drive/v1/files/trash:empty", s.path)
-        assertEquals("", s.body)
-        c.close()
-    }
-
-    @Test
     fun `clearOfflineTasks posts phases and delete_files for every client`() = runBlocking {
         val c = client()
         c.clearOfflineTasks(listOf(TaskPhase.COMPLETE), deleteFiles = true)

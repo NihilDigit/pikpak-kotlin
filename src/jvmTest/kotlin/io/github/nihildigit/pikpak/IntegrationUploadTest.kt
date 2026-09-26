@@ -65,9 +65,12 @@ class IntegrationUploadTest {
                 assertTrue(result.fileId.isNotBlank(), "upload should return a file id")
                 println("[upload] fileId=${result.fileId} instant=${result.instantUpload} bytes=${result.bytesUploaded}")
 
-                val listing = client.listFiles(folderId)
-                val uploaded = listing.firstOrNull { it.name == srcName && it.id == result.fileId }
-                assertNotNull(uploaded, "uploaded file should appear in listing")
+                var listed: FileStat? = null
+                eventually("uploaded file listed") {
+                    listed = client.listFiles(folderId).firstOrNull { it.name == srcName && it.id == result.fileId }
+                    listed != null
+                }
+                val uploaded = assertNotNull(listed, "uploaded file should appear in listing")
                 assertEquals(payload.size.toLong(), uploaded.sizeBytes, "uploaded file should have correct size")
 
                 SystemFileSystem.delete(dst, mustExist = false)
@@ -77,7 +80,7 @@ class IntegrationUploadTest {
                     runCatching { client.getFile(result.fileId).downloadUrl != null }.getOrDefault(false)
                 }
                 assertTrue(downloadable, "download link should appear within poll window")
-                val written = client.downloadSingleConnection(result.fileId, dst)
+                val written = client.downloadFile(result.fileId, dst)
                 assertEquals(payload.size.toLong(), written, "download should write expected byte count")
                 val downloaded = SystemFileSystem.source(dst).buffered().use { it.readByteArray(payload.size) }
                 assertTrue(downloaded.contentEquals(payload), "downloaded bytes should match the original payload")
@@ -114,7 +117,10 @@ class IntegrationUploadTest {
                     )
                 }
                 assertTrue(result.isFailure, "a source that ends early must fail the upload")
-                assertTrue(client.listFiles(folderId).isEmpty(), "the pending file init created must be deleted")
+                assertTrue(
+                    eventually("pending upload gone") { client.listFiles(folderId).isEmpty() },
+                    "the pending file init created must be deleted",
+                )
             } finally {
                 runCatching { client.deleteFile(folderId) }
             }

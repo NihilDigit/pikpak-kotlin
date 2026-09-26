@@ -12,7 +12,9 @@ import org.kotlincrypto.hash.sha1.SHA1
  *
  * Algorithm: split the file into chunks of [chunkSizeFor] bytes, take SHA1 of
  * each chunk, concatenate the raw 20-byte digests in order, then take SHA1 of
- * the concatenation. Result is lowercase hex.
+ * the concatenation. Result is upper-case hex, the case the server lists
+ * ([FileStat.hash], [ResolvedFile.gcid]) and [gcidByCid] returns, so `==`
+ * against any of them is a content comparison.
  *
  * The chunk-size table is copied verbatim from
  * github.com/52funny/pikpakhash@v0.0.0-20231104025731-ef91a56eff9c — empty
@@ -46,7 +48,7 @@ object PikPakHash {
      * coroutine is cancelled.
      */
     fun fromSource(source: RawSource, size: Long, onProgress: (hashedBytes: Long) -> Unit = {}): String {
-        if (size <= 0) return SHA1().digest(ByteArray(0)).toHex()
+        if (size <= 0) return SHA1().digest(ByteArray(0)).toHex().canonicalGcid()
 
         val chunkSize = chunkSizeFor(size)
         val outer = SHA1()
@@ -60,6 +62,6 @@ object PikPakHash {
             remaining -= want
             onProgress(size - remaining)
         }
-        return outer.digest().toHex()
+        return outer.digest().toHex().canonicalGcid()
     }
 }

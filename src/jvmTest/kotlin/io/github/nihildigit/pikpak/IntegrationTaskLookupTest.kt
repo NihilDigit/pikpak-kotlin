@@ -62,9 +62,14 @@ class IntegrationTaskLookupTest {
             // Second resolve must come out of the memo rather than the network.
             assertEquals(folderId, client.getPathFolderId(name))
 
-            val folders = client.listFiles("", extraFilters = mapOf(FileFilter.kind(FileKind.FOLDER)))
+            var folders = emptyList<FileStat>()
+            assertTrue(
+                eventually("new folder in the kind-filtered listing") {
+                    folders = client.listFiles("", extraFilters = mapOf(FileFilter.kind(FileKind.FOLDER)))
+                    folders.any { it.name == name }
+                },
+            )
             assertTrue(folders.all { it.isFolder }, "kind filter must exclude files server-side")
-            assertTrue(folders.any { it.name == name })
         } finally {
             runCatching { folderId?.let { client.deleteFile(it) } }
             client.close()

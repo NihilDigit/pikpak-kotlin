@@ -41,7 +41,7 @@ class IntegrationDownloadTest {
             val dest = Path(SystemTemporaryDirectory, "pikpak-kotlin-download-${candidate!!.id}.bin")
             SystemFileSystem.delete(dest, mustExist = false)
 
-            val written = client.downloadSingleConnection(candidate.id, dest)
+            val written = client.downloadFile(candidate.id, dest)
             assertEquals(candidate.sizeBytes, written, "downloaded byte count must match expected size")
 
             val onDisk = SystemFileSystem.metadataOrNull(dest)?.size ?: -1L

@@ -64,5 +64,5 @@ suspend fun PikPakClient.gcidByCid(cid: String, size: Long): String? {
         captchaAction = "GET:/drive/v1/resource/cid",
     )
     val gcid = (response as? JsonObject)?.get("gcid")?.jsonPrimitive?.contentOrNull
-    return gcid?.takeIf { it.isNotEmpty() }?.lowercase()
+    return gcid?.takeIf { it.isNotEmpty() }?.canonicalGcid()
 }

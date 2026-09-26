@@ -1,12 +1,12 @@
 package io.github.nihildigit.pikpak
 
 import io.ktor.http.HttpMethod
-import kotlin.time.Instant
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
+// Membership is read off getTransferQuota, which carries the tier and the expiry beside the
+// allowances. A separate getVipInfo stood here with nobody calling it and an envelope of its own.
 private const val USER_ME_URL = "${PikPakConstants.USER_BASE}/v1/user/me"
-private const val VIP_URL = "${PikPakConstants.DRIVE_BASE}/drive/v1/privilege/vip"
 
 /**
  * One OAuth provider linked to the account, as returned in [UserProfile.providers].
@@ -54,47 +54,6 @@ data class UserProfile(
     val hasPassword: Boolean get() = password == "SET"
 }
 
-/** Payload of [VipStatus]. Absent on accounts the endpoint has nothing to say about. */
-@Serializable
-data class VipData(
-    /** RFC 3339. Prefer [VipStatus.expiresAt]. */
-    val expire: String = "",
-    /** Observed values: `"ok"`, `"invalid"`. */
-    val status: String = "",
-    /** Membership tier, e.g. `"platinum"`. */
-    val type: String = "",
-    @SerialName("user_id") val userId: String = "",
-)
-
-/**
- * VIP membership (`GET /drive/v1/privilege/vip`).
- *
- * The envelope here is not PikPak's usual one: success is [result] ==
- * `"ACCEPTED"` rather than `error_code` 0, so a failed lookup arrives as a
- * 2xx this SDK cannot turn into an exception. Check [isVip] rather than
- * assuming [data] is populated.
- */
-@Serializable
-data class VipStatus(
-    /** `"ACCEPTED"` on success. */
-    val result: String = "",
-    val message: String = "",
-    val data: VipData? = null,
-) {
-    /** True only when the lookup succeeded *and* reported a live membership. */
-    val isVip: Boolean get() = result == "ACCEPTED" && data?.status == "ok"
-
-    /** When the membership lapses, or null when there is none or the date is unparseable. */
-    val expiresAt: Instant?
-        get() = data?.expire?.takeIf { it.isNotBlank() }?.let {
-            try {
-                Instant.parse(it)
-            } catch (_: IllegalArgumentException) {
-                null
-            }
-        }
-}
-
 /**
  * Returns the authenticated account's profile — display name, avatar, masked
  * contact details.
@@ -110,18 +69,4 @@ suspend fun PikPakClient.getUserProfile(): UserProfile {
         captchaAction = "GET:$USER_ME_URL",
     )
     return json.decodeFromJsonElement(UserProfile.serializer(), response)
-}
-
-/**
- * Returns the account's VIP membership. Quota is a separate call — see
- * [getQuota]; a lapsed membership does not change the reported limit
- * immediately.
- */
-suspend fun PikPakClient.getVipInfo(): VipStatus {
-    val response = http.request(
-        method = HttpMethod.Get,
-        url = VIP_URL,
-        captchaAction = "GET:/drive/v1/privilege/vip",
-    )
-    return json.decodeFromJsonElement(VipStatus.serializer(), response)
 }

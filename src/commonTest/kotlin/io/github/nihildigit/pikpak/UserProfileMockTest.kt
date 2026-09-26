@@ -93,39 +93,6 @@ class UserProfileMockTest {
         client.close()
     }
 
-    @Test
-    fun `vip is live only when the lookup was accepted and the membership is ok`() = runBlocking {
-        val client = clientWithAuth { req ->
-            if (req.url.encodedPath == "/drive/v1/privilege/vip") {
-                respondJson(
-                    """{"result":"ACCEPTED","message":"success",
-                       "data":{"expire":"2027-03-01T00:00:00.000Z","status":"ok",
-                               "type":"platinum","user_id":"UID"}}""",
-                )
-            } else respond404()
-        }
-
-        val vip = client.getVipInfo()
-
-        assertTrue(vip.isVip)
-        assertEquals("platinum", vip.data?.type)
-        assertEquals("2027-03-01T00:00:00Z", vip.expiresAt?.toString())
-        client.close()
-    }
-
-    @Test
-    fun `a rejected vip lookup is not a membership even when it carries data`() = runBlocking {
-        // The envelope is not PikPak's usual one: this arrives as a 2xx with
-        // error_code absent, so nothing below this model can reject it.
-        val client = clientWithAuth { req ->
-            if (req.url.encodedPath == "/drive/v1/privilege/vip") {
-                respondJson("""{"result":"REJECTED","data":{"status":"ok","type":"platinum"}}""")
-            } else respond404()
-        }
-
-        assertFalse(client.getVipInfo().isVip)
-        client.close()
-    }
 
     private fun clientWithAuth(
         onCaptchaInit: (String) -> Unit = {},

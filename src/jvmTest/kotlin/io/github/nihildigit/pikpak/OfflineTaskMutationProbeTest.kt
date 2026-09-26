@@ -183,29 +183,6 @@ class OfflineTaskMutationProbeTest {
         }
     }
 
-    /** Retry one given task and report what the server does with it. Trashes a re-downloaded file. */
-    @Test
-    fun `retry a given task`() = runBlocking {
-        Assumptions.assumeTrue(enabled, "set PIKPAK_PROBE=1 to run")
-        Assumptions.assumeTrue(username != null && password != null, "no .env credentials")
-        val taskId = System.getenv("PROBE_TASK_ID") ?: return@runBlocking
-        val client = PikPakClient(account = username!!, password = password!!, sessionStore = InMemorySessionStore())
-        try {
-            client.login()
-            println("[before] ${describe(client.getTask(taskId))}")
-            val retried = runCatching { client.retryOfflineTask(taskId) }
-            println("[retry] ${retried.map { describe(it) }}")
-            if (retried.isFailure) return@runBlocking
-            val settled = awaitTerminal(client, taskId)
-            println("[settled] ${describe(settled)}")
-            if (settled.phase == TaskPhase.COMPLETE && settled.fileId.isNotEmpty()) {
-                runCatching { client.batchTrash(listOf(settled.fileId)) }.also { println("[cleanup] trash ${settled.fileId} -> $it") }
-            }
-        } finally {
-            client.close()
-        }
-    }
-
     /** Resubmit a task's source URL as a new task, instead of RETRY. Trashes the result. */
     @Test
     fun `resubmit a given task`() = runBlocking {

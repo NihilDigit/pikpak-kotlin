@@ -22,9 +22,10 @@ sealed interface VariantPreference {
 /**
  * The variant a [VariantPreference] resolved to on one [FileDetail].
  *
- * [mediaId] is the durable handle. Persist it and pass it back to
- * [PikPakClient.rangeReader] to reopen the same bytes after the signed link
- * has expired.
+ * To reopen the same bytes later, persist the gcid ([FileDetail.hash]) with
+ * [mediaId] and build a [PikPakFileHandle] from them: a file id can die — trashed,
+ * swept, rebuilt — and the gcid cannot. [PikPakClient.rangeReader] takes the
+ * file id and is for the short term.
  */
 data class ResolvedVariant(
     /**
@@ -145,7 +146,7 @@ suspend fun PikPakClient.remoteSize(url: String): Long {
 }
 
 /**
- * A [RangeReader] locked to one variant of [fileId].
+ * A [RangeReader] over [fileId], locked to one variant of it.
  *
  * On expiry the reader re-fetches the file detail and takes the link belonging
  * to the same [mediaId]. It never re-runs preference selection: switching
@@ -153,11 +154,14 @@ suspend fun PikPakClient.remoteSize(url: String): Long {
  * already read past. A variant that has disappeared from the file detail fails
  * the read rather than silently resolving to another one.
  *
+ * Short-lived by design: it does not survive the file id dying, and does not
+ * move off a host that stops answering. A [PikPakFileHandle] does both.
+ *
  * @param mediaId [ResolvedVariant.mediaId]; null reads the original file.
  */
 fun PikPakClient.rangeReader(
     fileId: String,
-    mediaId: String?,
+    mediaId: String? = null,
     connectionBudget: Int = this.connectionBudget,
 ): RangeReader = RangeReader(
     client = this,

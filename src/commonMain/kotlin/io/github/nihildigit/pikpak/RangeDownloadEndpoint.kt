@@ -14,7 +14,7 @@ import kotlinx.io.write
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
-/** Default block one connection fetches per round in [directDownloadTo]. */
+/** Default block one request of [RangeSource.downloadTo] fetches. */
 public const val DIRECT_DOWNLOAD_BLOCK_SIZE: Long = 512L * 1024
 
 /** Default number of connections [RangeSource.downloadTo] keeps busy. */
@@ -25,10 +25,11 @@ public const val DIRECT_DOWNLOAD_CONCURRENCY: Int = 4
  * connections, so that [dest] is at every instant a valid prefix of the file
  * and its length is the download's progress.
  *
- * This is the default way to put a PikPak file on disk. The alternative,
- * [PikPakClient.downloadSingleConnection], resumes just as well but runs one
- * connection, and one connection to this CDN is bounded by the round trip
- * rather than by the link — which is the whole reason this SDK exists.
+ * This is the way to put a PikPak file on disk. One connection to this CDN is
+ * bounded by the round trip rather than by the link — measured at 0.94 MB/s on
+ * a distant route against 4.7 MB/s on a short one, the distant case scaling
+ * nearly linearly to eight connections — so there is no single-connection
+ * variant; pass `concurrency = 1` for one.
  *
  * Bytes are written strictly in order, which is what makes the file's length
  * the progress: resuming means continuing from that length, and there is no
@@ -60,6 +61,11 @@ public const val DIRECT_DOWNLOAD_CONCURRENCY: Int = 4
  * Use a [PikPakFileHandle] when the download can outlive a signature or the
  * file object can be swept away; a source over a fixed URL fails when the
  * signature does.
+ *
+ * It reads through [RangeSource] and nothing else, so it shares no bytes with
+ * the handle's block cache or [BlockStore]: a file downloaded while it plays is
+ * fetched twice, the two competing only through priority. Folding it into the
+ * cache as a sequential background cursor would fix that, and has not been done.
  *
  * @param dest        output path. An existing file is treated as a partial
  *                    download and continued; one longer than [totalSize] is
@@ -96,13 +102,13 @@ public suspend fun RangeSource.downloadTo(
     roundRetryDelay: Duration = 3.seconds,
 ): Long {
     if (concurrency < 1) {
-        throw PikPakException(-1, "directDownloadTo: concurrency must be >= 1, got $concurrency")
+        throw PikPakException(-1, "downloadTo: concurrency must be >= 1, got $concurrency")
     }
     if (blockSize < 1) {
-        throw PikPakException(-1, "directDownloadTo: blockSize must be >= 1, got $blockSize")
+        throw PikPakException(-1, "downloadTo: blockSize must be >= 1, got $blockSize")
     }
     if (totalSize < 0) {
-        throw PikPakException(-1, "directDownloadTo: totalSize must be >= 0, got $totalSize")
+        throw PikPakException(-1, "downloadTo: totalSize must be >= 0, got $totalSize")
     }
 
     dest.parent?.let { if (!SystemFileSystem.exists(it)) SystemFileSystem.createDirectories(it) }
@@ -236,7 +242,7 @@ private suspend fun slideWindow(
 
 /**
  * Marks a failure that came from the destination rather than the network, so
- * the retry loop can tell the two apart. Never escapes [directDownloadTo] —
+ * the retry loop can tell the two apart. Never escapes [RangeSource.downloadTo] —
  * the original is rethrown in its place.
  */
 private class SinkFailure(override val cause: Throwable) : Exception(cause)
@@ -264,57 +270,6 @@ private suspend fun fetchBlock(
         )
     }
     return bytes
-}
-
-/**
- * [RangeSource.downloadTo] over a signed URL, with the [RangeReader] created
- * and closed for you.
- *
- * The reader has nowhere to get a fresh URL from, so a signature that expires
- * mid-download fails the call. Hold a [PikPakFileHandle] and call
- * [RangeSource.downloadTo] on it when downloads outlive a signature — which
- * for anything large they will.
- *
- * Renamed in 0.6.0, and the name changed hands: until 0.5.x `downloadFromUrl`
- * was the single-connection download, now called
- * [PikPakClient.downloadSingleConnectionFromUrl]. A call that passed
- * `expectedSize` by name will not compile against this; one that passed it
- * positionally will compile and fan out to [concurrency] connections instead
- * of one.
- *
- * @param totalSize the file's size if already known; -1 probes it with
- *                  [PikPakClient.remoteSize].
- */
-public suspend fun PikPakClient.downloadFromUrl(
-    url: String,
-    dest: Path,
-    totalSize: Long = -1L,
-    concurrency: Int = DIRECT_DOWNLOAD_CONCURRENCY,
-    priority: Int = 1,
-    blockSize: Long = DIRECT_DOWNLOAD_BLOCK_SIZE,
-    progress: MutableStateFlow<Long>? = null,
-): Long {
-    if (concurrency < 1) {
-        throw PikPakException(-1, "downloadFromUrl: concurrency must be >= 1, got $concurrency")
-    }
-    val size = if (totalSize >= 0L) totalSize else remoteSize(url)
-    val reader = RangeReader(
-        client = this,
-        urlProvider = { url },
-        connectionBudget = minOf(concurrency, connectionBudget),
-    )
-    try {
-        return reader.asRangeSource().downloadTo(
-            dest = dest,
-            totalSize = size,
-            concurrency = concurrency,
-            priority = priority,
-            blockSize = blockSize,
-            progress = progress,
-        )
-    } finally {
-        reader.close()
-    }
 }
 
 private fun existingLength(dest: Path): Long =

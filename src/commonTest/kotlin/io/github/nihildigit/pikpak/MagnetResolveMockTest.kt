@@ -16,6 +16,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -89,15 +90,22 @@ class MagnetResolveMockTest {
         assertNull(parse("""{"list_id":"L","list":{"page_size":500,"resources":[]}}"""))
     }
 
+    // A depth cap of eight used to drop these without a word; pruneOfflineOutput then deleted them as unkept
     @Test
-    fun `the depth cap stops the walk instead of recursing forever`() {
-        val resource = parseMagnetResource(parser.parseToJsonElement(nestedResponse) as JsonObject, maxDepth = 2)
-            ?: error("entries above the cap must still resolve")
-        assertEquals(
-            listOf("E01.mkv", "specials/S00E01.mkv"),
-            resource.files.map { it.path },
-            "the contents of specials/extras sit below the cap and are dropped",
-        )
+    fun `a file twelve folders deep is still listed`() {
+        val leaf = """{"name":"deep.mkv","file_size":"1","is_dir":false,"meta":{"hash":"${"A".repeat(40)}"}}"""
+        val tree = (1..12).fold(leaf) { inner, level ->
+            """{"name":"d$level","is_dir":true,"dir":{"resources":[$inner]}}"""
+        }
+        val response = """{"list":{"resources":[$tree,{"name":"top.mkv","file_size":"1","is_dir":false,"meta":{"hash":"${"B".repeat(40)}"}}]}}"""
+        val resource = parseMagnetResource(parser.parseToJsonElement(response) as JsonObject) ?: error("the tree must resolve")
+        assertTrue(resource.files.any { it.name == "deep.mkv" }, "the deep file was dropped: ${resource.files.map { it.path }}")
+    }
+
+    @Test
+    fun `a paged top level is reported as truncated`() {
+        val paged = """{"list":{"next_page_token":"N","resources":[{"name":"a.mkv","file_size":"1","is_dir":false,"meta":{"hash":"${"A".repeat(40)}"}}]}}"""
+        assertTrue(assertNotNull(parseMagnetResource(parser.parseToJsonElement(paged) as JsonObject)).truncated)
     }
 
     // --- instantCreate ---
@@ -126,25 +134,29 @@ class MagnetResolveMockTest {
     }
 
     @Test
-    fun `a phase other than complete fails instead of returning an id`() = runBlocking<Unit> {
+    fun `a phase other than complete deletes the placeholder and fails with a typed error`() = runBlocking<Unit> {
+        var deleted: String? = null
         val client = clientWith { req ->
-            if (req.url.encodedPath.endsWith("/drive/v1/files")) {
-                // PikPak wants the bytes, and a hash-only caller has none.
-                respondJson(
-                    """{"file":{"id":"PENDINGID","phase":"PHASE_TYPE_PENDING"},""" +
-                        """"resumable":{"params":{"bucket":"b"}}}""",
-                )
-            } else {
-                respond404()
+            when {
+                req.method.value == "DELETE" && req.url.encodedPath.startsWith("/drive/v1/files/") -> {
+                    deleted = req.url.encodedPath.substringAfterLast('/')
+                    respondJson("{}")
+                }
+                req.url.encodedPath.endsWith("/drive/v1/files") ->
+                    // PikPak wants the bytes, and a hash-only caller has none.
+                    respondJson(
+                        """{"file":{"id":"PENDINGID","phase":"PHASE_TYPE_PENDING"},""" +
+                            """"resumable":{"params":{"bucket":"b"}}}""",
+                    )
+                else -> respond404()
             }
         }
-        val e = assertFailsWith<PikPakException> {
+        val e = assertFailsWith<InstantContentUnavailableException> {
             client.instantCreate(ResolvedFile("a.iso", 42L, "AABB"), parentId = "")
         }
-        assertTrue(
-            e.message!!.contains("PHASE_TYPE_PENDING"),
-            "the failure must name the phase that was returned: ${e.message}",
-        )
+        assertEquals("PHASE_TYPE_PENDING", e.phase)
+        // Left alone, the pending node stays in the folder forever and a retry adds a "(1)" copy.
+        assertEquals("PENDINGID", deleted, "the placeholder must be deleted")
         client.close()
     }
 

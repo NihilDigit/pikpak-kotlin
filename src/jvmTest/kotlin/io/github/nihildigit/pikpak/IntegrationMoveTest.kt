@@ -3,8 +3,7 @@ package io.github.nihildigit.pikpak
 import io.github.cdimascio.dotenv.dotenv
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 import kotlin.time.Clock
 import org.junit.jupiter.api.Assumptions
 
@@ -45,20 +44,19 @@ class IntegrationMoveTest {
             val dstId = client.createFolder(parentId = "", name = dstName).also(created::add)
             val payloadId = client.createFolder(parentId = srcId, name = "payload").also(created::add)
 
-            assertNotNull(
-                client.listFiles(srcId).firstOrNull { it.id == payloadId },
+            assertTrue(
+                eventually("payload listed in src/") { client.listFiles(srcId).any { it.id == payloadId } },
                 "payload should start in src/",
             )
 
             client.batchMove(ids = listOf(payloadId), toParentId = dstId)
 
-            assertEquals(
-                0,
-                client.listFiles(srcId).count { it.id == payloadId },
+            assertTrue(
+                eventually("payload gone from src/") { client.listFiles(srcId).none { it.id == payloadId } },
                 "after move, src/ should no longer contain payload",
             )
-            assertNotNull(
-                client.listFiles(dstId).firstOrNull { it.id == payloadId },
+            assertTrue(
+                eventually("payload listed in dst/") { client.listFiles(dstId).any { it.id == payloadId } },
                 "after move, dst/ should contain payload",
             )
         } finally {

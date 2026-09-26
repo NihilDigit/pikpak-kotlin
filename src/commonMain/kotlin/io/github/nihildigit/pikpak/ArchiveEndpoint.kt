@@ -9,6 +9,7 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -353,8 +354,13 @@ suspend fun PikPakClient.copyFromArchiveTree(
             jsonBody(json, body)
         }
     }
-    return (response as? JsonObject)?.get("task_id")?.jsonPrimitive?.contentOrNull.orEmpty()
+    return response.taskIdOrThrow("copyFromArchiveTree")
 }
+
+/** The `task_id` a task-starting call answers with. "" would only fail later, in getTask, without context. */
+private fun JsonElement.taskIdOrThrow(op: String): String =
+    ((this as? JsonObject)?.get("task_id") as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotEmpty() }
+        ?: throw PikPakException(-1, "$op: response missing task_id", rawBody = toString())
 
 /**
  * Turns the folder [folderId] into a single `.tar` file in place
@@ -381,7 +387,7 @@ suspend fun PikPakClient.packFolder(folderId: String): String {
     ) { jsonBody(json, buildJsonObject { put("folderId", folderId) }) }
     // A cached path may now resolve to a file.
     folderIds.invalidateAll()
-    return (response as JsonObject)["task_id"]?.jsonPrimitive?.contentOrNull.orEmpty()
+    return response.taskIdOrThrow("packFolder")
 }
 
 /**

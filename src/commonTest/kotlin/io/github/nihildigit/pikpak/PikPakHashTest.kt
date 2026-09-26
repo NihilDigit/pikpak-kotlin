@@ -35,8 +35,9 @@ class PikPakHashTest {
         assertEquals("8d8e0641a07d3b8680976cfe8b4d0aca47d0f844", hashOf(bytes))
     }
 
+    // The reference prints lower case; the SDK hands out the server's upper case
     private fun hashOf(bytes: ByteArray): String {
         val buf = Buffer().apply { write(bytes, 0, bytes.size) }
-        return PikPakHash.fromSource(buf, bytes.size.toLong())
+        return PikPakHash.fromSource(buf, bytes.size.toLong()).also { assertEquals(it.uppercase(), it) }.lowercase()
     }
 }

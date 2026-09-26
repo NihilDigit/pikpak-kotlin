@@ -16,7 +16,7 @@ import kotlin.test.assertTrue
 
 class OfflinePruneMockTest {
 
-    private val done = OfflineTask(id = "T", phase = TaskPhase.COMPLETE, fileId = "ROOT")
+    private val done = DriveTask(id = "T", phase = TaskPhase.COMPLETE, fileId = "ROOT")
 
     // ROOT/
     //   01.mkv          keep

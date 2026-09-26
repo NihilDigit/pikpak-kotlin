@@ -40,10 +40,12 @@ data class FileStat(
      */
     @SerialName("delete_time") val deleteTime: String = "",
     /**
-     * Server-supplied extras. `url` holds the original magnet for anything an
-     * offline task produced, which is the only place that association is
-     * recorded — the tasks endpoint cannot be queried by URL or info hash.
-     * Also carries `duration`, `width`, `height` for media.
+     * Server-supplied extras. `url` holds where the item came from: the magnet
+     * for anything an offline task produced, which is the only place that
+     * association is recorded — the tasks endpoint cannot be queried by URL or
+     * info hash — or the `https://mypikpak.com/s/<shareId>` link for anything
+     * restored from a share (see [shareIdFromUrl]). Also carries `duration`,
+     * `width`, `height` for media.
      */
     val params: Map<String, String> = emptyMap(),
     /**
@@ -60,7 +62,7 @@ data class FileStat(
     val isFile: Boolean get() = kind == FileKind.FILE
     val sizeBytes: Long get() = size.toLongOrNull() ?: 0L
 
-    /** The magnet this file came from, when an offline task produced it. */
+    /** Where the item came from: a magnet or a share link, see [params]. Null when neither. */
     val sourceUrl: String? get() = params["url"]
 }
 
@@ -222,7 +224,7 @@ data class FileDetail(
 ) {
     val sizeBytes: Long get() = size.toLongOrNull() ?: 0L
 
-    /** The magnet this file came from, when an offline task produced it. */
+    /** Where the item came from: a magnet or a share link, see [FileStat.params]. Null when neither. */
     val sourceUrl: String? get() = params["url"]
 
     /** The `application/octet-stream` link — the raw file — or an empty one. */

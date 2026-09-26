@@ -5,7 +5,6 @@ import io.ktor.http.HttpMethod
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonObject
 
 private const val DRIVE = PikPakConstants.DRIVE_BASE
 private const val FILES_PATH = "/drive/v1/files"
@@ -40,6 +39,9 @@ object FileFilter {
 
     /** Match one of [FileKind.FOLDER] / [FileKind.FILE]. Verified working. */
     fun kind(value: String): Pair<String, JsonElement> = "kind" to eq(value)
+
+    /** In the trash or not. A real boolean on the wire: the string "false" is not the same filter. */
+    fun trashed(value: Boolean): Pair<String, JsonElement> = "trashed" to buildJsonObject { put("eq", value) }
 
     /**
      * Starred entries only: `system_tag` `{"in": "STAR"}`, the filter the web
@@ -100,9 +102,7 @@ suspend fun PikPakClient.listFilesPaged(
     extraFilters: Map<String, JsonElement> = emptyMap(),
 ): FileListPage {
     val filters = buildJsonObject {
-        // trashed is a real boolean on the wire, not the string "false".
-        putJsonObject("trashed") { put("eq", false) }
-        for ((field, expr) in extraFilters) put(field, expr)
+        for ((field, expr) in mapOf(FileFilter.trashed(false)) + extraFilters) put(field, expr)
     }
     val query = mutableMapOf(
         "thumbnail_size" to THUMBNAIL_SIZE,

@@ -65,8 +65,9 @@ data class DriveEvent(
      */
     val progress: Int = 0,
     /**
-     * The file itself, embedded in full (same shape as [getFile], thumbnail
-     * included). Null when the server has nothing to embed.
+     * The file itself, decoded in the listing shape: name, size, kind, thumbnail.
+     * Links and media variants are not kept; ask [getFile] for those. Null when
+     * the server has nothing to embed.
      */
     @SerialName("reference_resource") val file: FileStat? = null,
 ) {

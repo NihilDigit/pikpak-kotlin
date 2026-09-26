@@ -15,6 +15,11 @@ import kotlinx.coroutines.sync.withLock
  * surgical invalidation would have to model every cached path that could pass
  * through a renamed segment.
  *
+ * A lookup that was already on the network when the map was dropped must not
+ * put its answer back: it may name the folder the mutation just deleted. So a
+ * put carries the [generation] its lookup started in, and one from before the
+ * last drop is discarded.
+ *
  * Nothing here is authoritative: a folder deleted from another device leaves a
  * stale entry until the next mutation or 404, and the caller then sees the
  * same error it would have seen without the cache.
@@ -22,36 +27,28 @@ import kotlinx.coroutines.sync.withLock
 internal class FolderIdCache {
     private val mutex = Mutex()
     private val entries = mutableMapOf<String, String>()
+    private var generation = 0L
+
+    /**
+     * Held across a resolve-or-create walk, so two coroutines of this process
+     * asking for the same missing folder create it once rather than twice.
+     * Only the creating walk takes it; lookups do not.
+     */
+    val creation = Mutex()
+
+    suspend fun generation(): Long = mutex.withLock { generation }
 
     suspend fun get(parentId: String, path: String): String? = mutex.withLock {
         entries[key(parentId, path)]
     }
 
-    suspend fun put(parentId: String, path: String, folderId: String) = mutex.withLock {
-        entries[key(parentId, path)] = folderId
+    suspend fun put(parentId: String, path: String, folderId: String, lookupGeneration: Long) = mutex.withLock {
+        if (lookupGeneration == generation) entries[key(parentId, path)] = folderId
     }
 
     suspend fun invalidateAll() = mutex.withLock {
         entries.clear()
-    }
-
-    /**
-     * Drops one folder and everything cached beneath it.
-     *
-     * For a caller that has just watched one specific folder answer 404, which
-     * is narrower than what a rename or a move can break: the folder is gone
-     * rather than relocated, so the only entries that can be wrong are the ones
-     * whose path ran through it, and under a fixed parent those are exactly its
-     * descendants. Everything else still resolves, which is why this does not
-     * fall back on [invalidateAll].
-     *
-     * Descendants have to go as well — `pack` disappearing takes
-     * `pack/specials` with it, and that entry names an id that is equally dead.
-     */
-    suspend fun invalidate(parentId: String, path: String) = mutex.withLock {
-        val exact = key(parentId, path)
-        val subtree = exact + '/'
-        entries.keys.retainAll { it != exact && !it.startsWith(subtree) }
+        generation++
     }
 
     // The separator is NUL because it can occur in neither a PikPak file id

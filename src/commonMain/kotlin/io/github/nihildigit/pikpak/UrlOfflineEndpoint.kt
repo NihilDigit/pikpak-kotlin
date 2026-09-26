@@ -8,55 +8,14 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 
-/**
- * Values PikPak uses for [OfflineTask.phase] and [FileDetail.phase]. Exported
- * because polling a task means comparing against them, and a caller that has
- * to spell the strings itself gets no compiler help when one is mistyped.
- */
-object TaskPhase {
-    const val PENDING = "PHASE_TYPE_PENDING"
-    const val RUNNING = "PHASE_TYPE_RUNNING"
-    const val COMPLETE = "PHASE_TYPE_COMPLETE"
-    const val ERROR = "PHASE_TYPE_ERROR"
-
-    /** The two phases a task never leaves. */
-    val TERMINAL: Set<String> = setOf(COMPLETE, ERROR)
-}
-
-/**
- * Snapshot of an offline-download task. PikPak surfaces the same shape from both
- * the URL submission endpoint (`POST /drive/v1/files` with `UPLOAD_TYPE_URL`) and
- * the task listing endpoint (`GET /drive/v1/tasks`), so this model is unified.
- * `fileId` / `fileName` / `fileSize` populate once the task finishes resolving.
- */
-@Serializable
-data class OfflineTask(
-    val id: String = "",
-    val kind: String = "",
-    val name: String = "",
-    val type: String = "",
-    @SerialName("user_id") val userId: String = "",
-    val phase: String = "",
-    val progress: Int = 0,
-    val message: String = "",
-    @SerialName("status_size") val statusSize: Int = 0,
-    val params: Map<String, String> = emptyMap(),
-    @SerialName("file_id") val fileId: String = "",
-    @SerialName("file_name") val fileName: String = "",
-    @SerialName("file_size") val fileSize: String = "0",
-    @SerialName("created_time") val createdTime: String? = null,
-    @SerialName("updated_time") val updatedTime: String? = null,
-)
-
 /** Page of offline tasks returned by [listOfflineTasks]. */
 @Serializable
 data class TaskListResponse(
-    val tasks: List<OfflineTask> = emptyList(),
+    val tasks: List<DriveTask> = emptyList(),
     @SerialName("next_page_token") val nextPageToken: String? = null,
 )
 
@@ -69,8 +28,8 @@ data class TaskListResponse(
  * whose fields happen to be default-initialised with the no-task case.
  */
 sealed class CreateUrlResult {
-    /** PikPak accepted the URL and queued a task; poll [OfflineTask.id]. */
-    data class Queued(val task: OfflineTask) : CreateUrlResult()
+    /** PikPak accepted the URL and queued a task; poll it with [getTask]. */
+    data class Queued(val task: DriveTask) : CreateUrlResult()
 
     /**
      * PikPak recognized the URL as already-fetched and did not create a task.
@@ -94,7 +53,7 @@ sealed class CreateUrlResult {
 /**
  * Submits a remote URL to PikPak's cloud-download (offline download) queue.
  * Returns [CreateUrlResult.Queued] when a task is created (the usual path;
- * poll via [listOfflineTasks]) or [CreateUrlResult.InstantComplete] when
+ * poll it with [getTask]) or [CreateUrlResult.InstantComplete] when
  * PikPak recognized the URL and fulfilled it without a task. Pass `""`
  * for [parentId] to drop the result into the root drive.
  *
@@ -114,71 +73,20 @@ suspend fun PikPakClient.createUrlFile(parentId: String, url: String): CreateUrl
         url = "${PikPakConstants.DRIVE_BASE}/drive/v1/files",
         captchaAction = "POST:/drive/v1/files",
     ) { jsonBody(json, body) }
-    val obj = response as JsonObject
-    val taskNode = obj["task"]?.jsonObject
+    // as? rather than jsonObject: an explicit null must count as absent, not throw a cast failure
+    val obj = response as? JsonObject ?: throw PikPakException(-1, "createUrlFile: bad response shape", rawBody = response.toString())
+    val taskNode = obj["task"] as? JsonObject
         ?: return CreateUrlResult.InstantComplete(
             raw = obj,
-            file = obj["file"]?.jsonObject?.let { json.decodeFromJsonElement(FileStat.serializer(), it) },
+            file = (obj["file"] as? JsonObject)?.let { json.decodeFromJsonElement(FileStat.serializer(), it) },
         )
-    val task = json.decodeFromJsonElement(OfflineTask.serializer(), taskNode)
+    val task = json.decodeFromJsonElement(DriveTask.serializer(), taskNode)
     return CreateUrlResult.Queued(task)
 }
 
-/**
- * Fetches one offline task by id (`GET /drive/v1/tasks/{id}`). Use this to
- * poll a task you submitted instead of listing every task on the account and
- * searching it — a poll loop over [listOfflineTasks] pulls the whole table
- * once every interval.
- *
- * The single-task response and the listing do not always agree. The listing
- * defaults to `with=reference_resource`, which overlays the state of the file
- * the task produced: a task whose output file was later deleted reads as
- * `PHASE_TYPE_ERROR` / "File deleted" in the listing while this endpoint still
- * reports the task's own `PHASE_TYPE_COMPLETE` / "Saved". Ask this endpoint
- * about the transfer, the listing about the file.
- */
-suspend fun PikPakClient.getTask(taskId: String): OfflineTask {
-    require(taskId.isNotEmpty()) { "taskId must not be empty" }
-    val response = http.request(
-        method = HttpMethod.Get,
-        url = "${PikPakConstants.DRIVE_BASE}/drive/v1/tasks/$taskId",
-        captchaAction = "GET:/drive/v1/tasks",
-    )
-    return json.decodeFromJsonElement(OfflineTask.serializer(), response)
-}
-
-/**
- * Queues an offline task again (`POST /drive/v1/task` with `create_type`
- * `RETRY`; note the singular path) and returns the task as the server now
- * reports it.
- *
- * Observed 2026-09-23: the server also accepts a task that is still RUNNING.
- * The task keeps its id, goes back to PENDING, counts up
- * `params["retry_times"]` and gets a new [OfflineTask.fileId], so a caller
- * holding the old file id has to read it again from the returned task.
- *
- * Accepted is not the same as retried. A finished task whose file was later
- * deleted went RUNNING and then, two seconds on, ERROR "Save failed, retry
- * please" (observed 2026-09-23), and so did every retry of a real save
- * failure tried that day. Submitting `params["url"]` again through
- * [createUrlFile] completed where RETRY did not.
- */
-suspend fun PikPakClient.retryOfflineTask(taskId: String): OfflineTask {
-    require(taskId.isNotEmpty()) { "taskId must not be empty" }
-    val body = buildJsonObject {
-        put("type", "offline")
-        put("create_type", "RETRY")
-        put("id", taskId)
-    }
-    val response = http.request(
-        method = HttpMethod.Post,
-        url = "${PikPakConstants.DRIVE_BASE}/drive/v1/task",
-        captchaAction = "POST:/drive/v1/task",
-    ) { jsonBody(json, body) }
-    val taskNode = (response as JsonObject)["task"]?.jsonObject
-        ?: throw PikPakException(-1, "retryOfflineTask: response missing task")
-    return json.decodeFromJsonElement(OfflineTask.serializer(), taskNode)
-}
+// A retryOfflineTask (create_type RETRY) stood here with no caller, and did not work: every task
+// retried on 2026-09-23 went back to ERROR "Save failed, retry please", while submitting
+// params["url"] again through createUrlFile completed. That is the retry.
 
 /**
  * Deletes offline-task records (`DELETE /drive/v1/tasks`). No-op when
@@ -228,9 +136,10 @@ suspend fun PikPakClient.clearOfflineTasks(phases: Collection<String>, deleteFil
 
 /**
  * Lists offline-download tasks on the account. Server-side `filters` is a JSON
- * string wrapping a `phase.in` match — the default catches running + errored
- * tasks, which is what callers polling for completion usually want. Pass
- * e.g. `"PHASE_TYPE_COMPLETE,PHASE_TYPE_ERROR"` to inspect finished work.
+ * string wrapping a `phase.in` match. The default, running and errored, is the
+ * "what is in progress or broken" view; it leaves out PENDING, where a fresh
+ * task starts, and COMPLETE, so it is no way to wait for one task to finish.
+ * Pass e.g. `"PHASE_TYPE_COMPLETE,PHASE_TYPE_ERROR"` to inspect finished work.
  *
  * This is the raw listing and waits for nothing. To follow one known task use
  * [getTask]; the server has no `id` filter here and answers 400.
