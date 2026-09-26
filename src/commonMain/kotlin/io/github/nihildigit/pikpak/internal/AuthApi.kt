@@ -1,21 +1,18 @@
 package io.github.nihildigit.pikpak.internal
 
-import io.github.nihildigit.pikpak.ErrorCodes
 import io.github.nihildigit.pikpak.PikPakClient
 import io.github.nihildigit.pikpak.PikPakConstants
 import io.github.nihildigit.pikpak.PikPakException
 import io.github.nihildigit.pikpak.Session
+import io.github.nihildigit.pikpak.isUsable
 import io.github.nihildigit.pikpak.toHex
 import io.ktor.http.HttpMethod
 import kotlinx.coroutines.sync.withLock
 import kotlin.time.Clock
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
@@ -25,15 +22,15 @@ import org.kotlincrypto.hash.md.MD5
 private const val SESSION_EXPIRY_SKEW_SEC = 5L * 60L
 
 /**
- * Auth state machine. Three flows:
- *  - [loginLocked]: try cached session → refresh if expired → full signin if refresh fails.
- *  - [refreshAccessToken]: POST /v1/auth/token with refresh_token grant.
+ * Auth state machine.
+ *  - [loginLocked] and [reauthenticateLocked]: one ladder, see [authenticateLocked].
  *  - [refreshCaptchaToken]: re-issue X-Captcha-Token for a given action when
  *    the server rejects with `error_code=9`. Uses the salt-cascade signing
  *    derived from the official Android client.
  *
  * Mutex policy:
- *  - [loginLocked] assumes the caller already holds [PikPakClient.mutex].
+ *  - [loginLocked] and [reauthenticateLocked] assume the caller already holds
+ *    [PikPakClient.mutex].
  *  - [refreshCaptchaToken] takes the mutex itself — it's called from inside
  *    `HttpEngine.request`, which never holds the mutex.
  *
@@ -44,28 +41,68 @@ private const val SESSION_EXPIRY_SKEW_SEC = 5L * 60L
  */
 internal class AuthApi(private val pikpak: PikPakClient) {
 
-    suspend fun loginLocked(): Session {
-        // A live in-memory session outranks anything the store can return: it
-        // is at least as fresh, and consulting the store first made the cost of
-        // every login() call a function of the store implementation's quality.
-        pikpak.state.session?.let { if (isUsable(it)) return it }
+    /** A session that can authorize a request. */
+    suspend fun loginLocked(): Session = authenticateLocked(rejected = null)
 
-        pikpak.sessionStore.load(pikpak.account)?.let { cached ->
-            // Only publish the cached session once it is known good. Publishing
-            // first left state.session holding an unusable token whenever the
-            // refresh below threw something other than PikPakException, and
-            // every subsequent request went out with that token.
-            if (isUsable(cached)) {
-                pikpak.state.session = cached
-                return cached
-            }
-            try {
-                return refreshAccessTokenLocked(cached.refreshToken)
-            } catch (_: PikPakException) {
-                // fall through to full signin
-            }
+    /**
+     * After the server refused [previous] (HTTP 401) although it had not reached its own
+     * expiry. The same ladder, passing over any session that still carries the refused token.
+     * If another coroutine already replaced it while this one waited for the lock, that
+     * replacement is returned and no round trip happens.
+     */
+    suspend fun reauthenticateLocked(previous: Session?): Session =
+        authenticateLocked(rejected = previous?.accessToken)
+
+    /**
+     * The one ladder, cheapest first:
+     *  1. the in-memory session, if it can authorize and is not the refused one;
+     *  2. the stored one, on the same test — another process sharing the store may have
+     *     rotated it since this one loaded;
+     *  3. a refresh with each refresh token on hand, memory's first;
+     *  4. a password sign-in, once.
+     *
+     * Two partial ladders stood here before, and each skipped a rung the other had. login()
+     * ignored an expired in-memory session's refresh token, and the 401 path never read the
+     * store, so a request made before login() went from a missing header straight to a
+     * password sign-in while a valid session sat on disk.
+     *
+     * A refresh the server refuses for any reason moves on to the next rung; one that fails
+     * on the wire is thrown, because signing in over a network that just dropped a request
+     * only fails the same way while costing a password prompt.
+     */
+    private suspend fun authenticateLocked(rejected: String?): Session {
+        val memory = pikpak.state.session
+        if (memory != null && memory.accessToken != rejected && memory.isUsable()) return memory
+
+        val stored = pikpak.sessionStore.load(pikpak.account)
+        if (stored != null && stored.accessToken != rejected && stored.isUsable()) {
+            pikpak.state.session = stored
+            return stored
         }
+
+        var deadRefreshToken = false
+        val refreshTokens = listOfNotNull(memory?.refreshToken, stored?.refreshToken).filter { it.isNotEmpty() }.distinct()
+        for (token in refreshTokens) {
+            val refreshed = try {
+                refreshLocked(token)
+            } catch (_: PikPakException) {
+                continue
+            }
+            if (refreshed != null) return refreshed
+            deadRefreshToken = true
+        }
+        // The dead session goes before the sign-in, not after it succeeds: a sign-in that then
+        // fails (no password to give, a wrong one) would otherwise leave the caller a store
+        // that retries the same dead token on every start. Callers used to clear it themselves
+        // on isRefreshTokenInvalid, which never reached them because the sign-in failure is
+        // what they saw.
+        if (deadRefreshToken) forgetSessionLocked()
         return signInLocked()
+    }
+
+    private suspend fun forgetSessionLocked() {
+        pikpak.state.session = null
+        pikpak.sessionStore.clear(pikpak.account)
     }
 
     private suspend fun signInLocked(): Session {
@@ -82,66 +119,36 @@ internal class AuthApi(private val pikpak: PikPakClient) {
             HttpMethod.Post,
             "${PikPakConstants.USER_BASE}/v1/auth/signin",
         ) { jsonBody(pikpak.json, body) }
-        ensureOk(response, "signin")
-        val session = response.toSession()
+        val session = ensureOk(response, "signin").toSession()
         commitSession(session)
         return session
     }
 
-    private suspend fun refreshAccessTokenLocked(refreshToken: String): Session {
+    /**
+     * A new session from [refreshToken], or null when the server says that token is dead.
+     * It reports a dead token either as a 2xx envelope or as a 4xx carrying the same
+     * envelope, and requestRaw throws for the latter, so both shapes are checked.
+     */
+    private suspend fun refreshLocked(refreshToken: String): Session? {
         val body = buildJsonObject {
             put("client_id", PikPakConstants.CLIENT_ID)
             put("client_secret", PikPakConstants.CLIENT_SECRET)
             put("grant_type", "refresh_token")
             put("refresh_token", refreshToken)
         }
-        // The server reports a dead refresh token either as a 2xx envelope
-        // or as a 4xx carrying the same envelope; requestRaw throws for the
-        // latter, so both shapes are checked.
         val response = try {
             pikpak.http.requestRaw(
                 HttpMethod.Post,
                 "${PikPakConstants.USER_BASE}/v1/auth/token",
             ) { jsonBody(pikpak.json, body) }
         } catch (e: PikPakException) {
-            if (e.isRefreshTokenInvalid) return signInLocked()
+            if (e.isRefreshTokenInvalid) return null
             throw e
         }
-        val errorCode = (response as? JsonObject)?.get("error_code")
-            ?.let { (it as? JsonPrimitive)?.intOrNull } ?: 0
-        if (errorCode == ErrorCodes.REFRESH_TOKEN_INVALID) {
-            return signInLocked()
-        }
-        ensureOk(response, "refresh_token")
-        val session = response.toSession()
+        response.envelopeError()?.let { if (it.isRefreshTokenInvalid) return null }
+        val session = ensureOk(response, "refresh_token").toSession()
         commitSession(session)
         return session
-    }
-
-    /**
-     * Re-authenticates after the server rejected a token it had previously
-     * issued (HTTP 401). Distinct from [loginLocked], which trusts a session
-     * that has not reached its own expiry — exactly the session the server just
-     * refused.
-     *
-     * [previous] is the session the failing request used. If another coroutine
-     * already replaced it while this one waited for the lock, that replacement
-     * is the re-auth we wanted and no second round trip happens.
-     */
-    suspend fun reauthenticateLocked(previous: Session?): Session {
-        val current = pikpak.state.session
-        if (current != null && current.accessToken.isNotEmpty() && current.accessToken != previous?.accessToken) {
-            return current
-        }
-        val refreshToken = current?.refreshToken.orEmpty()
-        if (refreshToken.isNotEmpty()) {
-            try {
-                return refreshAccessTokenLocked(refreshToken)
-            } catch (_: PikPakException) {
-                // fall through to full signin
-            }
-        }
-        return signInLocked()
     }
 
     /**
@@ -152,6 +159,10 @@ internal class AuthApi(private val pikpak: PikPakClient) {
      * because a snapshot taken here would be taken too late — a coroutine
      * that reaches this point after the first refresh has completed would
      * snapshot the fresh token and refresh it again.
+     *
+     * One token for every action, although captcha/init is asked per action.
+     * A token minted for one action has so far been accepted on all of them;
+     * whether the server would ever bind it is not measured.
      */
     suspend fun refreshCaptchaToken(action: String, rejected: String) {
         pikpak.mutex.withLock {
@@ -193,8 +204,7 @@ internal class AuthApi(private val pikpak: PikPakClient) {
         val response = pikpak.http.requestRaw(HttpMethod.Post, url) {
             jsonBody(pikpak.json, body)
         }
-        ensureOk(response, "captcha_refresh")
-        val token = (response as JsonObject)["captcha_token"]?.jsonPrimitive?.contentOrNull.orEmpty()
+        val token = ensureOk(response, "captcha_refresh")["captcha_token"]?.jsonPrimitive?.contentOrNull.orEmpty()
         pikpak.state.captchaToken = token
     }
 
@@ -211,8 +221,7 @@ internal class AuthApi(private val pikpak: PikPakClient) {
             HttpMethod.Post,
             "${PikPakConstants.USER_BASE}/v1/shield/captcha/init",
         ) { jsonBody(pikpak.json, body) }
-        ensureOk(response, "captcha_init")
-        val token = (response as JsonObject)["captcha_token"]?.jsonPrimitive?.contentOrNull.orEmpty()
+        val token = ensureOk(response, "captcha_init")["captcha_token"]?.jsonPrimitive?.contentOrNull.orEmpty()
         pikpak.state.captchaToken = token
         return token
     }
@@ -227,37 +236,23 @@ internal class AuthApi(private val pikpak: PikPakClient) {
         pikpak.sessionStore.save(pikpak.account, session)
     }
 
-    private fun isExpired(session: Session): Boolean {
-        val now = Clock.System.now().epochSeconds
-        return session.expiresAt <= now
-    }
-
-    /**
-     * A session is only worth reusing if it can actually authorize a request.
-     * SessionStore implementations that hand back a placeholder carrying just a
-     * refresh token report a blank access token, and `Authorization: Bearer `
-     * fails every call until something forces a re-login.
-     */
-    private fun isUsable(session: Session): Boolean =
-        session.accessToken.isNotEmpty() && !isExpired(session)
-
-    private fun JsonElement.toSession(): Session {
-        val obj = jsonObject
-        val accessToken = obj["access_token"]?.jsonPrimitive?.contentOrNull.orEmpty()
-        val refreshToken = obj["refresh_token"]?.jsonPrimitive?.contentOrNull.orEmpty()
-        val sub = obj["sub"]?.jsonPrimitive?.contentOrNull.orEmpty()
-        val expiresIn = obj["expires_in"]?.jsonPrimitive?.longOrNull ?: 0L
+    private fun JsonObject.toSession(): Session {
+        val accessToken = this["access_token"]?.jsonPrimitive?.contentOrNull.orEmpty()
+        val refreshToken = this["refresh_token"]?.jsonPrimitive?.contentOrNull.orEmpty()
+        val sub = this["sub"]?.jsonPrimitive?.contentOrNull.orEmpty()
+        val expiresIn = this["expires_in"]?.jsonPrimitive?.longOrNull ?: 0L
         val expiresAt = Clock.System.now().epochSeconds + expiresIn - SESSION_EXPIRY_SKEW_SEC
         return Session(accessToken, refreshToken, sub, expiresAt)
     }
 
-    private fun ensureOk(response: JsonElement, op: String) {
-        val obj = response as? JsonObject ?: throw PikPakException(-1, "$op: bad response shape")
-        val code = (obj["error_code"] as? JsonPrimitive)?.intOrNull ?: 0
-        if (code != 0) {
-            val msg = (obj["error"] as? JsonPrimitive)?.contentOrNull.orEmpty()
-            val desc = (obj["error_description"] as? JsonPrimitive)?.contentOrNull
-            throw PikPakException(code, "$op: $msg", desc)
-        }
+    /**
+     * The response as an object, or the error its envelope carries. The envelope goes through
+     * the same conversion as every API call, so predicates such as isCaptchaRequired read the
+     * server's own `error`: this used to prefix it with the operation name, which made a
+     * captcha rejection on a 2xx look like something else than the same rejection on a 400.
+     */
+    private fun ensureOk(response: JsonElement, op: String): JsonObject {
+        response.envelopeError()?.let { throw it }
+        return response as? JsonObject ?: throw PikPakException(-1, "$op: bad response shape", rawBody = response.toString())
     }
 }

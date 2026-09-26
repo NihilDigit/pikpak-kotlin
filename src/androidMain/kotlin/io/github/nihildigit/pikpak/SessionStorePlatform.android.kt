@@ -3,15 +3,12 @@ package io.github.nihildigit.pikpak
 import kotlinx.io.files.Path
 
 /**
- * Android-default path. `user.home` on Android typically resolves to the
- * process root (`/`) which is not writable — consumers that care about a
- * stable on-disk location should instead construct
- * `FileSessionStore(dir = Path(context.filesDir.absolutePath, "pikpak-kotlin"))`
- * from their application, or swap in [InMemorySessionStore].
+ * There is no default on Android. `user.home` resolves to the process root there, which is not
+ * writable, and a path that fails only on the first save let a sign-in succeed on the network
+ * and then report failure. So a [FileSessionStore] or a [PikPakClient] built with the defaults
+ * fails here, at construction, saying what to pass instead.
  */
-actual fun defaultSessionDir(): Path {
-    val xdg = System.getenv("XDG_CONFIG_HOME")?.takeIf { it.isNotBlank() }
-    val home = System.getProperty("user.home") ?: "."
-    val base = xdg ?: "$home/.config"
-    return Path("$base/pikpak-kotlin")
-}
+actual fun defaultSessionDir(): Path = throw IllegalStateException(
+    "No default session directory on Android: pass FileSessionStore(dir = Path(context.filesDir.absolutePath, \"pikpak-kotlin\")) " +
+        "or your own SessionStore to PikPakClient",
+)

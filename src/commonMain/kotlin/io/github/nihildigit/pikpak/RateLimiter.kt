@@ -1,8 +1,11 @@
 package io.github.nihildigit.pikpak
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
@@ -33,6 +36,7 @@ class RateLimiter(
     private var nextReleaseAt = TimeSource.Monotonic.markNow()
 
     suspend fun acquire() {
+        val interval = (1000.0 / refillPerSecond).toLong().coerceAtLeast(1).milliseconds
         val waitFor = mutex.withLock {
             val now = TimeSource.Monotonic.markNow()
             refill(now)
@@ -54,14 +58,29 @@ class RateLimiter(
                 // — with a caller arriving later able to take a free token
                 // ahead of an already-queued waiter.
                 tokens -= 1.0
-                val interval = (1000.0 / refillPerSecond).toLong().coerceAtLeast(1).milliseconds
                 val base = if (nextReleaseAt < now) now else nextReleaseAt
                 val myReleaseAt = base + interval
                 nextReleaseAt = myReleaseAt
                 myReleaseAt - now
             }
         }
-        if (waitFor > Duration.ZERO) delay(waitFor)
+        if (waitFor <= Duration.ZERO) return
+        try {
+            delay(waitFor)
+        } catch (e: CancellationException) {
+            // A waiter that gives up returns its reservation. Kept, fifty queued calls from a
+            // cancelled search left the bucket fifty tokens short and the next request waiting
+            // ten seconds behind nobody. Pulling the next slot back may let a later caller fire
+            // in the same interval as a waiter still queued; the tokens still bound the rate.
+            withContext(NonCancellable) {
+                mutex.withLock {
+                    tokens += 1.0
+                    val now = TimeSource.Monotonic.markNow()
+                    nextReleaseAt = (nextReleaseAt - interval).let { if (it < now) now else it }
+                }
+            }
+            throw e
+        }
     }
 
     private fun refill(now: kotlin.time.TimeSource.Monotonic.ValueTimeMark) {
@@ -78,17 +97,5 @@ class RateLimiter(
 
         /** Disable rate limiting (use only when you know the workload won't trip captcha). */
         fun unlimited(): RateLimiter = RateLimiter(capacity = Int.MAX_VALUE, refillPerSecond = 1e9)
-
-        @Deprecated(
-            "Each access creates a new limiter — rename makes that explicit.",
-            ReplaceWith("RateLimiter.default()"),
-        )
-        val Default: RateLimiter get() = default()
-
-        @Deprecated(
-            "Each access creates a new limiter — rename makes that explicit.",
-            ReplaceWith("RateLimiter.unlimited()"),
-        )
-        val Unlimited: RateLimiter get() = unlimited()
     }
 }

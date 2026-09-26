@@ -4,7 +4,9 @@ import io.github.nihildigit.pikpak.ErrorCodes
 import io.github.nihildigit.pikpak.PikPakClient
 import io.github.nihildigit.pikpak.PikPakConstants
 import io.github.nihildigit.pikpak.PikPakException
+import io.github.nihildigit.pikpak.Session
 import io.github.nihildigit.pikpak.UrlExpiredException
+import io.github.nihildigit.pikpak.isUsable
 import io.ktor.client.HttpClient
 import io.ktor.client.network.sockets.ConnectTimeoutException
 import io.ktor.client.network.sockets.SocketTimeoutException
@@ -39,12 +41,16 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import kotlin.concurrent.Volatile
 
 /**
- * Internal HTTP layer. Handles the three things every PikPak request needs:
+ * Internal HTTP layer. Handles what every PikPak request needs:
  *  1. Rate limiting (token bucket — surface area for tuning lives on the client).
  *  2. Standard headers (User-Agent, Authorization, X-Device-Id, X-Captcha-Token).
- *  3. Failure recovery: transient HTTP/network and 5xx/429 → backoff retry;
+ *  3. Authentication on demand: a request with no session, or one past its
+ *     expiry, logs in first; an HTTP 401 re-authenticates and retries once.
+ *  4. Failure recovery: transient HTTP/network and 5xx/429 → backoff retry,
+ *     except where the server may already have acted (see [execute]);
  *     PikPak `error_code=9` (captcha required) → refresh captcha for the action
  *     and retry exactly once before bubbling up.
  *
@@ -74,21 +80,29 @@ internal class HttpEngine(
         var captchaRetried = false
         var reauthRetried = false
         while (true) {
+            // No session yet, or one past its own expiry: log in before sending rather than
+            // spend a request learning it from a 401. That 401 used to be the only way in for
+            // a request made before login(), and its recovery skipped the stored session.
+            val current = pikpak.state.session
             // Both snapshots are taken before the request goes out, not when
             // its failure comes back: by then another coroutine may already
             // have replaced the value, and a snapshot of the replacement
-            // would not match the state that was actually rejected.
-            val sessionUsed = pikpak.state.session
+            // would not match the state that was actually rejected. The
+            // headers are built from the same snapshots, never re-read: a
+            // wait in the rate limiter or a retry inside execute would
+            // otherwise send a newer value than the one the refresh below
+            // is keyed on, and the refresh would skip itself.
+            val sessionUsed = if (current != null && current.isUsable()) current else pikpak.mutex.withLock { pikpak.auth.loginLocked() }
             val captchaUsed = pikpak.state.captchaToken
             val element = try {
                 requestRaw(method, url) {
-                    applyAuthHeaders()
+                    applyAuthHeaders(sessionUsed, captchaUsed)
                     configure()
                 }
             } catch (e: PikPakException) {
-                // The access token has not reached its own expiry or we would
-                // not have sent it, so the server disagreeing is the only
-                // signal available. Re-auth once; a second 401 is a real
+                // The access token has not reached its own expiry or it would
+                // have been replaced above, so the server disagreeing is the
+                // only signal available. Re-auth once; a second 401 is a real
                 // authorization failure and belongs to the caller.
                 if (e.httpStatus == 401 && !reauthRetried) {
                     reauthRetried = true
@@ -104,8 +118,7 @@ internal class HttpEngine(
                 }
                 throw e
             }
-            if (element.tryGetErrorCode() == ErrorCodes.OK) return element
-            val error = element.toException()
+            val error = element.envelopeError() ?: return element
             if (error.isCaptchaRequired && captchaAction != null && !captchaRetried) {
                 pikpak.auth.refreshCaptchaToken(captchaAction, captchaUsed)
                 captchaRetried = true
@@ -150,7 +163,7 @@ internal class HttpEngine(
             // fall back to a fresh signin. 0.5.0 threw a bare "HTTP 400" here,
             // which silently disabled both recoveries.
             val envelope = parseErrorEnvelopeOrNull(text)
-            throw envelope?.toException(response.status.value, response.headerMap())
+            throw envelope?.envelopeError(response.status.value, response.headerMap())
                 ?: PikPakException(
                     errorCode = -1,
                     errorMessage = "HTTP ${response.status.value}",
@@ -221,7 +234,20 @@ internal class HttpEngine(
     /**
      * Shared request pipeline. Retries the *request* on transient transport
      * errors and on 5xx/429 responses; never retries once [block] has started,
-     * because a block may have already written bytes somewhere.
+     * because a block may have already written bytes somewhere. On the last
+     * attempt a 5xx is handed to [block] instead, which is where RangeReader
+     * sees a 503 as backpressure.
+     *
+     * A POST is replayed only when the server cannot have acted on it: a 429
+     * or 503, which refuse the request, or a failure before the request was
+     * sent (see [failedBeforeSending]) — a TLS handshake the route drops is
+     * the common one on a proxied line. A
+     * read timeout, a reset after the body was sent or a 502 from a gateway
+     * whose backend committed all leave the effect unknown, and replaying a
+     * createFolder, an offline task or a multipart completion then makes a
+     * duplicate, costs quota twice, or finds the upload already finished and
+     * reports it gone. The other methods this SDK sends read or overwrite, and
+     * are replayed on all of them.
      */
     private suspend fun <T> execute(
         client: HttpClient,
@@ -232,6 +258,7 @@ internal class HttpEngine(
         block: suspend (HttpResponse) -> T,
     ): T {
         val policy = pikpak.retryPolicy
+        val replayable = method != HttpMethod.Post
         var attempt = 0
         while (true) {
             if (rateLimited) pikpak.rateLimiter.acquire()
@@ -243,8 +270,9 @@ internal class HttpEngine(
                     configure()
                 }.execute { response ->
                     val status = response.status.value
-                    if ((status >= 500 || status == 429) && attempt < policy.maxAttempts - 1) {
-                        throw RetryableStatus(status, response.retryAfter(), response.headerMap())
+                    val retryable = status == 429 || status == 503 || (replayable && status >= 500)
+                    if (retryable && attempt < policy.maxAttempts - 1) {
+                        throw RetryableStatus(status, response.retryAfter())
                     }
                     blockEntered = true
                     block(response)
@@ -253,14 +281,14 @@ internal class HttpEngine(
                 if (t is CancellationException) throw t
                 if (blockEntered) throw t
                 if (t is RetryableStatus) {
-                    if (attempt >= policy.maxAttempts - 1) throw t.toPikPakException(url)
                     val waitFor = t.retryAfter ?: policy.delayFor(attempt)
                     recordRetry(t.status, waitFor)
                     delay(waitFor)
                     attempt++
                     continue
                 }
-                if (!isRetryable(t) || attempt >= policy.maxAttempts - 1) throw t
+                val retryable = if (replayable) isTransient(t) else t.failedBeforeSending()
+                if (!retryable || attempt >= policy.maxAttempts - 1) throw t
                 val waitFor = policy.delayFor(attempt)
                 recordRetry(null, waitFor)
                 delay(waitFor)
@@ -269,33 +297,15 @@ internal class HttpEngine(
         }
     }
 
-    /**
-     * Client-wide counters plus, when the caller installed one, that one
-     * request's own.
-     */
+    /** Counted against the caller's own request, when it installed a counter; see [AttemptRetries]. */
     private suspend fun recordRetry(status: Int?, waited: Duration) {
-        pikpak.recordHttpRetry(status, waited)
         currentCoroutineContext()[AttemptRetries]?.record(status, waited)
     }
 
-    private class RetryableStatus(
-        val status: Int,
-        val retryAfter: Duration?,
-        val headers: Map<String, List<String>>,
-    ) : RuntimeException("HTTP $status") {
-        fun toPikPakException(url: String) = PikPakException(
-            errorCode = -1,
-            errorMessage = "HTTP $status after retry budget exhausted",
-            errorDescription = url,
-            httpStatus = status,
-            headers = headers,
-        )
-    }
+    /** Thrown only while retries remain, so it never leaves [execute]. */
+    private class RetryableStatus(val status: Int, val retryAfter: Duration?) : RuntimeException("HTTP $status")
 
-    private fun isRetryable(t: Throwable): Boolean {
-        // Cancellation is not a transport failure; retrying it would resurrect
-        // work the caller already abandoned.
-        if (t is CancellationException) return false
+    private fun isTransient(t: Throwable): Boolean {
         if (t is UrlExpiredException) return false
         if (t is HttpRequestTimeoutException) return true
         if (t is ConnectTimeoutException) return true
@@ -312,36 +322,11 @@ internal class HttpEngine(
             "unexpected eof" in message
     }
 
-    private fun HttpRequestBuilder.applyAuthHeaders() {
-        val session = pikpak.state.session
-        if (session != null) {
-            headers.set(HttpHeaders.Authorization, "Bearer ${session.accessToken}")
-        }
-        val captcha = pikpak.state.captchaToken
+    private fun HttpRequestBuilder.applyAuthHeaders(session: Session, captcha: String) {
+        headers.set(HttpHeaders.Authorization, "Bearer ${session.accessToken}")
         if (captcha.isNotEmpty()) {
             headers.set("X-Captcha-Token", captcha)
         }
-    }
-
-    private fun JsonElement.tryGetErrorCode(): Int {
-        val obj = this as? JsonObject ?: return ErrorCodes.OK
-        val code = obj["error_code"] as? JsonPrimitive ?: return ErrorCodes.OK
-        return code.intOrNull ?: ErrorCodes.OK
-    }
-
-    private fun JsonElement.toException(
-        httpStatus: Int? = null,
-        headers: Map<String, List<String>> = emptyMap(),
-    ): PikPakException {
-        val obj = this as? JsonObject
-            ?: return PikPakException(-1, "unexpected response", this.toString(), httpStatus, headers)
-        val code = (obj["error_code"] as? JsonPrimitive)?.intOrNull ?: -1
-        val msg = (obj["error"] as? JsonPrimitive)?.contentOrNull.orEmpty()
-        val desc = (obj["error_description"] as? JsonPrimitive)?.contentOrNull
-        return PikPakException(
-            code, msg, desc, httpStatus, headers,
-            rawBody = obj.toString().truncateForError(),
-        )
     }
 
     /** The body as a PikPak error envelope, or null when it is not one (non-JSON, or no numeric `error_code`). */
@@ -368,14 +353,12 @@ internal class HttpEngine(
         fun defaultClient(): HttpClient = HttpClient {
             install(HttpTimeout) {
                 connectTimeoutMillis = 15_000
-                // Request timeout caps the entire HTTP exchange — set high so
-                // long file downloads aren't aborted mid-stream. The per-call
-                // RetryPolicy handles short-lived transport failures.
-                requestTimeoutMillis = Long.MAX_VALUE
-                // Inter-byte socket timeout. Bytes should flow at least every
-                // few minutes even on slow links; tune via a custom HttpClient
-                // if your workload needs different bounds.
-                socketTimeoutMillis = 5L * 60 * 1000
+                // This client carries JSON API calls only; bytes go over the CDN
+                // client. Bounded, because sign-in and captcha requests run under
+                // the client's auth mutex, and one that stalls holds up every
+                // login and captcha refresh behind it for as long as it is let.
+                requestTimeoutMillis = 60_000
+                socketTimeoutMillis = 30_000
             }
             // HttpRequestRetry is intentionally NOT installed. The SDK's own
             // retry loop (driven by RetryPolicy) already handles transient
@@ -402,14 +385,24 @@ internal class HttpEngine(
  * block only writes to its sink. Ktor does carry the caller's context into the
  * request pipeline, so engine coroutines can see this element, but nothing down
  * there calls [record].
+ *
+ * The counters are volatile for the one reader on another coroutine: RangeReader's
+ * first-response deadline, which watches [statuses] to tell a host that answered
+ * with a retried status from one that said nothing.
  */
 internal class AttemptRetries : AbstractCoroutineContextElement(AttemptRetries) {
     companion object Key : CoroutineContext.Key<AttemptRetries>
 
+    @Volatile
     var serverErrors: Int = 0
         private set
+
+    @Volatile
     var rateLimited: Int = 0
         private set
+
+    /** Responses the server did send, retried all the same. */
+    val statuses: Int get() = serverErrors + rateLimited
     var transport: Int = 0
         private set
     var waited: Duration = Duration.ZERO
@@ -429,6 +422,28 @@ private const val ERROR_BODY_LIMIT = 2048
 
 private fun String.truncateForError(): String =
     if (length <= ERROR_BODY_LIMIT) this else substring(0, ERROR_BODY_LIMIT) + "…(${length} bytes total)"
+
+/**
+ * The error a PikPak JSON envelope reports, or null when it reports none. Anything that is not
+ * an object is data, not an envelope. One conversion for every reader of envelopes, so the
+ * fields the exception's predicates read are the server's own wherever the envelope arrived.
+ */
+internal fun JsonElement.envelopeError(
+    httpStatus: Int? = null,
+    headers: Map<String, List<String>> = emptyMap(),
+): PikPakException? {
+    val obj = this as? JsonObject ?: return null
+    val code = (obj["error_code"] as? JsonPrimitive)?.intOrNull ?: return null
+    if (code == ErrorCodes.OK) return null
+    return PikPakException(
+        errorCode = code,
+        errorMessage = (obj["error"] as? JsonPrimitive)?.contentOrNull.orEmpty(),
+        errorDescription = (obj["error_description"] as? JsonPrimitive)?.contentOrNull,
+        httpStatus = httpStatus,
+        headers = headers,
+        rawBody = obj.toString().truncateForError(),
+    )
+}
 
 internal fun HttpResponse.headerMap(): Map<String, List<String>> =
     headers.entries().associate { it.key.lowercase() to it.value }

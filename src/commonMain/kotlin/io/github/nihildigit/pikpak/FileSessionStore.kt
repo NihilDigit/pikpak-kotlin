@@ -12,9 +12,13 @@ import org.kotlincrypto.hash.md.MD5
  * Persists [Session] as JSON files in [dir]. One file per account, keyed by
  * md5(account) so the filename never reveals the email/phone.
  *
- * The file is rewritten atomically-ish via best-effort overwrite. PikPak
- * sessions are not catastrophic to lose (we just re-login), so we do not
- * implement a fsync-rename dance — keep the SDK dependency surface small.
+ * Written to a temporary file and moved over the old one. Losing the session
+ * is not harmless: the refresh token lives nowhere else, and without it the
+ * next start has to sign in with the password (see AuthApi.commitSession). An
+ * overwrite in place that a crash interrupted left a file that failed to parse
+ * and read as no session at all.
+ *
+ * On Android there is no default [dir]; see [defaultSessionDir].
  */
 class FileSessionStore(
     private val dir: Path = defaultSessionDir(),
@@ -33,8 +37,10 @@ class FileSessionStore(
     override suspend fun save(account: String, session: Session) {
         ensureDir()
         val file = sessionPath(account)
+        val temp = Path(dir, "${file.name}.tmp")
         val text = json.encodeToString(Session.serializer(), session)
-        SystemFileSystem.sink(file).buffered().use { it.writeString(text) }
+        SystemFileSystem.sink(temp).buffered().use { it.writeString(text) }
+        SystemFileSystem.atomicMove(temp, file)
     }
 
     override suspend fun clear(account: String) {
@@ -55,12 +61,3 @@ class FileSessionStore(
         private val defaultJson = Json { ignoreUnknownKeys = true }
     }
 }
-
-internal fun ByteArray.toHex(): String = joinToString("") {
-    val v = it.toInt() and 0xff
-    val hi = v ushr 4
-    val lo = v and 0x0f
-    "${hexChar(hi)}${hexChar(lo)}"
-}
-
-private fun hexChar(v: Int): Char = if (v < 10) ('0' + v) else ('a' + (v - 10))

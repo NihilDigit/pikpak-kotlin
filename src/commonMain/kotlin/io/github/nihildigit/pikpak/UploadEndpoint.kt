@@ -18,6 +18,7 @@ import io.ktor.http.isSuccess
 import kotlin.time.Clock
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import kotlinx.io.EOFException
 import kotlinx.io.RawSource
 import kotlinx.io.buffered
 import kotlinx.io.files.Path
@@ -27,7 +28,6 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
@@ -166,37 +166,13 @@ data class UploadSession(
  * with [cancelUpload].
  */
 suspend fun PikPakClient.startUpload(parentId: String, name: String, size: Long, gcid: String): UploadStart {
-    val initBody = buildJsonObject {
-        put("kind", FileKind.FILE)
-        put("name", name)
-        put("size", size.toString())
-        put("hash", gcid)
-        put("upload_type", "UPLOAD_TYPE_RESUMABLE")
-        if (parentId.isNotEmpty()) put("parent_id", parentId)
-        putJsonObject("body") {
-            put("duration", "")
-            put("width", "")
-            put("height", "")
-        }
-        putJsonObject("objProvider") { put("provider", "UPLOAD_TYPE_UNKNOWN") }
-    }
-
-    val initResponse = http.request(
-        method = HttpMethod.Post,
-        url = "$DRIVE/drive/v1/files",
-        captchaAction = "POST:/drive/v1/files",
-    ) { jsonBody(json, initBody) }
-
-    val initObj = initResponse as JsonObject
-    val fileNode = initObj["file"]?.jsonObject ?: throw PikPakException(-1, "upload: missing file in init response")
-    val phase = fileNode["phase"]?.jsonPrimitive?.contentOrNull.orEmpty()
-    val fileId = fileNode["id"]?.jsonPrimitive?.contentOrNull.orEmpty()
-
-    if (phase == TaskPhase.COMPLETE) return UploadStart.Instant(fileId)
+    val node = createUploadNode(parentId, name, size, gcid)
+    val fileId = node.fileId
+    if (node.phase == TaskPhase.COMPLETE) return UploadStart.Instant(fileId)
 
     try {
-        val params = initObj["resumable"]?.jsonObject?.get("params")?.jsonObject
-            ?: throw PikPakException(-1, "upload: missing resumable.params for phase=$phase")
+        val params = ((node.response["resumable"] as? JsonObject)?.get("params") as? JsonObject)
+            ?: throw PikPakException(-1, "upload: missing resumable.params for phase=${node.phase}")
         fun param(name: String) = params[name]?.jsonPrimitive?.contentOrNull.orEmpty()
         val withoutUploadId = UploadSession(
             fileId = fileId,
@@ -219,6 +195,46 @@ suspend fun PikPakClient.startUpload(parentId: String, name: String, size: Long,
     }
 }
 
+/** What `POST /drive/v1/files` made of an upload request: the new file and how far along it is. */
+internal class UploadNode(val fileId: String, val phase: String, val response: JsonObject)
+
+/**
+ * The drive half of an upload: creates the file for [gcid] under [parentId]. PikPak answers
+ * COMPLETE when it already holds the content, and PENDING with OSS credentials when the bytes
+ * have to go up. Shared by [startUpload], which goes on to send them, and [instantCreate],
+ * which has none to send.
+ */
+internal suspend fun PikPakClient.createUploadNode(parentId: String, name: String, size: Long, gcid: String): UploadNode {
+    val body = buildJsonObject {
+        put("kind", FileKind.FILE)
+        put("name", name)
+        put("size", size.toString())
+        put("hash", gcid)
+        put("upload_type", "UPLOAD_TYPE_RESUMABLE")
+        if (parentId.isNotEmpty()) put("parent_id", parentId)
+        putJsonObject("body") {
+            put("duration", "")
+            put("width", "")
+            put("height", "")
+        }
+        putJsonObject("objProvider") { put("provider", "UPLOAD_TYPE_UNKNOWN") }
+    }
+    val response = http.request(
+        method = HttpMethod.Post,
+        url = "$DRIVE/drive/v1/files",
+        captchaAction = "POST:/drive/v1/files",
+    ) { jsonBody(json, body) }
+    // as? rather than jsonObject: an explicit "file": null must reach the error below, not a cast failure
+    val obj = response as? JsonObject
+    val file = obj?.get("file") as? JsonObject
+        ?: throw PikPakException(-1, "upload: missing file in response for $name", rawBody = response.toString())
+    return UploadNode(
+        fileId = file["id"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+        phase = file["phase"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+        response = obj,
+    )
+}
+
 /**
  * Sends whatever of [session] is not on OSS yet and completes the upload; the
  * file is then `PHASE_TYPE_COMPLETE`. Works from a fresh process: measured
@@ -232,12 +248,30 @@ suspend fun PikPakClient.startUpload(parentId: String, name: String, size: Long,
  *
  * A failure leaves the session as it was, to be continued again or given up
  * with [cancelUpload]. Once [UploadSession.expiration] has passed, OSS refuses
- * the credentials with a 403 and only [cancelUpload] is left.
+ * the credentials with a 403, which reaches the caller as [UrlExpiredException],
+ * and only [cancelUpload] is left.
+ *
+ * An upload OSS no longer knows (404) may be one that completed with its answer
+ * lost: the completion is not replayed, but a caller continuing the session
+ * again would ask for its parts and find none. So a 404 is checked against the
+ * drive file, and one already COMPLETE returns normally.
  */
 suspend fun PikPakClient.continueUpload(
     session: UploadSession,
     open: (offset: Long) -> RawSource,
     onProgress: (uploadedBytes: Long) -> Unit = {},
+) {
+    try {
+        sendMissingParts(session, open, onProgress)
+    } catch (e: PikPakException) {
+        if (e.httpStatus != 404 || !uploadCompleted(session.fileId)) throw e
+    }
+}
+
+private suspend fun PikPakClient.sendMissingParts(
+    session: UploadSession,
+    open: (offset: Long) -> RawSource,
+    onProgress: (uploadedBytes: Long) -> Unit,
 ) {
     val parts = listUploadedParts(session).toMutableMap()
     val partCount = ((session.size + session.partSize - 1) / session.partSize).toInt().coerceAtLeast(1)
@@ -255,8 +289,12 @@ suspend fun PikPakClient.continueUpload(
                 inputPart = number
             }
             val want = partLength(number)
-            val bytes = input.readByteArray(want)
-            if (bytes.size != want) throw PikPakException(-1, "upload: source ended early at part $number")
+            // readByteArray throws on a short source rather than returning fewer bytes
+            val bytes = try {
+                input.readByteArray(want)
+            } catch (e: EOFException) {
+                throw PikPakException(-1, "upload: source ended early at part $number", cause = e)
+            }
             parts[number] = ossUploadPart(session, number, bytes)
             inputPart = number + 1
             onProgress(parts.keys.sumOf { partLength(it).toLong() })
@@ -272,10 +310,21 @@ suspend fun PikPakClient.continueUpload(
  * kept, then permanently deletes the pending drive file [startUpload] made.
  * The abort is best effort, since expired credentials cannot send it; the
  * delete goes through the account and throws on failure.
+ *
+ * A drive file that is already COMPLETE is left alone: the upload finished,
+ * perhaps with its answer lost, and the file is the user's now, not a leftover.
+ * Deleting it here used to destroy a finished upload that merely looked failed.
  */
 suspend fun PikPakClient.cancelUpload(session: UploadSession) {
     runCatching { ossRequest(method = HttpMethod.Delete, oss = session, rawQuery = "uploadId=${session.uploadId}") { } }
+    if (uploadCompleted(session.fileId)) return
     deleteFile(session.fileId)
+}
+
+private suspend fun PikPakClient.uploadCompleted(fileId: String): Boolean = try {
+    getFile(fileId).phase == TaskPhase.COMPLETE
+} catch (e: PikPakException) {
+    false
 }
 
 /**
@@ -347,9 +396,13 @@ private suspend fun PikPakClient.ossComplete(session: UploadSession, parts: Map<
 
 /**
  * One signed OSS exchange. Verifies the status before handing the live
- * response to [block]: OSS answers an expired STS token with a 403 whose body
- * is an XML error document, and a caller that only reads a header off it
- * (ETag, say) would see "success with a missing header".
+ * response to [block]: a failed exchange still carries a body, an XML error
+ * document, and a caller that only reads a header off it (ETag, say) would see
+ * "success with a missing header". A 401 or 403 never gets this far — sendRaw
+ * turns it into [UrlExpiredException] first — so this catches the rest, a 404
+ * for an upload OSS no longer knows among them. That also means a 403 from a
+ * skewed clock in the Date header reads as expiry; OSS says which it was only
+ * in the body's `<Code>`, which is not parsed.
  *
  * [rawQuery] is signed whole, as the Go reference does; it must hold only OSS
  * subresources (`uploads`, `uploadId`, `partNumber`). Paging parameters are

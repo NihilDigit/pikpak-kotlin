@@ -1,9 +1,18 @@
 package io.github.nihildigit.pikpak
 
 /**
- * Every failure the SDK surfaces. Open so transport-specific subtypes
- * ([UrlExpiredException]) can be matched by callers that care, while callers
- * that don't can keep catching this one type.
+ * A failure PikPak itself reported: an error envelope, a status the SDK does
+ * not recover from, or a response it could not make sense of. Open so
+ * transport-specific subtypes ([UrlExpiredException]) can be matched by
+ * callers that care.
+ *
+ * Not every failure is one of these. A request that never got an answer —
+ * a timeout, a refused connection, a dropped Wi-Fi — surfaces as the
+ * engine's own IOException-family exception once retries are spent, and
+ * whatever a password supplier throws passes through unchanged. Callers rely
+ * on the difference: "offline" and "refused" call for opposite handling, and
+ * wrapping one in the other would hide it. Cancellation passes through as
+ * well.
  *
  * [httpStatus], [headers] and [rawBody] are populated whenever the failure was
  * observed at the HTTP layer. They are the only way a caller can tell a 502
@@ -31,6 +40,12 @@ open class PikPakException(
      */
     val isCaptchaRequired: Boolean
         get() = errorCode == ErrorCodes.CAPTCHA_REQUIRED && errorMessage.startsWith("captcha")
+
+    /**
+     * The refresh token is dead. [PikPakClient.login] never throws this: it
+     * clears the dead session from memory and the store and signs in with the
+     * password, and what reaches the caller is that sign-in's own outcome.
+     */
     val isRefreshTokenInvalid: Boolean get() = errorCode == ErrorCodes.REFRESH_TOKEN_INVALID
 
     /** First value of [name] (case-insensitive), or null. */
@@ -67,6 +82,26 @@ class UrlExpiredException(
     httpStatus = httpStatus,
     headers = headers,
     rawBody = rawBody,
+)
+
+/**
+ * [instantCreate] found that PikPak does not hold the content behind [gcid]:
+ * the server answered with a [phase] other than complete, waiting for bytes a
+ * hash-only caller does not have. The placeholder the request created has
+ * already been deleted, so nothing is left behind in the drive.
+ *
+ * The content has to reach PikPak another way — an offline task for the source
+ * or a real upload. Matched by type so a caller can fall back to one of those
+ * without parsing the message.
+ */
+class InstantContentUnavailableException(
+    val gcid: String,
+    val fileName: String,
+    val phase: String,
+) : PikPakException(
+    errorCode = -1,
+    errorMessage = "instantCreate: PikPak does not hold hash $gcid (phase=$phase); " +
+        "$fileName needs a real upload or an offline task",
 )
 
 object ErrorCodes {

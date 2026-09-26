@@ -117,6 +117,55 @@ class AuthFlowMockTest {
         client.close()
     }
 
+    // Before, a request made without login() went out unauthenticated, got a 401, and the 401 path never read the store
+    @Test
+    fun `a request made before login uses the stored session`() = runBlocking {
+        val store = InMemorySessionStore()
+        store.save("mock@x", Session("STORED-AT", "RT", "UID", 9_999_999_999L))
+        val authorizations = mutableListOf<String?>()
+        val client = clientWith(store) { req ->
+            callLog += "${req.method.value} ${req.url.encodedPath}"
+            authorizations += req.headers[HttpHeaders.Authorization]
+            respondJson("""{"quota":{"limit":"1","usage":"0"}}""")
+        }
+
+        client.getQuota()
+        assertEquals(listOf<String?>("Bearer STORED-AT"), authorizations)
+        assertEquals(0, callLog.count { it.endsWith("/v1/auth/signin") || it.endsWith("/v1/shield/captcha/init") })
+        client.close()
+    }
+
+    // A caller whose password prompt fails was asked twice, and the dead token stayed in its store to fail again next start
+    @Test
+    fun `a dead refresh token is dropped and the password asked for once`() = runBlocking {
+        val store = InMemorySessionStore()
+        store.save("mock@x", Session("OLD", "BAD-RT", "UID", expiresAt = 1L))
+        var passwordAsked = 0
+        val engine = MockEngine { req ->
+            callLog += "${req.method.value} ${req.url.encodedPath}"
+            when {
+                req.url.encodedPath.endsWith("/v1/auth/token") ->
+                    respondJson("""{"error_code":4126,"error":"refresh_token_invalid"}""")
+                req.url.encodedPath.endsWith("/v1/shield/captcha/init") -> respondJson("""{"captcha_token":"CAP"}""")
+                req.url.encodedPath.endsWith("/v1/auth/signin") ->
+                    respondJson("""{"error_code":16,"error":"invalid_credentials"}""")
+                else -> respond404()
+            }
+        }
+        val client = PikPakClient(
+            account = "mock@x",
+            passwordSupplier = { passwordAsked++; "pw" },
+            sessionStore = store,
+            httpClient = HttpClient(engine),
+        )
+
+        assertFailsWith<PikPakException> { client.login() }
+        assertEquals(1, passwordAsked)
+        assertEquals(1, callLog.count { it.endsWith("/v1/auth/signin") })
+        assertNull(store.load("mock@x"), "the dead session is still in the store")
+        client.close()
+    }
+
     @Test
     fun `signin failure bubbles as PikPakException`() = runBlocking {
         val client = clientWith(InMemorySessionStore()) { req ->
