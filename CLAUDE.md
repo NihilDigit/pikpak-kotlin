@@ -17,14 +17,19 @@ Published as `io.github.nihildigit:pikpak-kotlin` on Maven Central. Source of tr
 ### Code layout
 
 - `src/commonMain/` — everything non-platform-specific. Depends only on KMP-capable libs: Ktor, kotlinx.serialization, kotlinx.coroutines, kotlinx.datetime, kotlinx-io, KotlinCrypto.
-- `src/jvmMain/`, `src/androidMain/`, `src/appleMain/` — per-platform actuals: `defaultSessionDir()` and `defaultCdnHttpClient()` (`internal/CdnClient.*.kt`), the latter tuning each engine's per-host connection cap to the CDN budget. `appleMain` covers both iOS targets; there is no `nativeMain` code, since iOS is the only native platform.
+- `src/jvmMain/`, `src/androidMain/`, `src/jvmAndroidMain/`, `src/appleMain/` — per-platform actuals: `defaultSessionDir()`, `defaultCdnHttpClient()` (`internal/CdnClient.*.kt`, tuning each engine's per-host connection cap to the budget) and `failedBeforeSending()` (`internal/SendFailure.*.kt`, which decides whether a POST may be replayed). `jvmAndroidMain` holds what JVM and Android share, both running OkHttp. `appleMain` covers both iOS targets; there is no `nativeMain` code, since iOS is the only native platform.
 - `src/commonTest/` — unit tests that run on every target: gcid vectors, MockEngine-based auth/captcha/401 paths, `RangeReaderMockTest` for budget, refresh, 503, resume and EOF behaviour.
 - `src/jvmTest/` — live PikPak API integration tests, opt-in via `.env`. `RangeReaderSmokeTest` is the end-to-end playback-path check (magnet → task → range reads → fan-out throughput); `CdnNetworkProbeTest` measures the CDN and runs only with `PIKPAK_PROBE=1`; `WeakLinkSmokeTest` measures what the fan-out is worth on the current link and runs only with `PIKPAK_WEAKLINK=1` — it asserts nothing about speed, because "no gain" is the correct answer on a short route. Shared inputs live in `TestFixtures`.
-- `internal/` sub-package — implementation helpers not meant for consumers: `HttpEngine`, `AuthApi`, `PriorityGate` (priority-ordered semaphore behind `RangeReader`), `FolderIdCache`, `CdnClient`.
+- `internal/` sub-package — implementation helpers not meant for consumers: `HttpEngine`, `AuthApi`, `PriorityGate` (priority-ordered semaphore behind `RangeReader`, ties broken by `RequestOrder`), `ForegroundStreams` and `HostHealth` (account-wide state the readers consult), `FolderIdCache`, `CdnClient`.
+- Playback layering: `RangeReader` (one signed URL, gates, retries, host switching) ← `PikPakFileHandle` (gcid identity, link minting, one shared `BlockCache`) ← `PikPakStreamReader` (a cursor on that cache). Read the wiki's Playback and Architecture pages before changing any of the three.
+
+## Documentation
+
+User-facing documentation lives in the GitHub wiki (`git@github.com:NihilDigit/pikpak-kotlin.wiki.git`, cloned beside this repo as `../pikpak-kotlin.wiki`), not in this repo: the README is a short introduction that links into it. Measured facts of PikPak go on the wiki's Measurements page with their date, and removed APIs with their reason on History — that is where a future change looks before re-adding something. KDoc stays the place for why a piece of code is the way it is; the wiki is for how the pieces are used and fit together.
 
 ### Request pipeline (read before touching the auth/retry code)
 
-Public endpoints are `suspend` extension functions (`Endpoints.kt`, `FolderEndpoints.kt`, `UploadEndpoint.kt`, `DownloadEndpoint.kt`, `UrlOfflineEndpoint.kt`, `RangeStreamEndpoint.kt`, `VariantEndpoint.kt`, `MagnetResolveEndpoint.kt`). They delegate to `PikPakClient.http.request(...)` with an optional `captchaAction`. `HttpEngine` (`internal/HttpEngine.kt`) handles rate-limit acquisition, standard PikPak headers, on-demand login, one-shot captcha refresh on `error_code=9`, one-shot re-authentication on HTTP 401, and exponential-backoff retry on transient transport errors and 5xx/429. `AuthApi` (`internal/AuthApi.kt`) owns the session state machine — in-memory session → store → refresh_token → full signin — plus the salt-cascade captcha signing flow.
+Public endpoints are `suspend` extension functions, one file per API domain (`Endpoints.kt`, `FolderEndpoints.kt`, `UploadEndpoint.kt`, `UrlOfflineEndpoint.kt`, `Tasks.kt`, `RangeStreamEndpoint.kt`, `VariantEndpoint.kt`, `MagnetResolveEndpoint.kt`, and so on). They delegate to `PikPakClient.http.request(...)` with an optional `captchaAction`. `HttpEngine` (`internal/HttpEngine.kt`) handles rate-limit acquisition, standard PikPak headers, on-demand login, one-shot captcha refresh on `error_code=9`, one-shot re-authentication on HTTP 401, and exponential-backoff retry on transient transport errors and 5xx/429. `AuthApi` (`internal/AuthApi.kt`) owns the session state machine — in-memory session → store → refresh_token → full signin — plus the salt-cascade captcha signing flow.
 
 Two invariants the concurrency fixes depend on:
 
@@ -35,7 +40,7 @@ Two invariants the concurrency fixes depend on:
 
 `RangeReader` (`RangeReader.kt`) is the playback primitive: one instance per remote file, reads share `connectionBudget` slots through `PriorityGate`, higher priority wins a contended slot, expiry goes back to `urlProvider`, 503 waits, a truncated body resumes from the delivered offset, a range past EOF ends at EOF. `PriorityGate.release()` runs under `NonCancellable` because a cancelled reader that had to wait for the mutex would otherwise leak its slot for good.
 
-`VariantEndpoint.kt` picks which representation of a media file to read — the octet-stream original or one of PikPak's transcoded MPEG-TS variants — and owns `remoteSize`, the one-byte Content-Range probe that `downloadFromUrl` also uses. One invariant: **a variant is chosen once and locked by `mediaId`; refresh never reselects.** `resolveVariant` is where a missing or still-transcoding variant falls back to the original, and it is the only place that fallback happens. `rangeReader(fileId, mediaId)` looks the id up again on every refresh and throws when it is gone, because the variants are different byte streams and a caller reading at a committed offset would otherwise get corruption instead of an error.
+`VariantEndpoint.kt` picks which representation of a media file to read — the octet-stream original or one of PikPak's transcoded MPEG-TS variants — and owns `remoteSize`, the one-byte Content-Range probe `PikPakFileHandle.streamSize` uses for a transcode. One invariant: **a variant is chosen once and locked by `mediaId`; refresh never reselects.** `resolveVariant` is where a missing or still-transcoding variant falls back to the original, and it is the only place that fallback happens. `rangeReader(fileId, mediaId)` looks the id up again on every refresh and throws when it is gone, because the variants are different byte streams and a caller reading at a committed offset would otherwise get corruption instead of an error.
 
 ### The gcid path (read before touching `MagnetResolveEndpoint` or `PikPakFileHandle`)
 
@@ -108,10 +113,11 @@ There is intentionally no `ci.yml` on push/PR. If you find yourself adding one, 
 
 Full step-by-step in [RELEASING.md](./RELEASING.md). Short version:
 
-1. Bump `version` in `build.gradle.kts` (drop `-SNAPSHOT`).
-2. Commit, tag `vX.Y.Z`, push both.
-3. Watch `.github/workflows/release.yml` — it verifies tag matches version, runs every platform's runtime tests, then publishes.
-4. Bump back to `vX.Y.(Z+1)-SNAPSHOT` for ongoing dev.
+1. **Update the wiki.** Go through the diff since the last tag and bring every wiki page it touches up to date: public API, defaults and behaviour, new measurements (dated, on Measurements), removed or reshaped API (with the reason, on History), and the version on Home and Getting Started. The wiki's Development page has the checklist. Push the wiki before the tag, so a release never points at pages describing the previous version. Show the maintainer the wiki diff before pushing it, like any push.
+2. Bump `version` in `build.gradle.kts` (drop `-SNAPSHOT`), and the version in the README's install snippet.
+3. Commit, tag `vX.Y.Z`, push both.
+4. Watch `.github/workflows/release.yml` — it verifies tag matches version, runs every platform's runtime tests, then publishes.
+5. Bump back to `vX.Y.(Z+1)-SNAPSHOT` for ongoing dev.
 
 GPG key + Sonatype Central Portal namespace + GitHub repo secrets are already configured. If any of those need re-setup, RELEASING.md covers it.
 
