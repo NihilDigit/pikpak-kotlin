@@ -2,6 +2,7 @@ package io.github.nihildigit.pikpak
 
 import io.github.nihildigit.pikpak.internal.PriorityGate
 import io.ktor.utils.io.ByteReadChannel
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.concurrent.Volatile
@@ -57,8 +58,8 @@ data class VariantLink(
  */
 class PikPakFileHandle(
     private val client: PikPakClient,
-    /** Content hash. The one identifier here that cannot go stale. */
-    val gcid: String,
+    /** Content hash, in either case. The one identifier here that cannot go stale. */
+    gcid: String,
     /** Length of the original file. Needed to recreate it, and by [openStream]. */
     val size: Long,
     /** Name given to a recreated file object. Cosmetic; the gcid decides the bytes. */
@@ -102,8 +103,33 @@ class PikPakFileHandle(
     private val onRangeAttempt: ((RangeAttempt) -> Unit)? = null,
     private val clock: Clock = Clock.System,
     private val refreshMargin: Duration = DEFAULT_REFRESH_MARGIN,
+    /**
+     * A link the caller already holds for this variant, typically from the detail it just
+     * looked up. The first read uses it instead of asking for the detail again; see
+     * [PikPakClient.fileHandle], which fills this in.
+     */
+    initialLink: VariantLink? = null,
+    /** The variant's length when the caller already knows it, which saves a transcode the probe in [streamSize]. */
+    streamSize: Long? = null,
+    /** Where fetched blocks are kept beyond memory, and looked for first. See [BlockStore]. */
+    private val blockStore: BlockStore? = null,
+    /** Where the shared cache's workers run. Closing the handle or cancelling this stops them. */
+    private val coroutineContext: CoroutineContext = EmptyCoroutineContext,
 ) : RangeSource, AutoCloseable {
+    /** Upper case whatever the caller passed, so the [BlockStore] key and the stream-size memo agree. */
+    val gcid: String = gcid.canonicalGcid()
+
     private val mutex = Mutex()
+
+    /** The link [provideUrl] handed out last; reused by a new reader while it stays valid. */
+    @Volatile
+    private var link: VariantLink? = initialLink?.takeIf { it.url.isNotBlank() }
+
+    private val cacheMutex = Mutex()
+
+    /** Shared by every stream opened on this handle; see [openStream]. */
+    @Volatile
+    private var blockCache: BlockCache? = null
 
     /** Guards [unreportedObject] alone, so it is never held across a network call. */
     private val reportMutex = Mutex()
@@ -132,7 +158,7 @@ class PikPakFileHandle(
     // Only ever written with the same probed value; the variant it describes
     // cannot change while this handle lives.
     @Volatile
-    private var probedSize: Long? = null
+    private var probedSize: Long? = streamSize
 
     /**
      * The file object currently backing this handle, or null before the first
@@ -158,16 +184,6 @@ class PikPakFileHandle(
         block: suspend (ByteReadChannel) -> T,
     ): T = currentReader().read(start, length, priority, block)
 
-    /** [read] with the length left open, which reads to the end of the file. */
-    suspend fun <T> readToEnd(
-        start: Long,
-        priority: Int = 0,
-        block: suspend (ByteReadChannel) -> T,
-    ): T = currentReader().read(start, null, priority, block)
-
-    override suspend fun readBytes(start: Long, length: Long, priority: Int): ByteArray =
-        currentReader().readBytes(start, length, priority)
-
     /** Resolves the link now so the first read does not pay for it. */
     suspend fun prewarm() {
         currentReader().prewarm()
@@ -188,27 +204,74 @@ class PikPakFileHandle(
     suspend fun variants(): List<MediaVariant> = detail().medias
 
     /**
-     * Opens a seekable, cached reader over this file, for playing it.
+     * Opens a seekable read position over this file, for playing it.
      *
-     * Reads go through this handle, so a signature that expires or a file
-     * object that has to be rebuilt mid-playback is invisible to the player.
-     * Constructing a [PikPakStreamReader] on a bare [RangeReader] instead would
-     * pin it to the instance this handle is about to retire.
+     * Every stream opened here shares one block cache and one set of workers:
+     * several can read at once, each with its own read-ahead window, and what
+     * one fetched the others read from memory. A player that opens a second
+     * connection to seek opens a second stream; nothing has to be cancelled
+     * for it. Reads go through this handle, so a signature that expires or a
+     * file object that has to be rebuilt mid-playback is invisible to them.
      *
-     * The result owns its own read-ahead and cache and must be closed; closing
-     * it does not close this handle, which several readers may share.
+     * The result must be closed. Closing it gives up its position and leaves
+     * the cache to the handle; [close] on the handle drops the cache.
+     *
+     * The cache takes its size from [streamSize], its connections from the
+     * handle's budget and its workers' context from the handle's
+     * `coroutineContext`. None of that is a per-stream argument: it is one
+     * cache, and a later caller's arguments either changed it under every
+     * other stream or were silently ignored.
+     *
+     * @param role [StreamRole.BACKGROUND] for a file being warmed ahead of the
+     *   one on screen. It can be changed later without losing the cache; see
+     *   [PikPakStreamReader.role].
      */
+    suspend fun openStream(role: StreamRole = StreamRole.FOREGROUND): PikPakStreamReader =
+        PikPakStreamReader(sharedCache(), ownsCache = false, initialRole = role)
+
     /**
-     * @param size length of what is being read. Null asks [streamSize], which
-     *   costs a probe for a transcode and nothing for the original. Pass it
-     *   explicitly when the caller already knows it.
+     * Fetches [ranges] into the shared cache without opening a stream, for a
+     * file the user may play next: its head, the start of an excerpt, a
+     * container index. Streams opened later read them from memory, or from the
+     * [BlockStore] if they were written there.
+     *
+     * Ties at the connection gates go to the older demand, so files warmed in
+     * the order they will be played finish in that order rather than sharing
+     * the line and finishing together. [priority] defaults to the [role]'s warm
+     * band, [PikPakStreamReader.WARM_PRIORITY] in the foreground.
+     *
+     * The job completes once every block is cached and fails when one cannot
+     * be fetched. Cancelling it withdraws the request, and fetches only it
+     * wanted are cancelled; closing the handle withdraws everything.
      */
-    suspend fun openStream(
-        size: Long? = null,
-        concurrency: Int = connectionBudget,
-        parentCoroutineContext: CoroutineContext = EmptyCoroutineContext,
-    ): PikPakStreamReader =
-        PikPakStreamReader(this, size ?: streamSize(), concurrency, parentCoroutineContext)
+    suspend fun prefetch(
+        ranges: List<LongRange>,
+        role: StreamRole = StreamRole.BACKGROUND,
+        priority: Int? = null,
+    ): Deferred<Unit> = sharedCache().warm(ranges, role, priority)
+
+    private suspend fun sharedCache(): BlockCache = cacheMutex.withLock {
+        check(!closed) { "PikPakFileHandle is closed" }
+        // A cache whose context was cancelled from outside is closed without anyone having asked; build another
+        blockCache?.takeUnless { it.closed }?.let { return@withLock it }
+        val built = BlockCache(
+            source = this,
+            size = streamSize(),
+            concurrency = connectionBudget,
+            parentCoroutineContext = coroutineContext,
+            foregroundStreams = client.foregroundStreams,
+            store = blockStore,
+            storeKey = "$gcid/${mediaId ?: ORIGINAL_KEY}",
+        )
+        blockCache = built
+        // close() does not wait for this lock, and the probe in streamSize can take long enough
+        // for it to run meanwhile; it then saw no cache to close, so this one is closed here
+        if (closed) {
+            built.close()
+            throw IllegalStateException("PikPakFileHandle is closed")
+        }
+        built
+    }
 
     /**
      * Length of the representation this handle reads, which is not always
@@ -221,17 +284,23 @@ class PikPakFileHandle(
      * over a transcode would truncate a longer one and run a shorter one off
      * its end.
      *
-     * Probed once and kept: the length belongs to the variant, which is fixed
-     * for the life of the handle, so a refreshed link cannot change it.
+     * Probed once and kept, for this handle and for every later handle on the
+     * same content and variant in this client: the length belongs to the
+     * transcode, which a refreshed link or a rebuilt file object cannot change.
      */
     suspend fun streamSize(): Long {
-        if (mediaId == null) return size
+        val variant = mediaId ?: return size
         probedSize?.let { return it }
-        return client.remoteSize(provideUrl(UrlRequest.Initial)).also { probedSize = it }
+        client.knownStreamSize(gcid, variant)?.let { return it.also { probedSize = it } }
+        return client.remoteSize(provideUrl(UrlRequest.Initial)).also {
+            probedSize = it
+            client.rememberStreamSize(gcid, variant, it)
+        }
     }
 
     override fun close() {
         closed = true
+        blockCache?.close()
         reader?.close()
         reader = null
     }
@@ -295,20 +364,47 @@ class PikPakFileHandle(
      * instead of having to make the CDN answer 404 first.
      */
     internal suspend fun provideUrl(request: UrlRequest): String {
+        // A reader asking for its first link gets the one already in hand while it is good: the
+        // link a caller passed in from the detail it just looked up, or the one the probe in
+        // streamSize minted a moment ago. Each used to cost another detail lookup.
+        val reusable = link.takeIf { request == UrlRequest.Initial && it != null && isUsable(it) }
+        val chosen = reusable ?: mintAvoidingBadHosts(request)
+        link = chosen
+        expiresAt = chosen.expiresAt
+        // After the link, never before it: the object still has to answer the
+        // lookups that minted it, and a caller that deletes on this signal would
+        // pull it out from under them.
+        reportMinted()
+        return chosen.url
+    }
+
+    private fun isUsable(candidate: VariantLink): Boolean {
+        val expiry = candidate.expiresAt
+        if (expiry != null && expiry - clock.now() <= refreshMargin) return false
+        return !client.hostHealth.isBad(candidate.url)
+    }
+
+    /**
+     * A fresh link, minted again while it lands on a host another file saw fail. PikPak picks
+     * the host anew for every link, so asking again is all it takes; the cap only keeps an
+     * account whose every host is failing from spinning on lookups.
+     */
+    private suspend fun mintAvoidingBadHosts(request: UrlRequest): VariantLink {
         // A rejection means the link we held is no good, and so is the file
         // object that produced it — the CDN refuses links whose file is gone.
         // Rebuild before asking, rather than paying a 404 to learn the same thing.
         if (request is UrlRequest.Rejected) rebuild()
+        var minted = mint()
+        repeat(MAX_HOST_REMINTS) {
+            if (!client.hostHealth.isBad(minted.url)) return minted
+            minted = mint()
+        }
+        return minted
+    }
 
+    private suspend fun mint(): VariantLink {
         val detail = detail()
-        val link = linkOf(detail)
-            ?: throw PikPakException(-1, "file ${detail.id} has no readable link for variant $mediaId")
-        expiresAt = link.expiresAt
-        // After the link, never before it: the object still has to answer the
-        // lookups above, and a caller that deletes on this signal would pull it
-        // out from under them.
-        reportMinted()
-        return link.url
+        return linkOf(detail) ?: throw PikPakException(-1, "file ${detail.id} has no readable link for variant $mediaId")
     }
 
     private suspend fun reportMinted() {
@@ -389,5 +485,49 @@ class PikPakFileHandle(
          * signature expire mid-body.
          */
         val DEFAULT_REFRESH_MARGIN: Duration = 5.minutes
+
+        /** Extra links minted when one lands on a host known to be failing; see [mintAvoidingBadHosts]. */
+        internal const val MAX_HOST_REMINTS = 2
+
+        /** What the original is called in a [BlockStore], where transcodes go by their media id. */
+        internal const val ORIGINAL_KEY = "origin"
     }
+}
+
+/**
+ * A handle over [detail]'s content, reading the variant [mediaId] (null for the original).
+ *
+ * Everything the handle would otherwise look up is taken from the detail: the gcid, the file
+ * object, the name and parent a rebuild would use, and the first link, so the first read
+ * needs no detail request of its own. The original's length comes with it; a transcode's does
+ * not, and is probed unless [streamSize] is given or this client has probed it before.
+ */
+fun PikPakClient.fileHandle(
+    detail: FileDetail,
+    mediaId: String? = null,
+    parentId: String = detail.parentId,
+    streamSize: Long? = null,
+    blockStore: BlockStore? = null,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+    onObjectMinted: (suspend (String) -> Unit)? = null,
+    onRangeAttempt: ((RangeAttempt) -> Unit)? = null,
+): PikPakFileHandle {
+    // Read off the detail directly, not through variant(): that throws for an original with no
+    // link, and a missing link here only means the handle mints the first one itself
+    val link = if (mediaId == null) detail.octetStream else detail.medias.firstOrNull { it.mediaId == mediaId }?.link
+    return PikPakFileHandle(
+        client = this,
+        gcid = detail.hash,
+        size = detail.sizeBytes,
+        name = detail.name,
+        initialFileId = detail.id,
+        mediaId = mediaId,
+        parentId = parentId,
+        onObjectMinted = onObjectMinted,
+        onRangeAttempt = onRangeAttempt,
+        initialLink = link?.url?.takeIf { it.isNotBlank() }?.let { VariantLink(it, link.expiresAt) },
+        streamSize = streamSize ?: detail.sizeBytes.takeIf { mediaId == null },
+        blockStore = blockStore,
+        coroutineContext = coroutineContext,
+    )
 }

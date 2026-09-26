@@ -2,6 +2,8 @@ package io.github.nihildigit.pikpak
 
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.readAvailable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /**
  * Random access to the bytes of one remote file.
@@ -12,11 +14,12 @@ import io.ktor.utils.io.readAvailable
  * [PikPakFileHandle] is the one that keeps reading across everything that can
  * invalidate the URL underneath it.
  *
- * Both readers take this rather than a [RangeReader] because a handle retires
- * its reader — on signature expiry and when the file id has to be rebuilt —
- * and anything holding an instance it was handed once keeps reading through a
- * reader the handle has already closed. Taking the interface means every read
- * asks again, and the swap is invisible to whoever is reading.
+ * The stream reader and [downloadTo] take this rather than a [RangeReader]
+ * because a handle retires its reader — on signature expiry and when the file
+ * id has to be rebuilt — and anything holding an instance it was handed once
+ * keeps reading through a reader the handle has already closed. Taking the
+ * interface means every read asks again, and the swap is invisible to whoever
+ * is reading.
  */
 interface RangeSource {
     /**
@@ -46,23 +49,13 @@ interface RangeSource {
     /**
      * Reads a range into memory. Only for ranges small enough to hold.
      *
-     * Overridable because [RangeReader] can fill a caller's array without the
-     * intermediate channel; the default is here so an implementation only has
-     * to provide [read].
+     * A range that runs past the end of the file ends at EOF, like a file
+     * read: the array comes back shorter than [length] rather than failing.
+     * A caller that needs the exact length checks it.
      */
     suspend fun readBytes(start: Long, length: Long, priority: Int = 0): ByteArray {
         require(length <= Int.MAX_VALUE) { "readBytes cannot materialise $length bytes" }
-        val out = ByteArray(length.toInt())
-        var filled = 0
-        read(start, length, priority) { channel ->
-            while (filled < out.size) {
-                val n = channel.readAvailable(out, filled, out.size - filled)
-                if (n < 0) break
-                filled += n
-            }
-        }
-        // A range that runs past the end of the file ends at EOF, like a file read.
-        return if (filled == out.size) out else out.copyOf(filled)
+        return read(start, length, priority) { channel -> channel.readFully(length.toInt()) }
     }
 }
 
@@ -76,7 +69,20 @@ private class RangeReaderSource(private val reader: RangeReader) : RangeSource {
         priority: Int,
         block: suspend (ByteReadChannel) -> T,
     ): T = reader.read(start, length, priority, block)
+}
 
-    override suspend fun readBytes(start: Long, length: Long, priority: Int): ByteArray =
-        reader.readBytes(start, length, priority)
+/** Up to [length] bytes, fewer only at EOF. */
+internal suspend fun ByteReadChannel.readFully(length: Int): ByteArray {
+    val out = ByteArray(length)
+    var filled = 0
+    while (filled < out.size) {
+        // readAvailable hands over already-buffered bytes without suspending,
+        // so without this a cancelled read could run to the end of its range
+        // before reaching a cancellation point.
+        currentCoroutineContext().ensureActive()
+        val n = readAvailable(out, filled, out.size - filled)
+        if (n < 0) break
+        filled += n
+    }
+    return if (filled == out.size) out else out.copyOf(filled)
 }

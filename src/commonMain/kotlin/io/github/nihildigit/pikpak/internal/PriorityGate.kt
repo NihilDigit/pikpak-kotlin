@@ -14,7 +14,8 @@ import kotlinx.coroutines.withContext
  * `kotlinx.coroutines.sync.Semaphore` is strictly FIFO, which is the wrong
  * order for playback: a read-ahead request queued a second ago must not stand
  * in front of the block the decoder is stalled on. Waiters at equal priority
- * keep FIFO order, so read-ahead among itself stays fair.
+ * are served by [RequestOrder], the moment their demand was made, and only
+ * then by arrival.
  *
  * Slots are handed over directly rather than released and re-acquired — a
  * released slot would otherwise be taken by whichever coroutine happened to
@@ -34,11 +35,13 @@ internal class PriorityGate(private val capacity: Int) {
 
     private class Waiter(
         val priority: Int,
+        val order: Long,
         val sequence: Long,
         val granted: CompletableDeferred<Unit> = CompletableDeferred(),
     )
 
-    suspend fun acquire(priority: Int) {
+    /** @param order see [RequestOrder]; lower goes first among equal priorities. */
+    suspend fun acquire(priority: Int, order: Long = Long.MAX_VALUE) {
         val waiter = mutex.withLock {
             // Jumping a non-empty queue would starve waiters that are only
             // there because the gate was full a moment ago.
@@ -46,7 +49,7 @@ internal class PriorityGate(private val capacity: Int) {
                 inUse++
                 return
             }
-            Waiter(priority, sequence++).also { insert(it) }
+            Waiter(priority, order, sequence++).also { insert(it) }
         }
         try {
             waiter.granted.await()
@@ -77,9 +80,13 @@ internal class PriorityGate(private val capacity: Int) {
     }
 
     private fun insert(waiter: Waiter) {
-        val at = waiters.indexOfFirst {
-            it.priority < waiter.priority || (it.priority == waiter.priority && it.sequence > waiter.sequence)
-        }
+        val at = waiters.indexOfFirst { comesAfter(it, waiter) }
         if (at < 0) waiters.add(waiter) else waiters.add(at, waiter)
+    }
+
+    private fun comesAfter(queued: Waiter, arriving: Waiter): Boolean = when {
+        queued.priority != arriving.priority -> queued.priority < arriving.priority
+        queued.order != arriving.order -> queued.order > arriving.order
+        else -> queued.sequence > arriving.sequence
     }
 }

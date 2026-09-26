@@ -1,10 +1,15 @@
 package io.github.nihildigit.pikpak
 
+import io.github.nihildigit.pikpak.internal.ForegroundStreams
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.Test
@@ -37,6 +42,8 @@ class PikPakStreamReaderTest {
         cap: Long = 2L * 1024 * 1024,
         wideThreshold: Long = 256L * 1024,
         parentContext: CoroutineContext = EmptyCoroutineContext,
+        role: StreamRole = StreamRole.FOREGROUND,
+        foreground: ForegroundStreams? = null,
     ) = PikPakStreamReader(
         source = source,
         size = size,
@@ -49,7 +56,13 @@ class PikPakStreamReaderTest {
         readAheadBytes = readAhead,
         memoryCapBytes = cap,
         wideBlockThresholdBytes = wideThreshold,
+        initialRole = role,
+        foregroundStreams = foreground,
     )
+
+    /** A read parked at the head. Until something reads there is no read-ahead window, so nothing is fetched. */
+    private fun CoroutineScope.startReading(reader: PikPakStreamReader) =
+        launch { runCatching { reader.read(ByteArray(1), 0, 1) } }
 
     private suspend fun readAll(reader: PikPakStreamReader, chunk: Int): ByteArray {
         val out = ByteArray(reader.size.toInt())
@@ -114,6 +127,7 @@ class PikPakStreamReaderTest {
         val reader = reader(source, content.size.toLong())
 
         try {
+            startReading(reader)
             waitUntil("the first blocks are in flight") { source.requests().size >= 4 }
             val issued = source.requests()
             val head = assertNotNull(issued.firstOrNull { it.start == 0L }, "the head block was never requested")
@@ -127,6 +141,76 @@ class PikPakStreamReaderTest {
         }
     }
 
+    // Every background request, even the one it is blocked on, must lose to any foreground read-ahead
+    @Test
+    fun `a background reader asks below every foreground request`() = runBlocking<Unit> {
+        val content = payload(8 * 1024 * 1024)
+        val source = FakeRangeSource(content, latency = 30.seconds)
+        val reader = reader(source, content.size.toLong(), role = StreamRole.BACKGROUND)
+
+        try {
+            startReading(reader)
+            waitUntil("the first blocks are in flight") { source.requests().size >= 4 }
+            val highest = source.requests().maxOf { it.priority }
+            assertTrue(
+                highest < PikPakStreamReader.READ_AHEAD_PRIORITY,
+                "a background request at $highest would beat foreground read-ahead",
+            )
+        } finally {
+            reader.close()
+        }
+    }
+
+    // Priority cannot take back a slot, so what bounds playback's wait is how many background requests are in flight
+    @Test
+    fun `a background reader keeps two requests in flight while something plays`() = runBlocking<Unit> {
+        val content = payload(8 * 1024 * 1024)
+        val source = FakeRangeSource(content, latency = 30.seconds)
+        val foreground = ForegroundStreams()
+        foreground.enter()
+        val reader = reader(source, content.size.toLong(), concurrency = 6, role = StreamRole.BACKGROUND, foreground = foreground)
+
+        try {
+            startReading(reader)
+            waitUntil("the capped requests are in flight") { source.requests().size >= 2 }
+            delay(300.milliseconds)
+            val throttled = source.requests()
+            assertEquals(2, throttled.size, "only the capped workers may fetch: $throttled")
+            assertTrue(throttled.all { it.length == unit }, "throttled requests stay single blocks: $throttled")
+
+            // The last foreground reader leaving lifts the cap without anyone touching this reader
+            foreground.leave()
+            waitUntil("the whole budget is back in use") { source.requests().size >= 6 }
+        } finally {
+            reader.close()
+        }
+    }
+
+    @Test
+    fun `promoting a background reader lifts its cap and its priority`() = runBlocking<Unit> {
+        val content = payload(8 * 1024 * 1024)
+        val source = FakeRangeSource(content, latency = 30.seconds)
+        val foreground = ForegroundStreams()
+        foreground.enter()
+        val reader = reader(source, content.size.toLong(), concurrency = 6, role = StreamRole.BACKGROUND, foreground = foreground)
+
+        try {
+            startReading(reader)
+            waitUntil("the capped requests are in flight") { source.requests().size >= 2 }
+            reader.role = StreamRole.FOREGROUND
+            waitUntil("the whole budget is in use") { source.requests().size >= 6 }
+            val promoted = source.requests().drop(2)
+            assertTrue(
+                promoted.all { it.priority >= PikPakStreamReader.READ_AHEAD_PRIORITY },
+                "requests after promotion ask on the foreground band: $promoted",
+            )
+            assertEquals(2, foreground.active.value, "a promoted reader counts as foreground")
+        } finally {
+            reader.close()
+        }
+        assertEquals(1, foreground.active.value, "closing a foreground reader leaves the count")
+    }
+
     @Test
     fun `a seek cancels the blocks it left behind and restarts at one block`() = runBlocking<Unit> {
         val content = payload(8 * 1024 * 1024)
@@ -136,6 +220,7 @@ class PikPakStreamReaderTest {
         val reader = reader(source, content.size.toLong())
 
         try {
+            startReading(reader)
             waitUntil("the first blocks are in flight") { source.requests().size >= 4 }
             val before = source.requests().size
 
@@ -218,12 +303,9 @@ class PikPakStreamReaderTest {
         assertEquals(2, source.requests().count { it.start == unit }, "the failed block was not retried")
     }
 
+    // A dead block used to condemn the whole reader and its cache with it, so callers rebuilt readers and fetched everything again
     @Test
-    fun `a block that never succeeds retires the whole reader`() = runBlocking<Unit> {
-        // MAX_ATTEMPTS exhausted does not fail one read, it condemns the
-        // instance: a player is expected to build a new reader rather than
-        // keep asking. Nothing else pins that, and a stray `failure = null`
-        // would turn it into an intermittent read error instead.
+    fun `a block that never succeeds fails its reads and leaves the reader usable`() = runBlocking<Unit> {
         val content = payload((unit * 4).toInt())
         val source = FakeRangeSource(content, failAlwaysAt = setOf(unit))
         val reader = reader(source, content.size.toLong(), concurrency = 1)
@@ -233,18 +315,152 @@ class PikPakStreamReaderTest {
                 pikPakFailureOf { readAll(reader, chunk = 4096) },
                 "a block that can never be fetched let the read through",
             )
-            assertNotNull(
-                pikPakFailureOf { reader.read(ByteArray(16), 0, 16) },
-                "the reader served a read again after it had failed",
+            val attemptsBefore = source.requests().count { it.start == unit }
+            assertNotNull(pikPakFailureOf { reader.read(ByteArray(16), 0, 16) }, "the dead block read back as data")
+            assertTrue(
+                source.requests().count { it.start == unit } > attemptsBefore,
+                "a later read of the failed block did not try it again",
             )
-            assertEquals(
-                PikPakStreamReader.MAX_ATTEMPTS,
-                source.requests().count { it.start == unit },
-                "the dead block was not attempted exactly MAX_ATTEMPTS times",
-            )
+
+            reader.seekTo(0)
+            val head = ByteArray(16)
+            assertEquals(16, reader.read(head, 0, 16), "the reader stopped serving blocks that are fine")
+            assertContentEquals(content.copyOfRange(0, 16), head)
         } finally {
             reader.close()
         }
+    }
+
+    // mpv opens a second connection to seek while the first is still reading; neither may cancel the other
+    @Test
+    fun `readers on one cache keep their windows and share what they fetched`() = runBlocking<Unit> {
+        val content = payload((unit * 64).toInt())
+        val source = FakeRangeSource(content, latency = 20.milliseconds)
+        val cache = sharedCache(source, content.size.toLong())
+        val first = PikPakStreamReader(cache, ownsCache = false, initialRole = StreamRole.FOREGROUND)
+        val second = PikPakStreamReader(cache, ownsCache = false, initialRole = StreamRole.FOREGROUND)
+
+        try {
+            first.readAheadLimit = unit * 4
+            second.readAheadLimit = unit * 4
+            val buffer = ByteArray(unit.toInt())
+            assertEquals(buffer.size, first.read(buffer, 0, buffer.size))
+            second.seekTo(unit * 40)
+            assertEquals(buffer.size, second.read(buffer, 0, buffer.size))
+            assertContentEquals(content.copyOfRange((unit * 40).toInt(), (unit * 41).toInt()), buffer)
+            waitUntil("both windows are filled") {
+                first.readAheadDepthForTest() == unit * 4 && second.readAheadDepthForTest() == unit * 4
+            }
+            assertTrue(source.cancelled().isEmpty(), "one reader's seek cancelled the other's fetches: ${source.cancelled()}")
+
+            // What the first reader fetched is already there for the second
+            val before = source.requests().size
+            second.seekTo(unit)
+            assertEquals(buffer.size, second.read(buffer, 0, buffer.size))
+            assertContentEquals(content.copyOfRange(unit.toInt(), (unit * 2).toInt()), buffer)
+            assertTrue(source.requests().drop(before).none { it.start == unit }, "a cached block was fetched again")
+        } finally {
+            first.close()
+            second.close()
+            cache.close()
+        }
+    }
+
+    // A feed gives up on the clips scrolled past; left standing, their fetches were the oldest demand and won every tie
+    @Test
+    fun `a withdrawn prefetch cancels the fetch only it wanted`() = runBlocking<Unit> {
+        val content = payload((unit * 8).toInt())
+        val source = FakeRangeSource(content, latency = 30.seconds)
+        val cache = sharedCache(source, content.size.toLong(), concurrency = 1)
+
+        try {
+            val warm = cache.warm(listOf(0L until unit), StreamRole.FOREGROUND, null)
+            waitUntil("the block is in flight") { source.requests().isNotEmpty() }
+            warm.cancel()
+            waitUntil("the fetch is cancelled") { source.cancelled().isNotEmpty() }
+        } finally {
+            cache.close()
+        }
+    }
+
+    // Piko opens a reader per HTTP request; one the player dropped hung on a block a prefetch still wanted
+    @Test
+    fun `closing a reader wakes a read parked on a block others still want`() = runBlocking<Unit> {
+        val content = payload((unit * 8).toInt())
+        val source = FakeRangeSource(content, latency = 30.seconds)
+        val cache = sharedCache(source, content.size.toLong())
+        val warm = cache.warm(listOf(0L until unit), StreamRole.FOREGROUND, null)
+        val reader = PikPakStreamReader(cache, ownsCache = false, initialRole = StreamRole.FOREGROUND)
+
+        try {
+            supervisorScope {
+                val read = async { reader.read(ByteArray(16), 0, 16) }
+                waitUntil("the block is in flight") { source.requests().isNotEmpty() }
+                delay(100.milliseconds)
+                reader.close()
+                withTimeout(2.seconds) { assertFailsWith<PikPakException> { read.await() } }
+            }
+        } finally {
+            warm.cancel()
+            cache.close()
+        }
+    }
+
+    @Test
+    fun `a block store is read before the network and offered what the network delivered`() = runBlocking<Unit> {
+        val content = payload((unit * 8).toInt())
+        val store = MemoryBlockStore()
+        store.write("file", unit * 2, content.copyOfRange((unit * 2).toInt(), (unit * 3).toInt()))
+        val source = FakeRangeSource(content)
+        val cache = sharedCache(source, content.size.toLong(), store = store)
+
+        try {
+            withTimeout(10.seconds) { cache.warm(listOf(0L until unit * 4), StreamRole.FOREGROUND, null).await() }
+            assertTrue(source.requests().none { it.start == unit * 2 }, "a stored block was fetched: ${source.requests()}")
+            waitUntil("fetched blocks reach the store") { store.offsets("file").containsAll(listOf(0L, unit, unit * 3)) }
+
+            val reader = PikPakStreamReader(cache, ownsCache = false, initialRole = StreamRole.FOREGROUND)
+            reader.seekTo(unit * 2)
+            val buffer = ByteArray(unit.toInt())
+            assertEquals(buffer.size, reader.read(buffer, 0, buffer.size))
+            assertContentEquals(content.copyOfRange((unit * 2).toInt(), (unit * 3).toInt()), buffer)
+            reader.close()
+        } finally {
+            cache.close()
+        }
+    }
+
+    private fun sharedCache(
+        source: FakeRangeSource,
+        size: Long,
+        concurrency: Int = 4,
+        store: BlockStore? = null,
+    ) = BlockCache(
+        source = source,
+        size = size,
+        concurrency = concurrency,
+        parentCoroutineContext = EmptyCoroutineContext,
+        blockSize = unit,
+        readAheadBytes = 1L * 1024 * 1024,
+        memoryCapBytes = 2L * 1024 * 1024,
+        wideBlockThresholdBytes = 256L * 1024,
+        foregroundStreams = null,
+        store = store,
+        storeKey = "file",
+    )
+
+    private class MemoryBlockStore : BlockStore {
+        private val blocks = HashMap<Pair<String, Long>, ByteArray>()
+        private val lock = kotlinx.coroutines.sync.Mutex()
+
+        override suspend fun read(file: String, offset: Long, length: Int): ByteArray? =
+            lock.withLock { blocks[file to offset]?.takeIf { it.size == length } }
+
+        override suspend fun write(file: String, offset: Long, bytes: ByteArray) {
+            lock.withLock { blocks[file to offset] = bytes }
+        }
+
+        suspend fun offsets(file: String): Set<Long> = lock.withLock { blocks.keys.filter { it.first == file }.map { it.second }.toSet() }
     }
 
     @Test
@@ -363,6 +579,7 @@ class PikPakStreamReaderTest {
             // the slot it takes between the snapshot below and the abandon
             // makes the arithmetic wrong — which is exactly how this failed on
             // Kotlin/Native while passing on the JVM.
+            startReading(reader)
             waitUntil("the worker is parked in a fetch") { source.requests().isNotEmpty() }
 
             val fetch = assertNotNull(reader.claimForTest(), "there was nothing to claim")
@@ -415,6 +632,56 @@ class PikPakStreamReaderTest {
                     "wrong bytes at $pos in round $round",
                 )
             }
+        } finally {
+            reader.close()
+        }
+    }
+
+    // A feed warms dozens of files this way; read-ahead from offset zero on each would take the account's budget
+    @Test
+    fun `an unread reader fetches only what it is asked to prefetch`() = runBlocking<Unit> {
+        val content = payload(8 * 1024 * 1024)
+        val source = FakeRangeSource(content, latency = 2.milliseconds)
+        val reader = reader(source, content.size.toLong())
+
+        try {
+            delay(200.milliseconds)
+            assertEquals(emptyList(), source.requests(), "a reader nobody reads from fetched on its own")
+
+            val tail = content.size - 2 * unit until content.size.toLong()
+            withTimeout(10.seconds) { reader.prefetch(listOf(tail)).await() }
+            delay(200.milliseconds)
+            val issued = source.requests()
+            assertTrue(issued.isNotEmpty() && issued.all { it.start >= tail.first }, "fetched outside the prefetch: $issued")
+            assertEquals(0L, reader.position, "a prefetch moved the read position")
+
+            val buffer = ByteArray(1024)
+            reader.seekTo(tail.first)
+            assertEquals(buffer.size, reader.read(buffer, 0, buffer.size))
+            assertContentEquals(content.copyOfRange(tail.first.toInt(), tail.first.toInt() + buffer.size), buffer)
+        } finally {
+            reader.close()
+        }
+    }
+
+    // mpv reads the head while the tail index is on its way; the head's seeks must not take the tail down
+    @Test
+    fun `a seek does not cancel a prefetch`() = runBlocking<Unit> {
+        val content = payload(8 * 1024 * 1024)
+        val source = FakeRangeSource(content, latency = 300.milliseconds)
+        val reader = reader(source, content.size.toLong())
+
+        try {
+            startReading(reader)
+            val tail = content.size - unit until content.size.toLong()
+            val pending = reader.prefetch(listOf(tail), priority = PikPakStreamReader.BLOCKING_PRIORITY + 1)
+            waitUntil("the tail is in flight") { source.requests().any { it.start == tail.first } }
+            reader.seekTo(unit * 20)
+
+            withTimeout(10.seconds) { pending.await() }
+            assertTrue(source.cancelled().none { it.start == tail.first }, "the seek cancelled the prefetch")
+            val tailRequest = source.requests().first { it.start == tail.first }
+            assertEquals(PikPakStreamReader.BLOCKING_PRIORITY + 1, tailRequest.priority, "the prefetch lost the priority it asked for")
         } finally {
             reader.close()
         }

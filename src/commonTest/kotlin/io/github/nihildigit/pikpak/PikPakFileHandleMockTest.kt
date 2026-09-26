@@ -106,6 +106,34 @@ class PikPakFileHandleMockTest {
     private fun creates() = calls.count { it == "POST /drive/v1/files" }
     private fun details() = calls.count { it.startsWith("GET /drive/v1/files/") }
 
+    // Each reader's first link used to cost a detail lookup even when the caller had just done one
+    @Test
+    fun `a link handed in is used until it goes bad`() = runBlocking<Unit> {
+        val client = newClient()
+        val handle = PikPakFileHandle(
+            client = client,
+            gcid = GCID,
+            size = 1000,
+            name = "ep.mkv",
+            initialFileId = "f1",
+            initialLink = VariantLink("https://cdn/f1", expiresAt = null),
+        )
+        try {
+            assertEquals("https://cdn/f1", handle.provideUrl(UrlRequest.Initial))
+            assertEquals("https://cdn/f1", handle.provideUrl(UrlRequest.Initial))
+            assertEquals(0, details(), "a usable link in hand still cost a lookup")
+
+            // Another file saw this host fail. Every mint here lands on the same host, so what
+            // is left to check is that the handle tried to get off it, and gave up in bounded time.
+            client.hostHealth.answered("https://elsewhere/f9")
+            client.hostHealth.markSilent("https://cdn/f1")
+            handle.provideUrl(UrlRequest.Initial)
+            assertEquals(1 + PikPakFileHandle.MAX_HOST_REMINTS, details(), "a link on a failing host was not replaced")
+        } finally {
+            handle.close(); client.close()
+        }
+    }
+
     @Test
     fun `an expired signature resolves the same file again`() = runBlocking<Unit> {
         val client = newClient()

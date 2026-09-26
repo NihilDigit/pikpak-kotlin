@@ -73,7 +73,7 @@ class ReadmeCompositionTest {
         val handle = PikPakFileHandle(client, gcid = "C".repeat(40), size = 64, name = "x.mkv")
         var entered = false
         try {
-            handle.openStream(size = 64).use { stream ->
+            handle.openStream().use { stream ->
                 entered = true
                 assertEquals(64L, stream.bytesRemaining)
             }
