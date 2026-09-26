@@ -24,6 +24,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -60,6 +61,55 @@ class RangeReaderMockTest {
         assertContentEquals(content.copyOfRange(0, 256), bytes)
         assertEquals(2, issued, "one initial URL plus one refresh")
         assertEquals(1, reader.stats.value.urlRefreshes)
+        client.close()
+    }
+
+    // A dead edge host never answers; left alone the read would sit there until the socket timed out
+    @Test
+    fun `a host that does not answer is left for a fresh link`() = runBlocking {
+        val asked = mutableListOf<UrlRequest>()
+        val client = clientWith { req ->
+            if (req.url.host == "dead") awaitCancellation() else partial(req, content)
+        }
+        val reader = RangeReader(
+            client = client,
+            urlProvider = { request ->
+                asked += request
+                if (asked.size == 1) "https://dead/file" else "https://alive/file"
+            },
+        )
+
+        val bytes = withTimeout(RangeReader.FIRST_RESPONSE_DEADLINE * 3) { reader.readBytes(0, 256) }
+        assertContentEquals(content.copyOfRange(0, 256), bytes)
+        assertTrue(asked[1] is UrlRequest.Unresponsive, "the second link was asked for as a host change: $asked")
+
+        // The next read goes straight to the new host instead of waiting out the dead one again
+        val started = kotlin.time.TimeSource.Monotonic.markNow()
+        reader.readBytes(256, 256)
+        assertTrue(started.elapsedNow() < RangeReader.FIRST_RESPONSE_DEADLINE, "a later read went back to the dead host")
+        client.close()
+    }
+
+    // The HTTP layer retries a 503 before the body is handed over, and with Retry-After that can
+    // outlast the first-response deadline; the host did answer, so it must not be dropped
+    @Test
+    fun `a host answering 503 past the deadline is not taken for a silent one`() = runBlocking {
+        var attempts = 0
+        val client = clientWith { req ->
+            attempts++
+            if (attempts <= 3) {
+                respond(ByteReadChannel(ByteArray(0)), HttpStatusCode.ServiceUnavailable, headersOf(HttpHeaders.RetryAfter, "1"))
+            } else {
+                partial(req, content)
+            }
+        }
+        val asked = mutableListOf<UrlRequest>()
+        val reader = RangeReader(client, { request -> asked += request; "https://busy/file" })
+
+        val bytes = withTimeout(RangeReader.FIRST_RESPONSE_DEADLINE * 4) { reader.readBytes(0, 128) }
+        assertContentEquals(content.copyOfRange(0, 128), bytes)
+        assertEquals(listOf<UrlRequest>(UrlRequest.Initial), asked, "a busy host was abandoned as a silent one")
+        assertFalse(client.hostHealth.isBad("https://busy/file"))
         client.close()
     }
 
@@ -310,11 +360,6 @@ class RangeReaderMockTest {
         assertEquals(2, retried.single().retriedServerErrors, "both 5xx belong to the read that got them")
         assertTrue(retried.single().retryBackoff > Duration.ZERO, "the backoff is latency this read paid")
         assertEquals(0, clean.single().retries, "the concurrent read retried nothing and must report nothing")
-        assertEquals(
-            2,
-            client.httpRetries.value.serverErrors,
-            "the client-wide counter sees both retries but cannot say which read they belong to",
-        )
         client.close()
     }
 

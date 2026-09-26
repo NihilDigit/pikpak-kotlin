@@ -70,6 +70,15 @@ class MultiFileConcurrencyProbeTest {
         ?: "pikpak-kotlin-multifile-probe"
 
     private val connectionsPerFile = env["PIKPAK_MULTIFILE_CONNS"]?.toIntOrNull() ?: 8
+
+    /** A transcode's media name ("720P") to probe its links instead of the original's; they may be served elsewhere. */
+    private val variant = env["PIKPAK_MULTIFILE_VARIANT"]?.takeIf { it.isNotBlank() }
+
+    /**
+     * Distance between the start offsets of one file's connections. A transcode is a fraction of
+     * the original's size, and a start past its end comes back 416, which is not a refusal.
+     */
+    private val spreadBytes = (env["PIKPAK_MULTIFILE_SPREAD_MB"]?.toLongOrNull() ?: 64L) shl 20
     private val measureSeconds = env["PIKPAK_MULTIFILE_SECONDS"]?.toIntOrNull() ?: 12
     private val readyTimeoutSeconds = env["PIKPAK_MULTIFILE_READY_SEC"]?.toIntOrNull() ?: 300
 
@@ -112,8 +121,10 @@ class MultiFileConcurrencyProbeTest {
 
             val urls = files.mapNotNull { stat ->
                 val detail = sdk.getFile(stat.id)
-                detail.downloadUrl?.let { stat.name to it }
+                val url = if (variant == null) detail.downloadUrl else detail.medias.firstOrNull { it.mediaName == variant }?.url
+                url?.let { stat.name to it }
             }
+            log("variant: ${variant ?: "original download link"}")
             Assumptions.assumeTrue(urls.isNotEmpty(), "no episode produced a downloadUrl")
             log("resolved ${urls.size} signed urls")
             log("hosts: ${urls.map { it.second.substringAfter("://").substringBefore("/") }.distinct()}")
@@ -130,8 +141,13 @@ class MultiFileConcurrencyProbeTest {
             }
         } finally {
             if (cleanup && folderId != null) {
-                runCatching { sdk.batchTrash(listOf(folderId)) }
-                    .onFailure { log("cleanup failed: $it") }
+                // Deleted outright, not trashed, along with earlier runs' copies still in the bin:
+                // a trashed pack still counts against the account's quota until the bin is emptied.
+                runCatching {
+                    val leftovers = sdk.listTrash().filter { it.isFolder && it.name == folderName }.map { it.id }
+                    sdk.batchDelete(listOf(folderId) + leftovers)
+                    log("deleted '$folderName' and ${leftovers.size} trashed copies")
+                }.onFailure { log("cleanup failed: $it") }
             } else if (folderId != null) {
                 log("")
                 log("left '$folderName' in place; set PIKPAK_MULTIFILE_CLEANUP=1 to trash it")
@@ -220,7 +236,7 @@ class MultiFileConcurrencyProbeTest {
                 (0 until connectionsPerFile).map { connIndex ->
                     async {
                         // Spread the starts so concurrent reads of one file do not overlap.
-                        val start = (connIndex.toLong() * 64L shl 20)
+                        val start = connIndex * spreadBytes
                         drain(http, url, start, bytes, perFile[fileIndex], statuses, midReadFailures)
                     }
                 }
@@ -235,6 +251,7 @@ class MultiFileConcurrencyProbeTest {
         log("  outcomes: $seen")
         if (midReadFailures.get() > 0) log("  dropped mid-read (already admitted): ${midReadFailures.get()}")
         log("  per file: ${perFile.joinToString(" ") { rate(it.get()) }} MB/s")
+        log("  hosts: ${target.joinToString(" ") { it.second.substringAfter("://").substringBefore(".") }}")
         log("  aggregate: ${rate(bytes.get())} MB/s")
         log("")
     }

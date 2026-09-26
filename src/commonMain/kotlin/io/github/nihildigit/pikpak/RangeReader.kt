@@ -1,6 +1,8 @@
 package io.github.nihildigit.pikpak
 
+import io.github.nihildigit.pikpak.internal.HostHealth
 import io.github.nihildigit.pikpak.internal.PriorityGate
+import io.github.nihildigit.pikpak.internal.RequestOrder
 import io.ktor.utils.io.ByteChannel
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
@@ -8,10 +10,12 @@ import io.ktor.utils.io.readAvailable
 import io.ktor.utils.io.writeFully
 import kotlin.time.Instant
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -37,13 +41,22 @@ sealed interface UrlRequest {
 
     /** [previous] failed with a client error that is not an expiry, e.g. 404 after the file moved. */
     data class Rejected(val previous: String, val status: Int) : UrlRequest
+
+    /**
+     * [previous]'s edge host did not answer in time, or broke the transfer. The link itself is
+     * fine; what is wanted is a fresh one, which PikPak signs for a host picked anew each time.
+     */
+    data class Unresponsive(val previous: String) : UrlRequest
 }
 
 /** Live counters for one [RangeReader]. */
 data class RangeReaderStats(
-    /** Reads currently holding a connection slot. */
+    /**
+     * Reads holding a slot of the file's gate. A [PikPakFileHandle] shares one gate across the
+     * readers it replaces on refresh, so this counts the file, not this reader alone.
+     */
     val activeReads: Int = 0,
-    /** Reads waiting for a slot. */
+    /** Reads waiting for a slot of the file's gate; shared the same way. */
     val queuedReads: Int = 0,
     /** Bytes delivered to callers since construction. */
     val bytesRead: Long = 0,
@@ -163,7 +176,9 @@ class RangeReader internal constructor(
      * read: the channel closes after the bytes that exist, and [block] sees
      * fewer than [length] bytes rather than an error.
      *
-     * @param priority higher wins a contended slot. Equal priorities are FIFO.
+     * @param priority higher wins a contended slot. Equal priorities go to the
+     *   older demand (a RequestOrder on the calling context, which the stream
+     *   reader sets), then to arrival order.
      */
     suspend fun <T> read(
         start: Long,
@@ -207,22 +222,16 @@ class RangeReader internal constructor(
         var cause: Throwable? = null
     }
 
-    /** Reads a range into memory. Only for ranges small enough to hold; [read] is the general form. */
+    /** The CDN took the request and sent nothing back within [limit]. Not a CancellationException, so it reaches the retry path. */
+    private class UnresponsiveHost(limit: Duration) : Exception("no response headers within $limit")
+
+    /**
+     * Reads a range into memory. Only for ranges small enough to hold; [read] is the general
+     * form. Like [RangeSource.readBytes], a range past the end of the file comes back short.
+     */
     suspend fun readBytes(start: Long, length: Long, priority: Int = 0): ByteArray {
         require(length <= Int.MAX_VALUE) { "readBytes cannot materialise $length bytes" }
-        val out = ByteArray(length.toInt())
-        read(start, length, priority) { channel ->
-            var filled = 0
-            while (filled < out.size) {
-                val n = channel.readAvailable(out, filled, out.size - filled)
-                if (n == -1) break
-                filled += n
-            }
-            if (filled != out.size) {
-                throw PikPakException(-1, "readBytes: got $filled of $length bytes at offset $start")
-            }
-        }
-        return out
+        return read(start, length, priority) { channel -> channel.readFully(length.toInt()) }
     }
 
     /**
@@ -251,10 +260,12 @@ class RangeReader internal constructor(
      * while doing nothing.
      */
     private suspend fun <T> withSlot(priority: Int, body: suspend () -> T): T {
-        gate.acquire(priority)
+        // A read nobody ordered is ordered by now, which keeps the old arrival order among such reads
+        val order = currentCoroutineContext()[RequestOrder]?.value ?: RequestOrder.Sequence.next()
+        gate.acquire(priority, order)
         updateStats()
         try {
-            client.accountGate.acquire(priority)
+            client.accountGate.acquire(priority, order)
             try {
                 return body()
             } finally {
@@ -302,7 +313,7 @@ class RangeReader internal constructor(
             // Started even when nobody is listening: the branch would have to
             // be repeated at all six places an attempt can end, and a recorder
             // nothing reads costs one allocation per request.
-            val attempt = RangeAttemptRecorder(offset, remaining, gate.inUse, gate.queued, priority)
+            val attempt = RangeAttemptRecorder(offset, remaining, gate.inUse, gate.queued, priority, HostHealth.hostOf(attemptUrl))
 
             try {
                 // Only an extra context element, so the block below still runs
@@ -310,8 +321,28 @@ class RangeReader internal constructor(
                 // the retries HttpEngine performs under this one request are
                 // counted against this attempt and no other.
                 withContext(attempt.retries) {
+                  coroutineScope {
+                    // The request is past both gates here. What sits below them is the HTTP
+                    // layer's own retries of a 5xx or 429, which are the host answering, only
+                    // not yet with the body; so the clock restarts whenever one lands, and what
+                    // is left is a host that said nothing at all.
+                    // Throwing from the child fails the scope and cancels the request with it.
+                    val answered = CompletableDeferred<Unit>()
+                    val deadline = launch {
+                        var statusesSeen = attempt.retries.statuses
+                        while (true) {
+                            delay(FIRST_RESPONSE_DEADLINE)
+                            if (answered.isCompleted) return@launch
+                            val statuses = attempt.retries.statuses
+                            if (statuses == statusesSeen) throw UnresponsiveHost(FIRST_RESPONSE_DEADLINE)
+                            statusesSeen = statuses
+                        }
+                    }
                     client.streamRangeFromUrl(attemptUrl, offset, remaining) { stream ->
+                        answered.complete(Unit)
+                        deadline.cancel()
                         attempt.headersReceived()
+                        client.hostHealth.answered(attemptUrl)
                         announced = stream.contentLength
                         clippedAtEof = stream.endsBeforeRequested(offset, remaining)
                         val buffer = ByteArray(READ_CHUNK)
@@ -350,6 +381,7 @@ class RangeReader internal constructor(
                             }
                         }
                     }
+                  }
                 }
             } catch (t: Throwable) {
                 if (t is CancellationException) {
@@ -359,9 +391,11 @@ class RangeReader internal constructor(
                     // more channel read it takes to see EOF. Whether the pump reaches the
                     // report below first is then a race -- one the JVM wins, because there
                     // the last read returns -1 without suspending, and Kotlin/Native loses.
-                    // The attempt delivered what it delivered either way, and one nobody
-                    // reports is one that did not happen as far as any measurement can tell.
-                    report(attempt, outcomeFor(announced, delivered))
+                    // So a cancelled attempt that had everything is Complete; one cut short
+                    // is Cancelled, not Failed: nothing went wrong on the wire, and calling it
+                    // a failure made every seek look like a flaky host.
+                    val whole = announced != null && delivered >= announced!!
+                    report(attempt, if (whole) RangeAttempt.Outcome.Complete else RangeAttempt.Outcome.Cancelled)
                     throw t
                 }
                 offset += delivered
@@ -388,12 +422,21 @@ class RangeReader internal constructor(
                         rejectionRefreshed = true
                         refreshUrl(UrlRequest.Rejected(attemptUrl, t.httpStatus!!), attemptUrl)
                     }
+                    t is UnresponsiveHost -> {
+                        report(attempt, RangeAttempt.Outcome.Failed)
+                        failures++
+                        if (failures >= maxAttempts) throw PikPakException(-1, "RangeReader: no host answered at offset $offset", cause = t)
+                        bumpRetries()
+                        // No backoff: nothing is wrong with the network, only with that host
+                        switchHost(attemptUrl, silent = true)
+                    }
                     else -> {
                         report(attempt, RangeAttempt.Outcome.Failed)
                         failures++
                         if (failures >= maxAttempts) throw t
                         bumpRetries()
                         delay(client.retryPolicy.delayFor(failures - 1))
+                        switchHost(attemptUrl)
                     }
                 }
                 continue
@@ -427,6 +470,7 @@ class RangeReader internal constructor(
                 }
                 bumpRetries()
                 delay(client.retryPolicy.delayFor(failures - 1))
+                switchHost(attemptUrl)
             } else {
                 bumpRetries()
             }
@@ -442,11 +486,13 @@ class RangeReader internal constructor(
      * signature at once must not become eight getFile calls, so a refresh that
      * already happened is reused.
      */
-    private suspend fun refreshUrl(reason: UrlRequest, stale: String): String = urlMutex.withLock {
+    private suspend fun refreshUrl(reason: UrlRequest, stale: String, allowSame: Boolean = false): String = urlMutex.withLock {
         val existing = url
         if (existing != null && existing != stale) return existing
         val fresh = urlProvider(reason)
-        if (fresh == stale) {
+        // Same link back is fatal only when the link is what was refused. A host that did not
+        // answer may answer the next time; retrying it is no worse than retrying without a refresh.
+        if (fresh == stale && !allowSame) {
             throw PikPakException(
                 -1,
                 "RangeReader: urlProvider returned the same rejected URL; it cannot make progress",
@@ -459,12 +505,43 @@ class RangeReader internal constructor(
         fresh
     }
 
+    /**
+     * Moves this reader, and every read on it after this one, off [stale]'s edge host.
+     *
+     * PikPak signs each link for a host picked anew, so a fresh link is usually elsewhere.
+     * Retrying the same link instead is what the transport failures here defeat: measured
+     * 2026-09-26, a host that stops answering does it for every request, and one that cuts
+     * transfers short does it again on the retry, while the rest of the pool answers in
+     * 300–500 ms. A failed refresh keeps [stale] rather than failing the read — the
+     * failure may be the network, not the host, and then the old link is as good as any.
+     *
+     * A [silent] host, one that sent nothing within the first-response deadline, is also
+     * reported to the client, so links other files mint for it are replaced before a read
+     * ever lands there; see [HostHealth] for the corroboration it asks for first. A body
+     * cut short is not reported: a dropped Wi-Fi or a suspended laptop does that to every
+     * connection at once, and would mark the whole pool.
+     */
+    private suspend fun switchHost(stale: String, silent: Boolean = false) {
+        if (silent) client.hostHealth.markSilent(stale)
+        try {
+            refreshUrl(UrlRequest.Unresponsive(stale), stale, allowSame = true)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
+    }
+
     // Counters are bumped from every pump at once; a read-copy-write on
     // StateFlow.value would lose increments, update() retries on contention.
 
     private fun updateStats() {
         _stats.update { it.copy(activeReads = gate.inUse, queuedReads = gate.queued) }
     }
+
+    /** A body that stopped short of its own Content-Length by itself ended the way a transport error does. */
+    private fun outcomeFor(announced: Long?, delivered: Long): RangeAttempt.Outcome =
+        if (announced != null && delivered < announced) RangeAttempt.Outcome.Failed
+        else RangeAttempt.Outcome.Complete
 
     /**
      * Hands a finished attempt to [onAttempt], never letting it end the read.
@@ -474,16 +551,6 @@ class RangeReader internal constructor(
      * does not apply, because the caller supplied the code that threw and it is
      * not on the path the bytes take.
      */
-    /**
-     * What an attempt that stopped delivering should be called.
-     *
-     * A body that stopped short of its own Content-Length ended the same way a transport
-     * error does, whether it stopped by itself or because the read was cancelled.
-     */
-    private fun outcomeFor(announced: Long?, delivered: Long): RangeAttempt.Outcome =
-        if (announced != null && delivered < announced) RangeAttempt.Outcome.Failed
-        else RangeAttempt.Outcome.Complete
-
     private fun report(recorder: RangeAttemptRecorder, outcome: RangeAttempt.Outcome) {
         val observer = onAttempt ?: return
         try {
@@ -523,7 +590,7 @@ class RangeReader internal constructor(
     private fun throttleBackoff(attempt: Int): Duration =
         (THROTTLE_BASE_DELAY_MS * attempt).coerceAtMost(THROTTLE_MAX_DELAY_MS).milliseconds
 
-    private companion object {
+    internal companion object {
         const val READ_CHUNK = 64 * 1024
 
         /**
@@ -539,6 +606,18 @@ class RangeReader internal constructor(
         val BODY_SILENCE = 3.seconds
 
         /**
+         * How long a request that has been sent may wait for its response headers before the
+         * host is given up on for another; see [switchHost].
+         *
+         * Measured 2026-09-26 across a dozen edge hosts: a healthy one answers in 300–500 ms,
+         * cold ranges no slower than warm ones, with eight requests in flight on the link. The
+         * ones that do not answer then do not answer at all — a minute later the socket times
+         * out. Four times the healthy worst case leaves room for a congested line without letting
+         * a dead host hold a read for long.
+         */
+        val FIRST_RESPONSE_DEADLINE = 2.seconds
+
+        /**
          * A 503 means the URL is at its connection cap; waiting is the whole
          * remedy. The ceiling only exists so a permanently saturated URL fails
          * instead of hanging.
@@ -548,19 +627,3 @@ class RangeReader internal constructor(
         const val THROTTLE_MAX_DELAY_MS = 2_000L
     }
 }
-
-/**
- * A [RangeReader] over [fileId] that refreshes its own URL via `getFile`.
- * The common case: the caller has a file id and wants bytes.
- */
-fun PikPakClient.rangeReader(
-    fileId: String,
-    connectionBudget: Int = this.connectionBudget,
-): RangeReader = RangeReader(
-    client = this,
-    urlProvider = {
-        getFile(fileId).downloadUrl
-            ?: throw PikPakException(-1, "rangeReader: file $fileId has no octet-stream link")
-    },
-    connectionBudget = connectionBudget,
-)

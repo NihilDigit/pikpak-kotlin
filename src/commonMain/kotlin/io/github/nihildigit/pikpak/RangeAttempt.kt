@@ -105,8 +105,16 @@ class RangeAttempt(
     val retriedTransport: Int = 0,
     /** Time this attempt spent in retry backoff, included in [duration]. */
     val retryBackoff: Duration = Duration.ZERO,
+    /**
+     * The CDN edge host the request went to. Links are signed per host and a failing one is
+     * left for a fresh link, so consecutive attempts of one read can name different hosts.
+     */
+    val host: String? = null,
 ) {
-    /** How the attempt ended. Everything but [Complete] means another attempt followed. */
+    /**
+     * How the attempt ended. Everything but [Complete] and [Cancelled] means another
+     * attempt followed.
+     */
     enum class Outcome {
         /** The body arrived in full, or ran to the end of the file. */
         Complete,
@@ -120,8 +128,15 @@ class RangeAttempt(
         /** A 4xx that is not an expiry, e.g. the file object moved. */
         Rejected,
 
-        /** A transport failure or a body that stopped early. */
+        /** A transport failure, a body that stopped early by itself, or a host that sent nothing in time. */
         Failed,
+
+        /**
+         * The reader stopped it before the body was complete: the consumer had what it
+         * wanted, a seek or a closed stream no longer wanted the rest. Nothing is wrong
+         * on the wire, and most attempts a player makes end this way.
+         */
+        Cancelled,
     }
 
     /** Bytes per second over [duration], counting the round trip. Zero when nothing arrived. */
@@ -196,6 +211,7 @@ internal class RangeAttemptRecorder(
     private val activeReads: Int,
     private val queuedReads: Int,
     private val priority: Int,
+    private val host: String? = null,
 ) {
     /**
      * Installed on the coroutine that issues this attempt's request, so the
@@ -249,5 +265,6 @@ internal class RangeAttemptRecorder(
         retriedRateLimited = retries.rateLimited,
         retriedTransport = retries.transport,
         retryBackoff = retries.waited,
+        host = host,
     )
 }

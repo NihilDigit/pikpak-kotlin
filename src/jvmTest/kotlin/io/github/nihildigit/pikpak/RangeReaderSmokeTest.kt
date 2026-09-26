@@ -140,12 +140,8 @@ class RangeReaderSmokeTest {
             val single = timeRead(reader, offset = 16L shl 20, total = 8L shl 20, parts = 1)
             val fanned = timeRead(reader, offset = 64L shl 20, total = 32L shl 20, parts = 8)
             println("[smoke] throughput: 1 conn = ${"%.2f".format(single)} MB/s, 8 conn = ${"%.2f".format(fanned)} MB/s, x${"%.1f".format(fanned / single)}")
-            // Printed beside the two rates because a fan-out that lost to one
-            // connection is not by itself a slow link: these retries happen
-            // under the caller and each costs a round trip plus backoff, so a
-            // run where fanning out made things worse and this line is non-zero
-            // has found the connection cap rather than the route.
-            println("[smoke] retries the caller never saw: ${client.httpRetries.value}")
+            // The stats count the 503s that reached the reader; the ones the HTTP layer retried
+            // underneath are on each RangeAttempt, for a run that needs them.
             println("[smoke] reader stats: ${reader.stats.value}")
             // Per-connection throughput is bounded by the round trip, not by a
             // server-side rate limit: a distant route gives well under 1 MB/s on
@@ -219,14 +215,11 @@ class RangeReaderSmokeTest {
             assertTrue(smallDetail.downloadUrl != null, "no download link for $smallId after 20s")
             val dest = Path(SystemFileSystem.resolve(Path("build")).toString(), "smoke-$smallId.bin")
             SystemFileSystem.delete(dest, mustExist = false)
-            val written = client.downloadFromUrl(
-                url = smallDetail.downloadUrl!!,
-                dest = dest,
-                totalSize = smallDetail.sizeBytes,
-                concurrency = 4,
-            )
+            val written = client.fileHandle(smallDetail).use { handle ->
+                handle.downloadTo(dest = dest, totalSize = smallDetail.sizeBytes, concurrency = 4)
+            }
             val onDisk = SystemFileSystem.metadataOrNull(dest)?.size ?: -1
-            println("[smoke] downloadFromUrl ${smallDetail.name}: returned=$written onDisk=$onDisk expected=${smallDetail.sizeBytes}")
+            println("[smoke] downloadTo ${smallDetail.name}: returned=$written onDisk=$onDisk expected=${smallDetail.sizeBytes}")
             assertEquals(smallDetail.sizeBytes, written)
             assertEquals(smallDetail.sizeBytes, onDisk)
             SystemFileSystem.delete(dest, mustExist = false)

@@ -17,10 +17,16 @@ import io.ktor.client.HttpClient
  * its own per-route limit. Ktor's shared `HttpClientConfig` cannot reach any
  * of them, hence the expect/actual.
  *
+ * [perHostLimit] has to be the account budget, not the per-file one. The gates
+ * above already bound how many requests are in flight; an engine cap below them
+ * only adds a hidden queue, and two files whose links land on one edge host
+ * then sit in it past RangeReader's first-response deadline, which reads the
+ * wait as a dead host.
+ *
  * Consumers who would rather not have the SDK pick an engine can pass their
  * own client for this role; see the PikPakClient constructor.
  */
-internal expect fun defaultCdnHttpClient(connectionBudget: Int): HttpClient
+internal expect fun defaultCdnHttpClient(perHostLimit: Int): HttpClient
 
 internal const val CDN_CONNECT_TIMEOUT_MS = 15_000L
 

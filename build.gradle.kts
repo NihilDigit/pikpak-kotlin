@@ -1,5 +1,6 @@
 import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.plugin.KotlinPlatformType
 
 plugins {
     kotlin("multiplatform") version "2.3.10"
@@ -11,7 +12,7 @@ plugins {
 }
 
 group = "io.github.nihildigit"
-version = "0.9.0"
+version = "0.9.1-SNAPSHOT"
 
 @OptIn(ExperimentalKotlinGradlePluginApi::class)
 kotlin {
@@ -42,7 +43,19 @@ kotlin {
     // two targets. The Darwin-specific actuals live in appleMain, the widest
     // set that still sees platform.darwin, so an added macOS target would
     // pick them up without moving files.
-    applyDefaultHierarchyTemplate()
+    //
+    // jvmAndroidMain holds what the JVM and Android share beyond commonMain:
+    // both run OkHttp, and the CDN client was two identical copies before it.
+    // The Android KMP library plugin's target has no withX of its own in the
+    // hierarchy DSL, so it is matched by platform type.
+    applyDefaultHierarchyTemplate {
+        common {
+            group("jvmAndroid") {
+                withJvm()
+                withCompilations { it.platformType == KotlinPlatformType.androidJvm }
+            }
+        }
+    }
 
     sourceSets {
         // Ktor compile-time ABI baseline. Ktor's companion-object `val` constants
@@ -74,10 +87,9 @@ kotlin {
             // Ktor core APIs are compileOnly so the SDK does not force a specific
             // Ktor version on consumers (see issue #1 — animeko's 3.1.1 was being
             // upgraded to 3.4.2 transitively). Consumers must add their own Ktor
-            // client-core + content-negotiation + serialization-kotlinx-json.
+            // client-core and an engine. Nothing else: the SDK parses JSON by
+            // hand, and ContentNegotiation must not be installed on its clients.
             compileOnly("io.ktor:ktor-client-core:$ktorCompileVersion")
-            compileOnly("io.ktor:ktor-client-content-negotiation:$ktorCompileVersion")
-            compileOnly("io.ktor:ktor-serialization-kotlinx-json:$ktorCompileVersion")
             implementation("org.kotlincrypto.hash:md:$kotlincryptoVersion")
             implementation("org.kotlincrypto.hash:sha1:$kotlincryptoVersion")
             implementation("org.kotlincrypto.hash:sha2:$kotlincryptoVersion")
@@ -88,8 +100,6 @@ kotlin {
             implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:$coroutinesVersion")
             // Tests must materialise the Ktor classes the SDK declares compileOnly.
             implementation("io.ktor:ktor-client-core:$ktorTestVersion")
-            implementation("io.ktor:ktor-client-content-negotiation:$ktorTestVersion")
-            implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorTestVersion")
             implementation("io.ktor:ktor-client-mock:$ktorTestVersion")
         }
         jvmMain.dependencies {
@@ -111,6 +121,9 @@ kotlin {
 
         // Android rides on the same OkHttp engine as JVM.
         androidMain.dependencies {
+            compileOnly("io.ktor:ktor-client-okhttp:$ktorCompileVersion")
+        }
+        getByName("jvmAndroidMain").dependencies {
             compileOnly("io.ktor:ktor-client-okhttp:$ktorCompileVersion")
         }
 

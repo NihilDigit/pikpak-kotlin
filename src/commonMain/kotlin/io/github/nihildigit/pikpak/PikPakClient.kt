@@ -2,6 +2,8 @@ package io.github.nihildigit.pikpak
 
 import io.github.nihildigit.pikpak.internal.AuthApi
 import io.github.nihildigit.pikpak.internal.FolderIdCache
+import io.github.nihildigit.pikpak.internal.ForegroundStreams
+import io.github.nihildigit.pikpak.internal.HostHealth
 import io.github.nihildigit.pikpak.internal.HttpEngine
 import io.github.nihildigit.pikpak.internal.PriorityGate
 import io.github.nihildigit.pikpak.internal.defaultCdnHttpClient
@@ -16,31 +18,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import kotlin.time.Duration
 import org.kotlincrypto.hash.md.MD5
-
-/**
- * Retries the HTTP layer performed without the caller ever learning of one.
- *
- * See [PikPakClient.httpRetries] for why this is not simply part of
- * [RangeReaderStats].
- */
-data class HttpRetryStats(
-    /** 5xx responses retried. On a range request this is the CDN's connection cap. */
-    val serverErrors: Int = 0,
-    /** 429 responses retried. */
-    val rateLimited: Int = 0,
-    /** Transport failures retried, which carry no status. */
-    val transport: Int = 0,
-    /** Time spent in backoff across all of them, which is time a caller saw as latency. */
-    val waited: Duration = Duration.ZERO,
-) {
-    /** These counters only ever rise, so a caller keeps a baseline and subtracts it. */
-    operator fun minus(earlier: HttpRetryStats) = HttpRetryStats(
-        serverErrors = serverErrors - earlier.serverErrors,
-        rateLimited = rateLimited - earlier.rateLimited,
-        transport = transport - earlier.transport,
-        waited = waited - earlier.waited,
-    )
-}
 
 /**
  * Entry point to the PikPak SDK.
@@ -121,16 +98,16 @@ class PikPakClient(
      * Client for signed CDN and OSS URLs.
      *
      * When the SDK owns its clients this is a separate, per-platform-tuned one
-     * allowing at least [connectionBudget] connections per host, because every
-     * engine's default cap is lower and the CDN offers no HTTP/2 to
-     * multiplex over.
+     * allowing as many connections per host as the account gate does, because
+     * every engine's default cap is lower, the CDN offers no HTTP/2 to
+     * multiplex over, and the gates are what should be doing the limiting.
      *
      * An injected [httpClient] is reused here rather than quietly opening a
      * second connection pool behind the caller's back. That costs the tuning:
      * to keep both, pass [tunedCdnClient] as `cdnHttpClient`.
      */
     private val cdn: Lazy<HttpClient> = lazy {
-        cdnHttpClient ?: httpClient ?: defaultCdnHttpClient(connectionBudget)
+        cdnHttpClient ?: httpClient ?: defaultCdnHttpClient(maxOf(connectionBudget, accountConnectionBudget))
     }
     /**
      * The account-wide half of the two-level connection limit.
@@ -144,6 +121,27 @@ class PikPakClient(
      */
     internal val accountGate = PriorityGate(accountConnectionBudget)
 
+    /**
+     * Foreground readers open on this account. Priority alone orders the
+     * queue but cannot take back a slot a background read already holds, so
+     * background readers also shrink their in-flight count while this is
+     * non-zero; see [PikPakStreamReader.role].
+     */
+    internal val foregroundStreams = ForegroundStreams()
+
+    /** Edge hosts that failed recently, so no file on the account mints a link to one again soon. */
+    internal val hostHealth = HostHealth()
+
+    // Keyed by content and variant: a transcode's length is only learned by a probe, and it
+    // cannot change while the content exists, whichever file object or link reaches it.
+    private val streamSizes = MutableStateFlow<Map<String, Long>>(emptyMap())
+
+    internal fun knownStreamSize(gcid: String, mediaId: String): Long? = streamSizes.value["$gcid/$mediaId"]
+
+    internal fun rememberStreamSize(gcid: String, mediaId: String, size: Long) {
+        streamSizes.update { it + ("$gcid/$mediaId" to size) }
+    }
+
     init {
         // A gate of zero never grants its first slot — nothing holds one, so
         // nothing releases one — and every range read parks forever instead of
@@ -152,34 +150,6 @@ class PikPakClient(
         require(connectionBudget >= 1) { "connectionBudget must be >= 1, got $connectionBudget" }
         require(accountConnectionBudget >= 1) {
             "accountConnectionBudget must be >= 1, got $accountConnectionBudget"
-        }
-    }
-
-    private val _httpRetries = MutableStateFlow(HttpRetryStats())
-
-    /**
-     * Requests the HTTP layer retried on its own, by reason.
-     *
-     * A retry inside `execute` happens before the caller's block runs, so
-     * nothing above it can see one: a range request the CDN answered 503 twice
-     * arrives at [RangeReader] as a single request that merely took a second
-     * longer, and [RangeReaderStats.throttled] stays at zero because no 503
-     * ever reached it. On a long route that is the difference between a slow
-     * link and a connection cap being hit, which call for opposite fixes.
-     *
-     * Monotonic since construction and shared by every request on this client,
-     * so a caller reads it as a delta over a window rather than per request.
-     */
-    val httpRetries: StateFlow<HttpRetryStats> = _httpRetries.asStateFlow()
-
-    internal fun recordHttpRetry(status: Int?, waited: Duration) {
-        _httpRetries.update {
-            it.copy(
-                serverErrors = it.serverErrors + if (status != null && status >= 500) 1 else 0,
-                rateLimited = it.rateLimited + if (status == 429) 1 else 0,
-                transport = it.transport + if (status == null) 1 else 0,
-                waited = it.waited + waited,
-            )
         }
     }
 
@@ -199,20 +169,10 @@ class PikPakClient(
     suspend fun clearFolderIdCache() = folderIds.invalidateAll()
 
     /**
-     * Drops one memoized folder and everything memoized beneath it.
-     *
-     * For the narrower case where a caller knows which folder is gone — it
-     * just watched that one answer 404. A rename or a move still needs
-     * [clearFolderIdCache], because the folder is then reachable under a
-     * different name and any cached path could have run through it.
-     */
-    suspend fun invalidateFolderId(path: String, parentId: String = "") =
-        folderIds.invalidate(parentId, path)
-
-    /**
-     * Ensures the client has a valid access token. Reuses a cached session if
-     * one is still fresh; refreshes if expired; falls back to a full credential
-     * sign-in if the refresh token is also stale. Safe to call repeatedly.
+     * Ensures the client has a valid access token: the in-memory session, the
+     * stored one, a refresh, and only then a password sign-in. A dead refresh
+     * token is cleared from the store before that sign-in. Safe to call
+     * repeatedly. Optional: any API call logs in the same way first.
      */
     suspend fun login(): Session = mutex.withLock { auth.loginLocked() }
 
@@ -253,8 +213,8 @@ class PikPakClient(
 
     companion object {
         /**
-         * Concurrent connections the CDN client is configured to allow per
-         * host, and the default budget of a [RangeReader].
+         * Concurrent connections one file reads over, and the default budget
+         * of a [RangeReader].
          *
          * Measured 2026-09-02: one signed PikPak URL accepts exactly 8
          * concurrent connections and answers the 9th onward with 503, the
@@ -276,6 +236,11 @@ class PikPakClient(
          * against a 54-file pack spread over 12 distinct edge hosts — 16 were
          * admitted without a single refusal, while 32, 64 and 96 requested all
          * settled at exactly 20 admitted.
+         *
+         * Measured again 2026-09-26 on 720P transcodes of 12 files: 8 and 16
+         * requested were all admitted; 24, 32 and 40 requested got 11, 13 and 9,
+         * the rest answered 503. Past the limit, asking for more got fewer, so
+         * overshooting it costs connections rather than merely wasting requests.
          *
          * 16 is the largest round number under that ceiling, and it divides
          * into the two consumers that matter: playback holding 8 on one file
@@ -304,9 +269,13 @@ class PikPakClient(
          * The per-platform CDN client the SDK would build for itself. Pass it
          * as `cdnHttpClient` when you inject your own API client but still
          * want the tuned connection pool for downloads. You own its lifecycle.
+         *
+         * [perHostLimit] should be at least the client's account budget: the
+         * gates are the limit, and an engine cap under them only queues
+         * requests where RangeReader cannot see them.
          */
-        fun tunedCdnClient(connectionBudget: Int = DEFAULT_CONNECTION_BUDGET): HttpClient =
-            defaultCdnHttpClient(connectionBudget)
+        fun tunedCdnClient(perHostLimit: Int = DEFAULT_ACCOUNT_CONNECTION_BUDGET): HttpClient =
+            defaultCdnHttpClient(perHostLimit)
     }
 }
 
