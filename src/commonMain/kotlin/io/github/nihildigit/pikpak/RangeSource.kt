@@ -28,7 +28,8 @@ interface RangeSource {
      * @param priority higher wins a contended connection slot, both among this
      * file's reads and against every other file the client is reading. A read
      * at the playback head should outrank read-ahead, and both should outrank
-     * a background download. [PikPakStreamReader.BLOCKING_PRIORITY] and
+     * a background download. [PikPakStreamReader.BLOCKING_PRIORITY],
+     * [PikPakStreamReader.STREAMING_PRIORITY] and
      * [PikPakStreamReader.READ_AHEAD_PRIORITY] are the scale this SDK reads on.
      *
      * Priority decides who takes the next free slot, never who keeps one: a

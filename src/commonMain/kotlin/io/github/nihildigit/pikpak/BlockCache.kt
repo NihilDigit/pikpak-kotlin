@@ -174,6 +174,11 @@ internal class BlockCache(
         var role = initialRole
             internal set
 
+        /** See [PikPakStreamReader.urgent]. */
+        @Volatile
+        var urgent = false
+            internal set
+
         internal val order = RequestOrder.Sequence.next()
 
         @Volatile
@@ -247,6 +252,12 @@ internal class BlockCache(
         if (cursor.role == role) return
         cursor.role = role
         syncForegroundCount()
+        bump()
+    }
+
+    fun setUrgent(cursor: Cursor, urgent: Boolean) {
+        if (cursor.urgent == urgent) return
+        cursor.urgent = urgent
         bump()
     }
 
@@ -581,14 +592,18 @@ internal class BlockCache(
     }
 
     /**
-     * Higher for the block a cursor is blocked on, so it wins a contended connection slot; and
-     * a whole band lower for a background cursor, so none of its requests outranks any
-     * foreground one.
+     * Higher for the block a cursor is blocked on, so it wins a contended connection slot, and
+     * highest when its caller has said someone is waiting on it; a whole band lower for a
+     * background cursor, so none of its requests outranks any foreground one.
      */
     private fun priorityFor(cursor: Cursor, slot: Int): Int {
         val blocking = slot == slotOf(cursor.position)
         return when (cursor.role) {
-            StreamRole.FOREGROUND -> if (blocking) PikPakStreamReader.BLOCKING_PRIORITY else PikPakStreamReader.READ_AHEAD_PRIORITY
+            StreamRole.FOREGROUND -> when {
+                !blocking -> PikPakStreamReader.READ_AHEAD_PRIORITY
+                cursor.urgent -> PikPakStreamReader.BLOCKING_PRIORITY
+                else -> PikPakStreamReader.STREAMING_PRIORITY
+            }
             StreamRole.BACKGROUND ->
                 if (blocking) PikPakStreamReader.BACKGROUND_BLOCKING_PRIORITY else PikPakStreamReader.BACKGROUND_READ_AHEAD_PRIORITY
         }

@@ -309,7 +309,9 @@ class RangeReader internal constructor(
             // host with the same path and signature, see HostHealth.route. Every refresh below
             // is keyed on linkUrl, so a reroute never looks like a changed link.
             val linkUrl = currentUrl()
-            val attemptUrl = client.hostHealth.route(linkUrl, mayExplore = priority < PikPakStreamReader.BLOCKING_PRIORITY)
+            // A reader parked on the block is not the place to try an unproven host, whether or not
+            // its caller called it urgent: a player filling its buffer still stops if that block is late
+            val attemptUrl = client.hostHealth.route(linkUrl, mayExplore = priority < PikPakStreamReader.STREAMING_PRIORITY)
             val rerouted = attemptUrl != linkUrl
             var delivered = 0L
             var announced: Long? = null

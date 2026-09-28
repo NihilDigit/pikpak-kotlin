@@ -39,7 +39,8 @@ enum class StreamRole { FOREGROUND, BACKGROUND }
  *
  * The block a reader is blocked on is requested at a higher priority than
  * read-ahead, so it wins a contended connection slot both against this file's
- * own read-ahead and against every other file on the account.
+ * own read-ahead and against every other file on the account; higher still
+ * while the caller marks the reader [urgent].
  *
  * Every file on an account shares one connection budget, so readers also carry
  * a [role]. A background reader — one warming a file the user may open next —
@@ -153,6 +154,27 @@ class PikPakStreamReader internal constructor(
     var role: StreamRole
         get() = cursor.role
         set(value) = cache.setRole(cursor, value)
+
+    /**
+     * Whether someone is waiting on this reader right now: a seek that has not
+     * shown its frame yet, a player stalled with an empty buffer, a first frame
+     * the user has scrolled to. While set, the block the reader is parked on
+     * goes out at [BLOCKING_PRIORITY]; otherwise at [STREAMING_PRIORITY].
+     *
+     * The reader cannot tell on its own. A player reads through its buffer
+     * with every read blocking, most of them with seconds of video still in
+     * hand, and a seek arrives as just another reader opened at an offset. Left
+     * at the top priority, those buffer fills filled the band a seek needed:
+     * in a feed with three players they were most of the requests at it, and a
+     * seek, as the newest demand, lost every tie to them. The caller knows, so
+     * the caller says; clear it once the wait is over.
+     *
+     * Only for a [StreamRole.FOREGROUND] reader. Requests already queued keep
+     * the priority they were issued at.
+     */
+    var urgent: Boolean
+        get() = cursor.urgent
+        set(value) = cache.setUrgent(cursor, value)
 
     /**
      * How far past the read position this reader keeps the stream filled, at
@@ -295,15 +317,23 @@ class PikPakStreamReader internal constructor(
          */
         const val INDEX_PRIORITY = 101
 
-        /** What a reader asks for the block a caller is waiting on. */
+        /** What an [urgent] reader asks for the block a caller is waiting on. */
         const val BLOCKING_PRIORITY = 100
+
+        /**
+         * What a reader asks for the block a caller is waiting on when nobody
+         * said it was [urgent]: a player filling its buffer. Above every
+         * read-ahead and warm, since a player that does run dry stops on this
+         * block; below a seek or a stall, which have someone watching.
+         */
+        const val STREAMING_PRIORITY = 50
 
         /**
          * What a reader asks for blocks ahead of the read position.
          *
          * Anything a caller wants served ahead of its own read-ahead but behind
          * the block playback is stopped on belongs between this and
-         * [BLOCKING_PRIORITY].
+         * [STREAMING_PRIORITY].
          */
         const val READ_AHEAD_PRIORITY = 10
 
