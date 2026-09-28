@@ -64,6 +64,8 @@ class PikPakClient(
      * set it to [connectionBudget] to let one file at a time have the line.
      */
     val accountConnectionBudget: Int = DEFAULT_ACCOUNT_CONNECTION_BUDGET,
+    /** The initial [PikPakClient.domain]. */
+    domain: PikPakDomain = PikPakDomain.MYPIKPAK_COM,
     /**
      * Lets a read move from its link's edge host to a sibling host measured to be much faster,
      * and lets background reads measure siblings now and then so there is something to
@@ -81,6 +83,7 @@ class PikPakClient(
         cdnHttpClient: HttpClient? = null,
         connectionBudget: Int = DEFAULT_CONNECTION_BUDGET,
         accountConnectionBudget: Int = DEFAULT_ACCOUNT_CONNECTION_BUDGET,
+        domain: PikPakDomain = PikPakDomain.MYPIKPAK_COM,
         steerEdgeHosts: Boolean = true,
     ) : this(
         account,
@@ -92,13 +95,25 @@ class PikPakClient(
         cdnHttpClient,
         connectionBudget,
         accountConnectionBudget,
+        domain,
         steerEdgeHosts,
     )
 
     val deviceId: String = MD5().digest(account.encodeToByteArray()).toHex()
 
-    private val ownsHttpClient = httpClient == null
-    private val client: HttpClient = httpClient ?: HttpEngine.defaultClient()
+    /**
+     * Root domain for API calls, and through them for download links. See [PikPakDomain].
+     *
+     * May be changed at any time; the next API request goes out under the new root. The
+     * session carries over, since every root serves the same accounts on the same tokens. Links
+     * already minted keep the root they were minted under and stay valid until they expire,
+     * so a read in progress is not disturbed. [probeDomain] measures a root without switching.
+     */
+    @Volatile
+    var domain: PikPakDomain = domain
+
+    internal val ownsHttpClient = httpClient == null
+    internal val apiClient: HttpClient = httpClient ?: HttpEngine.defaultClient()
 
     private val ownsCdnClient = cdnHttpClient == null && httpClient == null
 
@@ -165,7 +180,7 @@ class PikPakClient(
 
     internal val state = ClientState(passwordSupplier)
     internal val mutex = Mutex()
-    internal val http = HttpEngine(client, this) { cdn.value }
+    internal val http = HttpEngine(apiClient, this) { cdn.value }
     internal val auth = AuthApi(this)
     internal val folderIds = FolderIdCache()
 
@@ -215,7 +230,7 @@ class PikPakClient(
 
     /** Closes the underlying HTTP clients that were created by this SDK. No-op for injected ones. */
     fun close() {
-        if (ownsHttpClient) client.close()
+        if (ownsHttpClient) apiClient.close()
         if (ownsCdnClient && cdn.isInitialized()) cdn.value.close()
     }
 

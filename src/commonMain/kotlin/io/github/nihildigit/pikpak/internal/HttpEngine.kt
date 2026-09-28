@@ -144,7 +144,8 @@ internal class HttpEngine(
     ): JsonElement = execute(
         client = client,
         method = method,
-        url = url,
+        // Endpoints name the official hosts; the root is swapped here, once, rather than in each
+        url = pikpak.domain.apiUrl(url),
         rateLimited = true,
         configure = {
             headers {
