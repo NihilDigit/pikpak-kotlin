@@ -305,7 +305,12 @@ class RangeReader internal constructor(
         var rejectionRefreshed = false
 
         while (remaining == null || remaining > 0) {
-            val attemptUrl = currentUrl()
+            // The link is what refreshes and expiry are about; the attempt may go to a sibling
+            // host with the same path and signature, see HostHealth.route. Every refresh below
+            // is keyed on linkUrl, so a reroute never looks like a changed link.
+            val linkUrl = currentUrl()
+            val attemptUrl = client.hostHealth.route(linkUrl, mayExplore = priority < PikPakStreamReader.BLOCKING_PRIORITY)
+            val rerouted = attemptUrl != linkUrl
             var delivered = 0L
             var announced: Long? = null
             var clippedAtEof = false
@@ -402,10 +407,21 @@ class RangeReader internal constructor(
                 remaining = remaining?.minus(delivered)
                 addBytes(delivered)
 
+                val throttled = t is PikPakException && t.httpStatus == 503
+                if (rerouted && !throttled) {
+                    // The sibling failed, not the link: an expiry, a 404 or a refused handshake
+                    // there says nothing about the link's own host. So no refresh and no failure
+                    // counted; the next attempt goes back to the link as it is.
+                    val rejected = t is UrlExpiredException || (t is PikPakException && t.httpStatus in 400..499)
+                    report(attempt, if (rejected) RangeAttempt.Outcome.Rejected else RangeAttempt.Outcome.Failed)
+                    client.hostHealth.refused(attemptUrl)
+                    continue
+                }
+
                 when {
                     t is UrlExpiredException -> {
                         report(attempt, RangeAttempt.Outcome.Expired)
-                        refreshUrl(UrlRequest.Expired(attemptUrl), attemptUrl)
+                        refreshUrl(UrlRequest.Expired(linkUrl), linkUrl)
                     }
                     t is PikPakException && t.httpStatus == 503 -> {
                         report(attempt, RangeAttempt.Outcome.Throttled)
@@ -420,7 +436,7 @@ class RangeReader internal constructor(
                         report(attempt, RangeAttempt.Outcome.Rejected)
                         if (rejectionRefreshed) throw t
                         rejectionRefreshed = true
-                        refreshUrl(UrlRequest.Rejected(attemptUrl, t.httpStatus!!), attemptUrl)
+                        refreshUrl(UrlRequest.Rejected(linkUrl, t.httpStatus!!), linkUrl)
                     }
                     t is UnresponsiveHost -> {
                         report(attempt, RangeAttempt.Outcome.Failed)
@@ -428,7 +444,7 @@ class RangeReader internal constructor(
                         if (failures >= maxAttempts) throw PikPakException(-1, "RangeReader: no host answered at offset $offset", cause = t)
                         bumpRetries()
                         // No backoff: nothing is wrong with the network, only with that host
-                        switchHost(attemptUrl, silent = true)
+                        switchHost(linkUrl, silent = true)
                     }
                     else -> {
                         report(attempt, RangeAttempt.Outcome.Failed)
@@ -436,7 +452,7 @@ class RangeReader internal constructor(
                         if (failures >= maxAttempts) throw t
                         bumpRetries()
                         delay(client.retryPolicy.delayFor(failures - 1))
-                        switchHost(attemptUrl)
+                        switchHost(linkUrl)
                     }
                 }
                 continue
@@ -460,7 +476,9 @@ class RangeReader internal constructor(
                 // CDN answers with 416 and no amount of retrying changes.
                 if (remaining == null || remaining <= 0L || clippedAtEof) return
             }
-            if (delivered == 0L) {
+            if (delivered == 0L && rerouted) {
+                client.hostHealth.refused(attemptUrl)
+            } else if (delivered == 0L) {
                 failures++
                 if (failures >= maxAttempts) {
                     throw PikPakException(
@@ -470,7 +488,7 @@ class RangeReader internal constructor(
                 }
                 bumpRetries()
                 delay(client.retryPolicy.delayFor(failures - 1))
-                switchHost(attemptUrl)
+                switchHost(linkUrl)
             } else {
                 bumpRetries()
             }
@@ -552,6 +570,8 @@ class RangeReader internal constructor(
      * not on the path the bytes take.
      */
     private fun report(recorder: RangeAttemptRecorder, outcome: RangeAttempt.Outcome) {
+        // Every attempt, whoever listens: host speed is compared across all of the account's files
+        client.hostHealth.delivered(recorder.host, recorder.delivered, recorder.bodyBytesPerSecond())
         val observer = onAttempt ?: return
         try {
             observer(recorder.finish(outcome))

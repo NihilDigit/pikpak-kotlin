@@ -64,6 +64,12 @@ class PikPakClient(
      * set it to [connectionBudget] to let one file at a time have the line.
      */
     val accountConnectionBudget: Int = DEFAULT_ACCOUNT_CONNECTION_BUDGET,
+    /**
+     * Lets a read move from its link's edge host to a sibling host measured to be much faster,
+     * and lets background reads measure siblings now and then so there is something to
+     * compare with. Off keeps every read on the host its link names. See [HostHealth].
+     */
+    steerEdgeHosts: Boolean = true,
 ) {
     constructor(
         account: String,
@@ -75,6 +81,7 @@ class PikPakClient(
         cdnHttpClient: HttpClient? = null,
         connectionBudget: Int = DEFAULT_CONNECTION_BUDGET,
         accountConnectionBudget: Int = DEFAULT_ACCOUNT_CONNECTION_BUDGET,
+        steerEdgeHosts: Boolean = true,
     ) : this(
         account,
         { password },
@@ -85,6 +92,7 @@ class PikPakClient(
         cdnHttpClient,
         connectionBudget,
         accountConnectionBudget,
+        steerEdgeHosts,
     )
 
     val deviceId: String = MD5().digest(account.encodeToByteArray()).toHex()
@@ -129,8 +137,8 @@ class PikPakClient(
      */
     internal val foregroundStreams = ForegroundStreams()
 
-    /** Edge hosts that failed recently, so no file on the account mints a link to one again soon. */
-    internal val hostHealth = HostHealth()
+    /** Edge hosts that failed or crawled recently, and the siblings reads may move to instead. */
+    internal val hostHealth = HostHealth(steering = steerEdgeHosts)
 
     // Keyed by content and variant: a transcode's length is only learned by a probe, and it
     // cannot change while the content exists, whichever file object or link reaches it.

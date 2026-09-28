@@ -113,6 +113,29 @@ class RangeReaderMockTest {
         client.close()
     }
 
+    // A sibling host that refuses the link says nothing about the link; refreshing it would
+    // mint a new one for nothing and, with the same link back, fail the read outright
+    @Test
+    fun `a sibling that refuses a rerouted attempt sends the read back to the host of the link`() = runBlocking {
+        val hosts = mutableListOf<String>()
+        val client = clientWith { req ->
+            hosts += req.url.host
+            if (req.url.host == "dl-z01a-9999.mypikpak.com") partial(req, content)
+            else respond(ByteReadChannel(ByteArray(0)), HttpStatusCode.NotFound)
+        }
+        val asked = mutableListOf<UrlRequest>()
+        val reader = RangeReader(client, { request -> asked += request; "https://dl-z01a-9999.mypikpak.com/f/file?sign=s" })
+
+        // Priority 0 is a background read, which may try an unmeasured sibling
+        val bytes = reader.readBytes(0, 256, priority = 0)
+        assertContentEquals(content.copyOfRange(0, 256), bytes)
+        assertEquals(2, hosts.size, "one sibling tried, then the link's host: $hosts")
+        assertTrue(hosts[0].startsWith("dl-z01a-") && hosts[0].endsWith(".mypikpak.com") && hosts[0] != hosts[1])
+        assertEquals(listOf<UrlRequest>(UrlRequest.Initial), asked, "the link was refreshed because a sibling refused it")
+        assertEquals(0, reader.stats.value.retries)
+        client.close()
+    }
+
     @Test
     fun `503 is waited out rather than failed`() = runBlocking {
         var attempts = 0

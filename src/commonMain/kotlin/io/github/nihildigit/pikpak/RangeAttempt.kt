@@ -211,7 +211,7 @@ internal class RangeAttemptRecorder(
     private val activeReads: Int,
     private val queuedReads: Int,
     private val priority: Int,
-    private val host: String? = null,
+    val host: String? = null,
 ) {
     /**
      * Installed on the coroutine that issues this attempt's request, so the
@@ -224,7 +224,19 @@ internal class RangeAttemptRecorder(
     private val timeline = LongArray(RangeAttempt.BUCKETS)
     private var headersAt: Duration? = null
     private var firstByteAt: Duration? = null
-    private var delivered = 0L
+    private var lastByteAt: Duration? = null
+    var delivered = 0L
+        private set
+
+    /**
+     * First byte to last, not to [finish]: a read the consumer cancelled finishes whenever the
+     * cancellation lands, and that wait is not the host's.
+     */
+    fun bodyBytesPerSecond(): Long {
+        val first = firstByteAt ?: return 0
+        val last = lastByteAt ?: return 0
+        return delivered * 1000 / (last - first).inWholeMilliseconds.coerceAtLeast(1)
+    }
 
     /**
      * Called when the response headers arrive.
@@ -241,6 +253,7 @@ internal class RangeAttemptRecorder(
         if (bytes <= 0) return
         val elapsed = mark.elapsedNow()
         if (firstByteAt == null) firstByteAt = elapsed
+        lastByteAt = elapsed
         delivered += bytes
         // The tail of an attempt longer than the array folds into the last slot
         // rather than being dropped, so the sum still reconciles with delivered.
