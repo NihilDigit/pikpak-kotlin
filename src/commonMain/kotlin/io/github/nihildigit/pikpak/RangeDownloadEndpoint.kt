@@ -89,6 +89,9 @@ public const val DIRECT_DOWNLOAD_CONCURRENCY: Int = 4
  * @param roundRetryDelay waited before resuming a run that is otherwise
  *                    healthy. Not the client's retry backoff: that curve has
  *                    already been walked inside the failed read.
+ * @param limiter     a ceiling shared with other downloads, paid per block
+ *                    before it is requested; see [BandwidthLimiter]. Null, the
+ *                    default, fetches as fast as the connections allow.
  * @return [totalSize].
  */
 public suspend fun RangeSource.downloadTo(
@@ -100,6 +103,7 @@ public suspend fun RangeSource.downloadTo(
     progress: MutableStateFlow<Long>? = null,
     maxRoundFailures: Int = 3,
     roundRetryDelay: Duration = 3.seconds,
+    limiter: BandwidthLimiter? = null,
 ): Long {
     if (concurrency < 1) {
         throw PikPakException(-1, "downloadTo: concurrency must be >= 1, got $concurrency")
@@ -142,6 +146,7 @@ public suspend fun RangeSource.downloadTo(
                     blockSize = blockSize,
                     concurrency = concurrency,
                     priority = priority,
+                    limiter = limiter,
                     onWritten = {
                         written = it
                         progress?.value = it
@@ -200,6 +205,7 @@ private suspend fun slideWindow(
     blockSize: Long,
     concurrency: Int,
     priority: Int,
+    limiter: BandwidthLimiter?,
     onWritten: (Long) -> Unit,
 ): Unit = coroutineScope {
     val window = ArrayDeque<Deferred<ByteArray>>(concurrency)
@@ -211,7 +217,11 @@ private suspend fun slideWindow(
         val start = nextOffset
         val length = minOf(blockSize, totalSize - start)
         nextOffset = start + length
-        window += async { fetchBlock(source, start, length, priority) }
+        window += async {
+            // Before the request, so a throttled block waits without a connection open
+            limiter?.acquire(length)
+            fetchBlock(source, start, length, priority)
+        }
     }
 
     repeat(concurrency) { issueNext() }
