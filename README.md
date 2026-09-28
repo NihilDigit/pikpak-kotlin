@@ -37,7 +37,7 @@ handle.openStream().use { stream ->
 ```kotlin
 repositories { mavenCentral() }
 dependencies {
-    implementation("io.github.nihildigit:pikpak-kotlin:1.1.0")
+    implementation("io.github.nihildigit:pikpak-kotlin:1.2.0")
     // Ktor is compileOnly in the SDK, so it never changes the Ktor you pinned: bring the core and one engine.
     implementation("io.ktor:ktor-client-core:<your-ktor-version>")
     implementation("io.ktor:ktor-client-okhttp:<your-ktor-version>")   // or ktor-client-darwin on iOS
