@@ -1,10 +1,11 @@
 import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.plugin.KotlinPlatformType
+import org.gradle.api.publish.maven.tasks.PublishToMavenRepository
 
 plugins {
-    kotlin("multiplatform") version "2.3.10"
-    kotlin("plugin.serialization") version "2.3.10"
+    kotlin("multiplatform") version "2.4.10"
+    kotlin("plugin.serialization") version "2.4.10"
     // AGP 9 dropped support for `com.android.library` in KMP projects;
     // this is the replacement that integrates directly into the `kotlin {}` DSL.
     id("com.android.kotlin.multiplatform.library") version "9.1.1"
@@ -194,3 +195,23 @@ mavenPublishing {
         }
     }
 }
+
+// Maven Central counts every uploaded file against a quota, and Gradle writes four checksums for
+// each file, the .asc signatures included: ten files for every artifact. Central needs the MD5 and
+// SHA-1 of an artifact and nothing for a signature (its own publishing guide says as much), so the
+// rest is removed from the staging directory the plugin zips at the end of the build. That leaves
+// four per artifact: the file, its signature, its MD5 and its SHA-1.
+tasks.withType<PublishToMavenRepository>().configureEach {
+    if (!name.endsWith("ToMavenCentralRepository")) return@configureEach
+    doLast {
+        if (repository.url.scheme != "file") return@doLast
+        val staging = File(repository.url)
+        if (!staging.isDirectory) return@doLast
+        staging.walkTopDown()
+            .filter { file -> file.isFile && isChecksumCentralDoesNotNeed(file.name) }
+            .forEach { it.delete() }
+    }
+}
+
+fun isChecksumCentralDoesNotNeed(name: String): Boolean =
+    name.endsWith(".sha256") || name.endsWith(".sha512") || name.endsWith(".asc.md5") || name.endsWith(".asc.sha1")
