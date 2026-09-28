@@ -8,7 +8,7 @@ plugins {
     kotlin("plugin.serialization") version "2.4.10"
     // AGP 9 dropped support for `com.android.library` in KMP projects;
     // this is the replacement that integrates directly into the `kotlin {}` DSL.
-    id("com.android.kotlin.multiplatform.library") version "9.1.1"
+    id("com.android.kotlin.multiplatform.library") version "9.3.1"
     id("com.vanniktech.maven.publish") version "0.36.0"
 }
 
