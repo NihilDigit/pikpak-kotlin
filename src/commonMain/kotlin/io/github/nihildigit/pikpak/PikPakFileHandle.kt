@@ -3,6 +3,8 @@ package io.github.nihildigit.pikpak
 import io.github.nihildigit.pikpak.internal.PriorityGate
 import io.ktor.utils.io.ByteReadChannel
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.concurrent.Volatile
@@ -96,6 +98,12 @@ class PikPakFileHandle(
      */
     private val onObjectMinted: (suspend (String) -> Unit)? = null,
     /**
+     * Treats every file object as a lease and deletes it where [onObjectMinted]
+     * would hear of it, before calling that. Rebuilds land in [parentId] and
+     * leave nothing behind; see [leaseDetail] for how a caller starts one.
+     */
+    private val leased: Boolean = false,
+    /**
      * Passed to every [RangeReader] this handle builds, the replacements a
      * refresh makes included, so an observer outlives the reader it watches.
      * See [RangeAttempt] for what it is for.
@@ -133,6 +141,24 @@ class PikPakFileHandle(
 
     /** Guards [unreportedObject] alone, so it is never held across a network call. */
     private val reportMutex = Mutex()
+
+    /** What happens to an object the handle has finished with; see [onObjectMinted] and `leased`. */
+    private val release: (suspend (String) -> Unit)? =
+        if (!leased) {
+            onObjectMinted
+        } else {
+            { id ->
+                client.deleteLease(id)
+                // Only room this handle took itself: the object a caller passed in was budgeted by
+                // whoever leased it, and is deleted (again, harmlessly) here without a refund
+                budgeted.withLock { budgetedObjects.remove(id) }?.let { client.leaseBudget?.release(it) }
+                onObjectMinted?.invoke(id)
+            }
+        }
+
+    /** Objects [rebuild] created under the lease budget, with the room each took. */
+    private val budgetedObjects = HashMap<String, Long>()
+    private val budgeted = Mutex()
 
     /** The object [onObjectMinted] still owes a report for, if any. */
     @Volatile
@@ -408,7 +434,7 @@ class PikPakFileHandle(
     }
 
     private suspend fun reportMinted() {
-        val report = onObjectMinted ?: return
+        val report = release ?: return
         val id = reportMutex.withLock { unreportedObject.also { unreportedObject = null } } ?: return
         report(id)
     }
@@ -459,11 +485,20 @@ class PikPakFileHandle(
      * dropped, so a caller deleting leases still collects it.
      */
     private suspend fun rebuild(): String {
-        val created = client.instantCreate(
-            ResolvedFile(path = name, size = size, gcid = gcid),
-            parentId = parentId,
-            name = name,
-        )
+        // A leased rebuild takes storage like any lease: wait for room rather than fail the create
+        val budget = if (leased) client.leaseBudget else null
+        val taken = budget?.acquire(size) ?: 0L
+        val created = try {
+            client.instantCreate(
+                ResolvedFile(path = name, size = size, gcid = gcid),
+                parentId = parentId,
+                name = name,
+            )
+        } catch (e: Throwable) {
+            withContext(NonCancellable) { budget?.release(taken) }
+            throw e
+        }
+        if (budget != null) budgeted.withLock { budgetedObjects[created] = taken }
         fileId = created
         expiresAt = null
         // Hand the replaced object over instead of overwriting the slot. Nothing looks it up
@@ -471,7 +506,7 @@ class PikPakFileHandle(
         // left that can name it. Two rebuilds racing used to strand the loser's object here:
         // the slot kept whichever wrote last, and the other id was gone for good.
         val replaced = reportMutex.withLock { unreportedObject.also { unreportedObject = created } }
-        replaced?.let { onObjectMinted?.invoke(it) }
+        replaced?.let { release?.invoke(it) }
         return created
     }
 
@@ -510,6 +545,7 @@ fun PikPakClient.fileHandle(
     blockStore: BlockStore? = null,
     coroutineContext: CoroutineContext = EmptyCoroutineContext,
     onObjectMinted: (suspend (String) -> Unit)? = null,
+    leased: Boolean = false,
     onRangeAttempt: ((RangeAttempt) -> Unit)? = null,
 ): PikPakFileHandle {
     // Read off the detail directly, not through variant(): that throws for an original with no
@@ -524,6 +560,7 @@ fun PikPakClient.fileHandle(
         mediaId = mediaId,
         parentId = parentId,
         onObjectMinted = onObjectMinted,
+        leased = leased,
         onRangeAttempt = onRangeAttempt,
         initialLink = link?.url?.takeIf { it.isNotBlank() }?.let { VariantLink(it, link.expiresAt) },
         streamSize = streamSize ?: detail.sizeBytes.takeIf { mediaId == null },

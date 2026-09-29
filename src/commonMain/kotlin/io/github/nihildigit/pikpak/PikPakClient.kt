@@ -9,6 +9,9 @@ import io.github.nihildigit.pikpak.internal.PriorityGate
 import io.github.nihildigit.pikpak.internal.defaultCdnHttpClient
 import io.ktor.client.HttpClient
 import kotlin.concurrent.Volatile
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -185,6 +188,21 @@ class PikPakClient(
     internal val folderIds = FolderIdCache()
 
     /**
+     * Work nobody waits for, such as deleting a leased object once its link
+     * is in hand. Cancelled by [close]; an object whose delete is cut short
+     * stays until the caller sweeps its lease folder.
+     */
+    internal val background = CoroutineScope(SupervisorJob())
+
+    /**
+     * Bounds the storage leased objects take at once; see [LeaseBudget]. Null
+     * leaves leases unbounded, which suits an account with room to spare. Read
+     * at each lease, so it can be set once the account's free space is known.
+     */
+    @Volatile
+    var leaseBudget: LeaseBudget? = null
+
+    /**
      * Drops the memoized path-to-folder-id map. The SDK clears it after every
      * mutation it performs itself; call this when a folder was moved, renamed
      * or deleted through some other client.
@@ -230,6 +248,7 @@ class PikPakClient(
 
     /** Closes the underlying HTTP clients that were created by this SDK. No-op for injected ones. */
     fun close() {
+        background.cancel()
         if (ownsHttpClient) apiClient.close()
         if (ownsCdnClient && cdn.isInitialized()) cdn.value.close()
     }

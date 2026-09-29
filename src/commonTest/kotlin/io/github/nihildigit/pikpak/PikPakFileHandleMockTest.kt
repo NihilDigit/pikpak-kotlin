@@ -8,6 +8,9 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import io.ktor.utils.io.ByteReadChannel
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -33,6 +36,9 @@ class PikPakFileHandleMockTest {
     private val live = mutableSetOf("f1")
     private var nextId = 2
 
+    /** The most file objects alive at once, the seeded f1 included. */
+    private var mostLive = 1
+
     /**
      * When set, an instant create returns an id the drive immediately denies —
      * the drive losing a file between the create and the detail read. Only a
@@ -56,11 +62,17 @@ class PikPakFileHandleMockTest {
                 request.method.value == "POST" && path.endsWith("/drive/v1/files") -> {
                     val id = "f${nextId++}"
                     if (!createsAreBornDead) live += id
+                    mostLive = maxOf(mostLive, live.size)
                     json(
                         """{"upload_type":"UPLOAD_TYPE_RESUMABLE","file":{"kind":"drive#file",
                             "id":"$id","name":"ep.mkv","size":"1000","phase":"PHASE_TYPE_COMPLETE",
                             "hash":"${GCID}"}}""",
                     )
+                }
+
+                request.method.value == "DELETE" && path.contains("/drive/v1/files/") -> {
+                    live -= path.substringAfterLast('/')
+                    json("{}")
                 }
 
                 path.contains("/drive/v1/files/") -> {
@@ -243,6 +255,48 @@ class PikPakFileHandleMockTest {
 
             handle.closeAndReport()
             assertEquals(listOf("f1", "f2"), minted, "the rebuilt object was left with nobody able to name it")
+        } finally {
+            client.close()
+        }
+    }
+
+    /**
+     * A lease is only worth taking if nothing stays behind: the object that
+     * minted the first link, and the one an expiry rebuilds, both go. A leak
+     * here fills a free account's 6 GB one episode at a time.
+     */
+    @Test
+    fun `a leased handle leaves no object behind across an expiry`() = runBlocking<Unit> {
+        val client = newClient()
+        val detail = client.leaseDetail(ResolvedFile(path = "ep.mkv", size = 1000, gcid = GCID))
+        assertEquals("https://cdn/f2", detail.downloadUrl, "the detail keeps the link of the object it deleted")
+        client.background.coroutineContext[Job]!!.children.forEach { it.join() }
+        assertEquals(setOf("f1"), live, "leaseDetail left its object in the drive")
+
+        val handle = client.fileHandle(detail, leased = true)
+        try {
+            val url = handle.provideUrl(UrlRequest.Expired("https://cdn/f2"))
+            assertEquals("https://cdn/f3", url, "an expired lease reads from a rebuilt object")
+            assertEquals(setOf("f1"), live, "the rebuilt object outlived its link")
+        } finally {
+            handle.close(); client.close()
+        }
+    }
+
+    /**
+     * Deletes run in the background, so without a budget three leases in a row
+     * all exist before the first delete lands; on a 6 GB free account the third
+     * create would fail. With room for one, each waits for the last to be gone.
+     */
+    @Test
+    fun `a lease budget keeps leased objects within the room it has`() = runBlocking<Unit> {
+        val client = newClient()
+        client.leaseBudget = LeaseBudget(capacityBytes = 1500)
+        try {
+            (1..3).map { async { client.leaseDetail(ResolvedFile(path = "ep$it.mkv", size = 1000, gcid = GCID)) } }.awaitAll()
+            client.background.coroutineContext[Job]!!.children.forEach { it.join() }
+            assertEquals(2, mostLive, "more than one leased object existed at once beside f1")
+            assertEquals(setOf("f1"), live)
         } finally {
             client.close()
         }
