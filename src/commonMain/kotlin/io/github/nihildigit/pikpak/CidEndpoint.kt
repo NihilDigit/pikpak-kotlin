@@ -2,6 +2,7 @@ package io.github.nihildigit.pikpak
 
 import io.github.nihildigit.pikpak.internal.buildUrl
 import io.ktor.http.HttpMethod
+import io.ktor.utils.io.toByteArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
@@ -30,18 +31,54 @@ object XunleiCid {
      * three times otherwise. Random access is the caller's because a stream
      * would have to read through two thirds of the file to reach the windows.
      */
-    fun of(size: Long, read: (offset: Long, length: Int) -> ByteArray): String {
+    fun of(size: Long, read: (offset: Long, length: Int) -> ByteArray): String =
+        digest(windows(size).map { (offset, length) -> read(offset, length) })
+
+    /** The (offset, length) pairs a file of [size] bytes is hashed over, in order. */
+    internal fun windows(size: Long): List<Pair<Long, Int>> {
         require(size >= 0) { "size must not be negative" }
-        val sha1 = SHA1()
-        if (size < WHOLE_FILE_BELOW) {
-            sha1.update(read(0, size.toInt()))
+        return if (size < WHOLE_FILE_BELOW) {
+            listOf(0L to size.toInt())
         } else {
-            sha1.update(read(0, WINDOW))
-            sha1.update(read(size / 3, WINDOW))
-            sha1.update(read(size - WINDOW, WINDOW))
+            listOf(0L to WINDOW, size / 3 to WINDOW, size - WINDOW to WINDOW)
         }
+    }
+
+    /** The CID of the bytes of [windows], read in that order. */
+    internal fun digest(parts: List<ByteArray>): String {
+        val sha1 = SHA1()
+        parts.forEach(sha1::update)
         return sha1.digest().toHex().uppercase()
     }
+}
+
+/**
+ * The screenshot thumbnail PikPak keeps for the video content [gcid] names.
+ *
+ * A listing's `thumbnail_link` is exactly this URL: no signature, no expiry,
+ * nothing tied to the file object or the account. It answers without any
+ * authorization, also for content the account has never held, and 404 when
+ * PikPak has no screenshot of it (measured 2026-09-29). So a caller that keeps
+ * only a gcid, a file it no longer holds, still has its thumbnail. What the
+ * `240/720` segments mean is not known; they are the values listings carry.
+ */
+fun thumbnailUrlOf(gcid: String): String = "https://sg-thumbnail-drive.mypikpak.com/v0/screenshot-thumbnails/${gcid.canonicalGcid()}/240/720"
+
+/**
+ * The CID of [detail]'s original, read from its octet-stream link: at most
+ * 60 KB whatever the size. [gcidByCid] takes no gcid, so a caller that wants
+ * to check later whether PikPak still holds some content keeps this beside it.
+ */
+suspend fun PikPakClient.sampleCid(detail: FileDetail): String {
+    val url = detail.downloadUrl ?: throw PikPakException(-1, "sampleCid: file ${detail.id} has no download link")
+    val parts = XunleiCid.windows(detail.sizeBytes).map { (offset, length) ->
+        if (length == 0) {
+            ByteArray(0)
+        } else {
+            streamRangeFromUrl(url, start = offset, length = length.toLong()) { it.channel.toByteArray() }
+        }
+    }
+    return XunleiCid.digest(parts)
 }
 
 /**
