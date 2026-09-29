@@ -215,6 +215,11 @@ data class FileDetail(
      * Alternate representations of this file. Empty for non-media files and for
      * media that hasn't been transcoded yet. See [MediaVariant] for byte-range
      * streaming context.
+     *
+     * On a free account the origin entry is listed without a link, while the
+     * transcodes keep theirs and [links] still carries the original through
+     * [octetStream] (2026-09-29): read that for the original, not the origin
+     * variant.
      */
     val medias: List<MediaVariant> = emptyList(),
     val trashed: Boolean = false,
@@ -249,9 +254,48 @@ data class QuotaInfo(
     val remainingBytes: Long get() = limitBytes - usageBytes
 }
 
+/**
+ * A quota counted in requests rather than bytes. Recorded 2026-09-29: a free
+ * account's daily cloud downloads read `limit "5"` with `complimentary "2"`,
+ * the three every free account gets plus two from an invitation; a premium
+ * account's read `limit "-1"`, `is_unlimited true`.
+ */
+@Serializable
+data class CountQuota(
+    val limit: String = "-1",
+    val usage: String = "0",
+    @SerialName("is_unlimited") val isUnlimited: Boolean = false,
+    /** The part of [limit] granted on top of the tier's own, already included in it. */
+    val complimentary: String = "0",
+) {
+    /** What is left today, or null when the count does not apply or is unknown. */
+    val remaining: Int?
+        get() {
+            val limitCount = limit.toIntOrNull() ?: return null
+            if (isUnlimited || limitCount < 0) return null
+            return (limitCount - (usage.toIntOrNull() ?: 0)).coerceAtLeast(0)
+        }
+}
+
+@Serializable
+data class CountQuotas(
+    /**
+     * Offline tasks created today; resets at 00:00 SGT. [instantCreate] does
+     * not draw on it: on a free account, a create read `usage "0"` before and
+     * after, and no task appeared (2026-09-29).
+     */
+    @SerialName("cloud_download") val cloudDownload: CountQuota = CountQuota(),
+)
+
 @Serializable
 data class QuotaResponse(
     val kind: String = "",
     val quota: QuotaInfo = QuotaInfo(),
     @SerialName("expires_at") val expiresAt: String = "",
+    val quotas: CountQuotas = CountQuotas(),
+    /**
+     * 1 on a premium account and 2 on a free one (2026-09-29). Other values
+     * are not known; [TransferAllowances.isPremium] is the documented signal.
+     */
+    @SerialName("user_type") val userType: Int = 0,
 )

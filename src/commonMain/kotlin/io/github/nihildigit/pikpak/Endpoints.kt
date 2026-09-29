@@ -51,7 +51,10 @@ object FileFilter {
     fun starred(): Pair<String, JsonElement> = "system_tag" to buildJsonObject { put("in", "STAR") }
 }
 
-/** Returns the storage quota for the authenticated account (`GET /drive/v1/about`). */
+/**
+ * Returns the storage quota and the daily cloud-download count for the
+ * authenticated account (`GET /drive/v1/about`).
+ */
 suspend fun PikPakClient.getQuota(): QuotaResponse {
     val response = http.request(
         method = HttpMethod.Get,

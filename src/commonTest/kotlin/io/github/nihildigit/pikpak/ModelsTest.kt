@@ -102,6 +102,20 @@ class ModelsTest {
     }
 
     @Test
+    fun `cloud download count reads a free limit and a premium one`() {
+        // Recorded 2026-09-29. complimentary is already inside limit; premium's -1 is no count at all.
+        val free = """{"kind":"drive#about","quota":{"limit":"6442450944","usage":"12893054"},
+            "quotas":{"cloud_download":{"kind":"","limit":"5","usage":"1","usage_in_trash":"0","is_unlimited":false,"complimentary":"2"}},
+            "user_type":2}"""
+        val premium = """{"kind":"drive#about","quota":{"limit":"10995116277760","usage":"1"},
+            "quotas":{"cloud_download":{"kind":"","limit":"-1","usage":"0","usage_in_trash":"0","is_unlimited":true,"complimentary":"0"}},
+            "user_type":1}"""
+        assertEquals(4, json.decodeFromString(QuotaResponse.serializer(), free).quotas.cloudDownload.remaining)
+        assertEquals(null, json.decodeFromString(QuotaResponse.serializer(), premium).quotas.cloudDownload.remaining)
+        assertEquals(null, json.decodeFromString(QuotaResponse.serializer(), """{"kind":"drive#about"}""").quotas.cloudDownload.remaining)
+    }
+
+    @Test
     fun `FileListPage decodes empty listing`() {
         val r = json.decodeFromString(FileListPage.serializer(), """{"files":[]}""")
         assertEquals(0, r.files.size)

@@ -30,6 +30,14 @@ data class TransferAllowance(
  *
  * The SDK's own requests count here, not under the connected-apps share: that
  * share stayed at zero throughout.
+ *
+ * Measured 2026-09-29 against a free account, whose limits are the premium
+ * ones plus a [downloadDaily] of 20 GiB:
+ * - [download] and [downloadDaily] count the bytes actually read, not the
+ *   size of what was opened: 71 MiB of range reads across episodes of 395
+ *   and 598 MiB, plus 6.1 MiB the web player fetched, drew 77.1 MiB.
+ * - The 15 % charge of [instantCreate] applies here too, and a create PikPak
+ *   cannot serve from its index draws nothing.
  */
 @Serializable
 data class TransferAllowances(
@@ -41,7 +49,10 @@ data class TransferAllowances(
     @SerialName("vip_status") val vipStatus: String = "",
     /** Premium expiry, ISO-8601 with offset, empty for a free account. */
     @SerialName("expire_time") val expireTime: String = "",
-)
+) {
+    /** [vipStatus] reads `ok` on a premium account and `invalid` on a free one. */
+    val isPremium: Boolean get() = vipStatus == "ok"
+}
 
 /**
  * Response of [getTransferQuota]. [connectedApps] is the separate share (a
