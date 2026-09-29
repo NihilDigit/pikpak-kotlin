@@ -157,7 +157,14 @@ private fun collect(
  * No bytes move, but it is not free: each call is charged 15 % of the file's
  * size against the monthly upload allowance of [getTransferQuota], also for
  * content the account already holds. Per byte, that is about six times what
- * an offline download of the same content costs its own allowance.
+ * an offline download of the same content costs its own allowance. The file
+ * takes its full size of storage until deleted. A create that ends in
+ * [InstantContentUnavailableException] is charged nothing.
+ *
+ * It is not a cloud download: it leaves the daily count of
+ * [CountQuotas.cloudDownload] alone, which is what makes a free account's
+ * three a day irrelevant to content PikPak already holds, and lets it take a
+ * few episodes of a pack an offline task would have to fetch whole.
  *
  * Known flake: creating the same gcid twice in one folder has been observed to
  * return a file node complete enough to carry an id but not yet resolvable —

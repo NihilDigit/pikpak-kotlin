@@ -51,6 +51,13 @@ object XunleiCid {
  * The server checks the size too: the right CID with the size off by one byte
  * is a miss. A miss is `200 {"gcid": ""}`, not an error; a zero size or a
  * malformed CID is a 400.
+ *
+ * It reads without creating anything, so it doubles as a check that content
+ * is still in the index: a free account that had never held a file got its
+ * gcid back from the CID (2026-09-29). The endpoint has no gcid-keyed form
+ * (`?gcid=` answers 400 "cid and file_size is required"), so a caller that
+ * wants the check later has to keep the CID. A hit shows the index has the
+ * content, not that nobody has let it go since; only [instantCreate] proves it.
  */
 suspend fun PikPakClient.gcidByCid(cid: String, size: Long): String? {
     require(size > 0) { "size must be positive" }

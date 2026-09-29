@@ -130,7 +130,8 @@ data class ShareInfo(
     /**
      * Top-level items. Ids are the owner's own file ids, the same ones [restoreShare]
      * takes; `parent_id` of these is the owner's folder, not something the reader
-     * can open.
+     * can open. Files carry their gcid in `hash` (2026-09-29, read without
+     * restoring), so [instantCreate] can take a shared file without [restoreShare].
      */
     val files: List<FileStat> = emptyList(),
     @SerialName("next_page_token") val nextPageToken: String = "",
