@@ -1,6 +1,7 @@
 package io.github.nihildigit.pikpak
 
 import io.github.cdimascio.dotenv.dotenv
+import io.github.nihildigit.pikpak.internal.jsonBody
 import io.ktor.http.HttpMethod
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -15,7 +16,9 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import kotlin.test.Test
 import kotlin.time.Clock
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.launch
 import kotlin.time.TimeSource
 
 /**
@@ -243,7 +246,6 @@ class FreeAccountProbeTest {
         val premiumPassword = env["PIKPAK_PASSWORD"]?.takeIf { it.isNotBlank() && it != "your-password" }
         Assumptions.assumeTrue(premiumUser != null && premiumPassword != null && username != null && password != null)
 
-        val http = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build()
         val premium = PikPakClient(account = premiumUser!!, password = premiumPassword!!, sessionStore = InMemorySessionStore())
         val free = PikPakClient(account = username!!, password = password!!, sessionStore = InMemorySessionStore())
         try {
@@ -278,8 +280,7 @@ class FreeAccountProbeTest {
                 log("no video in the premium drive within the walk budget")
                 return@runBlocking
             }
-            val link = premium.getFile(source.id).downloadUrl!!
-            val cid = XunleiCid.of(source.sizeBytes) { offset, length -> readRange(http, link, offset, length) }
+            val cid = premium.sampleCid(premium.getFile(source.id))
             log("source ${mib(source.sizeBytes)}, gcid ${source.hash.take(8)}…, cid ${cid.take(8)}…")
             val live = free.gcidByCid(cid, source.sizeBytes)
             log("free account, real cid: ${live?.take(8)}… match=${live == source.hash.uppercase()}")
@@ -303,6 +304,254 @@ class FreeAccountProbeTest {
         }
     }
 
+    /**
+     * Whether resolving a magnet already hands out thumbnails an archived entry
+     * could show, and whether their URLs are stable enough to store. Read-only.
+     */
+    @Test
+    fun `dump the thumbnails resource list returns`() = runBlocking {
+        Assumptions.assumeTrue(enabled, "set PIKPAK_PROBE=1 to run")
+        val premiumUser = env["PIKPAK_USERNAME"]?.takeIf { it.isNotBlank() && !it.contains("@example.com") }
+        val premiumPassword = env["PIKPAK_PASSWORD"]?.takeIf { it.isNotBlank() && it != "your-password" }
+        Assumptions.assumeTrue(premiumUser != null && premiumPassword != null)
+        val client = PikPakClient(account = premiumUser!!, password = premiumPassword!!, sessionStore = InMemorySessionStore())
+        try {
+            client.login()
+            val raw = client.http.request(
+                method = HttpMethod.Post,
+                url = "${PikPakConstants.DRIVE_BASE}/drive/v1/resource/list",
+                captchaAction = "POST:/drive/v1/resource/list",
+            ) {
+                jsonBody(client.json, kotlinx.serialization.json.buildJsonObject {
+                    put("urls", kotlinx.serialization.json.JsonPrimitive(SAMPLE_PACKS.first().second))
+                    put("page_size", kotlinx.serialization.json.JsonPrimitive(500))
+                    put("thumbnail_type", kotlinx.serialization.json.JsonPrimitive("FROM_HASH"))
+                })
+            }
+            val text = raw.toString()
+            File("build").mkdirs()
+            File("build/resource-list-thumbnails.json").writeText(text)
+            println("[thumb] ${text.length} chars written to build/resource-list-thumbnails.json")
+        } finally {
+            client.close()
+        }
+    }
+
+    /**
+     * What a thumbnail link looks like: whether it carries an expiry, and whether
+     * it is tied to the file object or only to the gcid. Decides whether an
+     * archived entry can keep one. Read-only; signatures are masked in the output.
+     */
+    @Test
+    fun `dump the shape of thumbnail links`() = runBlocking {
+        Assumptions.assumeTrue(enabled, "set PIKPAK_PROBE=1 to run")
+        val premiumUser = env["PIKPAK_USERNAME"]?.takeIf { it.isNotBlank() && !it.contains("@example.com") }
+        val premiumPassword = env["PIKPAK_PASSWORD"]?.takeIf { it.isNotBlank() && it != "your-password" }
+        Assumptions.assumeTrue(premiumUser != null && premiumPassword != null)
+        val client = PikPakClient(account = premiumUser!!, password = premiumPassword!!, sessionStore = InMemorySessionStore())
+        try {
+            client.login()
+            val video = findVideo(client) ?: return@runBlocking
+            fun shape(url: String): String {
+                if (url.isBlank()) return "(empty)"
+                val uri = URI(url)
+                val query = uri.rawQuery.orEmpty().split('&').filter { it.isNotEmpty() }.joinToString("&") { pair ->
+                    val (k, v) = pair.split('=', limit = 2).let { it[0] to it.getOrElse(1) { "" } }
+                    if (Regex("sign|token|sig|auth|key", RegexOption.IGNORE_CASE).containsMatchIn(k)) "$k=<${v.length} chars>" else "$k=$v"
+                }
+                return "${uri.host}${uri.rawPath}?$query"
+            }
+            log("gcid ${video.hash}, file id ${video.id}")
+            log("listing thumbnail: ${shape(video.thumbnailLink)}")
+            File("build").mkdirs()
+            File("build/thumbnail-shape.txt").writeText(report.toString())
+        } finally {
+            client.close()
+        }
+    }
+
+    /**
+     * How long a link keeps serving once its object is gone. Leasing rests on
+     * "a link outlives the object"; playback through a lease then failed with
+     * CDN 404 a few seconds after the delete, on a seek. Reads a small range
+     * at intervals after a permanent delete, and again after a move to trash.
+     */
+    @Test
+    fun `measure how long a link survives its object`() = runBlocking {
+        Assumptions.assumeTrue(enabled, "set PIKPAK_PROBE=1 to run")
+        val premiumUser = env["PIKPAK_USERNAME"]?.takeIf { it.isNotBlank() && !it.contains("@example.com") }
+        val premiumPassword = env["PIKPAK_PASSWORD"]?.takeIf { it.isNotBlank() && it != "your-password" }
+        Assumptions.assumeTrue(premiumUser != null && premiumPassword != null)
+        val client = PikPakClient(account = premiumUser!!, password = premiumPassword!!, sessionStore = InMemorySessionStore())
+        val http = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build()
+        try {
+            client.login()
+            log("=== link after delete, ${Clock.System.now()} ===")
+            val (_, target) = pickTarget(client, Long.MAX_VALUE) ?: return@runBlocking
+            for (mode in listOf("delete", "trash")) {
+                val id = client.instantCreate(target, parentId = "")
+                val link = client.getFile(id).downloadUrl!!
+                log("$mode: before: ${readAt(http, link, 0)}")
+                if (mode == "delete") client.deleteFile(id) else client.batchTrash(listOf(id))
+                val mark = TimeSource.Monotonic.markNow()
+                for (at in listOf(0, 1, 2, 3, 5, 8, 13, 20, 30, 45, 60, 90)) {
+                    val wait = at.seconds - mark.elapsedNow()
+                    if (wait.isPositive()) delay(wait)
+                    // Each read at a new offset, as a seek would ask
+                    log("$mode: t+${at}s: ${readAt(http, link, at * 10_000_000L)}")
+                }
+                if (mode == "trash") client.batchDelete(listOf(id))
+            }
+        } finally {
+            client.close()
+            File("build").mkdirs()
+            File("build/link-after-delete.txt").writeText(report.toString())
+        }
+    }
+
+    /**
+     * Where the captcha wall actually starts. The SDK's 5 requests a second was
+     * never measured; it only had to stay clear. Fires read-only `about` calls
+     * with the limiter off at rising rates, counting what the SDK hides: error
+     * code 9 answers and the captcha refreshes it does to get past them. Stops
+     * at once if a refresh asks for a human (a non-empty `url`). Free account only.
+     */
+    @Test
+    fun `find the request rate that trips the captcha wall`() = runBlocking {
+        Assumptions.assumeTrue(enabled, "set PIKPAK_PROBE=1 to run")
+        Assumptions.assumeTrue(username != null && password != null)
+        val sent = java.util.concurrent.atomic.AtomicInteger()
+        val walls = java.util.concurrent.atomic.AtomicInteger()
+        val refreshes = java.util.concurrent.atomic.AtomicInteger()
+        val human = java.util.concurrent.atomic.AtomicBoolean()
+        val counting = io.ktor.client.HttpClient(io.ktor.client.engine.okhttp.OkHttp) {
+            engine {
+                addInterceptor { chain ->
+                    val path = chain.request().url.encodedPath
+                    val response = chain.proceed(chain.request())
+                    val body = response.peekBody(4096).string()
+                    when {
+                        path.endsWith("/shield/captcha/init") -> {
+                            refreshes.incrementAndGet()
+                            if (Regex(""""url"\s*:\s*"http""").containsMatchIn(body)) human.set(true)
+                        }
+                        path.startsWith("/drive/v1/") -> {
+                            sent.incrementAndGet()
+                            if (Regex(""""error_code"\s*:\s*9\b""").containsMatchIn(body)) walls.incrementAndGet()
+                        }
+                    }
+                    response
+                }
+            }
+            expectSuccess = false
+        }
+        val client = PikPakClient(
+            account = username!!,
+            password = password!!,
+            sessionStore = InMemorySessionStore(),
+            httpClient = counting,
+            rateLimiter = RateLimiter.unlimited(),
+        )
+        try {
+            client.login()
+            log("=== captcha wall, ${Clock.System.now()} ===")
+            val someFile = client.listFiles(parentId = "").first { !it.isFolder }.id
+            val calls: List<Triple<String, Int, suspend () -> Unit>> = listOf(
+                Triple("about", 80, { client.getQuota() }),
+                Triple("about", 160, { client.getQuota() }),
+                Triple("getFile", 20, { client.getFile(someFile) }),
+                Triple("getFile", 40, { client.getFile(someFile) }),
+                Triple("listFiles", 20, { client.listFilesPaged(parentId = "") }),
+                Triple("listFiles", 40, { client.listFilesPaged(parentId = "") }),
+            )
+            for ((what, rate, call) in calls) {
+                val (s0, w0, r0) = Triple(sent.get(), walls.get(), refreshes.get())
+                val mark = TimeSource.Monotonic.markNow()
+                val failures = java.util.concurrent.atomic.AtomicInteger()
+                kotlinx.coroutines.coroutineScope {
+                    repeat(rate * 10) { i ->
+                        val due = (1000L * i / rate).milliseconds - mark.elapsedNow()
+                        if (due.isPositive()) delay(due)
+                        launch { runCatching { call() }.onFailure { failures.incrementAndGet() } }
+                    }
+                }
+                log(
+                    "$what $rate/s for 10 s: ${sent.get() - s0} calls, ${walls.get() - w0} answered error 9, " +
+                        "${refreshes.get() - r0} captcha refreshes, ${failures.get()} calls failed, took ${mark.elapsedNow().inWholeMilliseconds} ms",
+                )
+                if (human.get()) {
+                    log("STOP: a captcha refresh asked for human verification")
+                    break
+                }
+                delay(5.seconds)
+            }
+        } finally {
+            client.close()
+            File("build").mkdirs()
+            File("build/captcha-wall.txt").writeText(report.toString())
+        }
+    }
+
+    /**
+     * Whether a trashed file still takes the free account's space. Archiving a
+     * folder moves its files to the trash to stay recoverable; if the trash
+     * counts, a free account gains nothing until the trash is emptied.
+     */
+    @Test
+    fun `does the trash count against a free account's space`() = runBlocking {
+        Assumptions.assumeTrue(enabled, "set PIKPAK_PROBE=1 to run")
+        Assumptions.assumeTrue(username != null && password != null)
+        val client = PikPakClient(account = username!!, password = password!!, sessionStore = InMemorySessionStore())
+        var id: String? = null
+        try {
+            client.login()
+            log("=== trash vs space, ${Clock.System.now()} ===")
+            fun QuotaInfo.line() = "usage ${mib(usageBytes)}, in trash ${mib(usageInTrash.toLongOrNull() ?: 0)}, free ${mib(remainingBytes)}"
+            // about lags a write by seconds; wait until either figure moves, or give up and say so
+            suspend fun settled(from: QuotaInfo): String {
+                val mark = TimeSource.Monotonic.markNow()
+                while (mark.elapsedNow() < 45.seconds) {
+                    val now = client.getQuota().quota
+                    if (now.usage != from.usage || now.usageInTrash != from.usageInTrash) {
+                        return "${now.line()} (after ${mark.elapsedNow().inWholeSeconds} s)"
+                    }
+                    delay(3.seconds)
+                }
+                return "${client.getQuota().quota.line()} (no change in 45 s)"
+            }
+            val (_, target) = pickTarget(client, client.getQuota().quota.remainingBytes) ?: return@runBlocking
+            val q0 = client.getQuota().quota
+            log("before: ${q0.line()}")
+            id = client.instantCreate(target, parentId = "")
+            log("created ${mib(target.size)}: ${settled(q0)}")
+            val q1 = client.getQuota().quota
+            client.batchTrash(listOf(id))
+            log("trashed: ${settled(q1)}")
+            val trashed = client.listTrash().firstOrNull { it.id == id }
+            log("delete_time: ${trashed?.deleteTime ?: "(not listed)"}")
+            val q2 = client.getQuota().quota
+            client.batchDelete(listOf(id))
+            id = null
+            log("deleted for good: ${settled(q2)}")
+        } finally {
+            runCatching { id?.let { client.batchDelete(listOf(it)) } }
+            client.close()
+            File("build").mkdirs()
+            File("build/trash-vs-space.txt").writeText(report.toString())
+        }
+    }
+
+    private fun readAt(http: HttpClient, url: String, offset: Long): String {
+        val request = HttpRequest.newBuilder(URI(url))
+            .header("Range", "bytes=$offset-${offset + 65_535}")
+            .timeout(java.time.Duration.ofSeconds(30))
+            .build()
+        return runCatching {
+            val response = http.send(request, HttpResponse.BodyHandlers.ofByteArray())
+            "http ${response.statusCode()} ${response.body().size} B"
+        }.getOrElse { "${it::class.simpleName}: ${it.message}" }
+    }
+
     private suspend fun findVideo(client: PikPakClient): FileStat? {
         val queue = ArrayDeque(listOf(""))
         var folders = 0
@@ -313,16 +562,6 @@ class FreeAccountProbeTest {
             }
         }
         return null
-    }
-
-    private fun readRange(http: HttpClient, url: String, offset: Long, length: Int): ByteArray {
-        val request = HttpRequest.newBuilder(URI(url))
-            .header("Range", "bytes=$offset-${offset + length - 1}")
-            .timeout(java.time.Duration.ofSeconds(60))
-            .build()
-        val body = http.send(request, HttpResponse.BodyHandlers.ofByteArray()).body()
-        check(body.size == length) { "range $offset+$length returned ${body.size} bytes" }
-        return body
     }
 
     private fun randomHex(length: Int): String =
