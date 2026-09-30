@@ -25,8 +25,9 @@ val fileId = client.instantCreate(episode, parentId = folder)
 
 // Read it at any offset, over eight connections.
 val handle = PikPakFileHandle(client, gcid, episode.size, episode.name, initialFileId = fileId)
+val cache = handle.openCache()          // one per file: every stream, prefetch and download shares it
 val buffer = ByteArray(64 * 1024)
-handle.openStream().use { stream ->
+cache.openStream().use { stream ->
     stream.seekTo(0)
     stream.read(buffer, 0, buffer.size)
 }
@@ -37,7 +38,7 @@ handle.openStream().use { stream ->
 ```kotlin
 repositories { mavenCentral() }
 dependencies {
-    implementation("io.github.nihildigit:pikpak-kotlin:1.3.0")
+    implementation("io.github.nihildigit:pikpak-kotlin:2.0.0")
     // Ktor is compileOnly in the SDK, so it never changes the Ktor you pinned: bring the core and one engine.
     implementation("io.ktor:ktor-client-core:<your-ktor-version>")
     implementation("io.ktor:ktor-client-okhttp:<your-ktor-version>")   // or ktor-client-darwin on iOS
