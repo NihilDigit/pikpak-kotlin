@@ -227,7 +227,8 @@ class WeakLinkSmokeTest {
         Assumptions.assumeTrue(enabled, "set PIKPAK_WEAKLINK=1 to run the link measurements")
         Assumptions.assumeTrue(username != null && password != null, "no .env credentials")
         val f = open("playback") ?: return@runBlocking
-        val stream = f.handle.openStream()
+        val cache = f.handle.openCache()
+        val stream = cache.openStream()
         try {
             val buf = ByteArray(64 * 1024)
 
@@ -256,6 +257,7 @@ class WeakLinkSmokeTest {
             assertTrue(delivered > 0, "playback delivered nothing")
         } finally {
             stream.close()
+            cache.close()
             f.cleanUp()
         }
     }

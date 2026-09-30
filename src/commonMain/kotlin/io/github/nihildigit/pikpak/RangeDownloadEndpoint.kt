@@ -63,9 +63,10 @@ public const val DIRECT_DOWNLOAD_CONCURRENCY: Int = 4
  * signature does.
  *
  * It reads through [RangeSource] and nothing else, so it shares no bytes with
- * the handle's block cache or [BlockStore]: a file downloaded while it plays is
- * fetched twice, the two competing only through priority. Folding it into the
- * cache as a sequential background cursor would fix that, and has not been done.
+ * a [PikPakFileCache]: a file downloaded this way while it plays is fetched
+ * twice. For a file that is also played, [PikPakFileCache.download] into a
+ * [DurableBlockStore] fetches each block once; this stays for a caller that
+ * wants the plain in-order file, whose length is its progress.
  *
  * @param dest        output path. An existing file is treated as a partial
  *                    download and continued; one longer than [totalSize] is

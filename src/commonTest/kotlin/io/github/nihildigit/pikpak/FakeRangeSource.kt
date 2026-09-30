@@ -33,12 +33,17 @@ internal class FakeRangeSource(
     private val remainingFailures = failFirstAttemptAt.associateWith { 1 }.toMutableMap()
     private var active = 0
     private var peak = 0
+    private val activeAt = HashMap<Int, Int>()
+    private val peakAt = HashMap<Int, Int>()
 
     suspend fun requests(): List<Request> = snapshot { _requests.toList() }
 
     suspend fun cancelled(): List<Request> = snapshot { _cancelled.toList() }
 
     suspend fun peakConcurrency(): Int = snapshot { peak }
+
+    /** The most requests at [priority] in flight at once. */
+    suspend fun peakConcurrency(priority: Int): Int = snapshot { peakAt[priority] ?: 0 }
 
     override suspend fun <T> read(
         start: Long,
@@ -51,6 +56,9 @@ internal class FakeRangeSource(
             _requests += request
             active++
             peak = maxOf(peak, active)
+            val now = (activeAt[priority] ?: 0) + 1
+            activeAt[priority] = now
+            peakAt[priority] = maxOf(peakAt[priority] ?: 0, now)
         }
         try {
             if (latency > Duration.ZERO) delay(latency)
@@ -66,7 +74,10 @@ internal class FakeRangeSource(
             record { _cancelled += request }
             throw e
         } finally {
-            record { active-- }
+            record {
+                active--
+                activeAt[priority] = (activeAt[priority] ?: 1) - 1
+            }
         }
     }
 

@@ -4,7 +4,6 @@ import io.github.nihildigit.pikpak.internal.ForegroundStreams
 import kotlinx.coroutines.Deferred
 import kotlin.concurrent.Volatile
 import kotlin.coroutines.CoroutineContext
-import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.time.Duration
 import kotlin.time.TimeMark
 import kotlin.time.TimeSource
@@ -24,12 +23,12 @@ enum class StreamRole { FOREGROUND, BACKGROUND }
  * the player is the one that knows what it will read next, and every playback
  * fault this design replaced came from a policy layer second-guessing it.
  *
- * A reader is one read position over a block cache. Readers opened from the
- * same [PikPakFileHandle] share that handle's cache: any number of them can
- * read at once, each keeping its own read-ahead window filled, and bytes one of
- * them fetched are there for the rest. A player that opens a second connection
- * for a seek therefore opens a second reader instead of taking the first one's
- * position. A reader built with the public constructor owns a cache of its own.
+ * A reader is one read position over a [PikPakFileCache], opened with
+ * [PikPakFileCache.openStream]. Readers of one cache share it: any number of
+ * them can read at once, each keeping its own read-ahead window filled, and
+ * bytes one of them fetched are there for the rest. A player that opens a
+ * second connection for a seek therefore opens a second reader instead of
+ * taking the first one's position.
  *
  * The cache holds fixed-size blocks, evicted least-recently-used from outside
  * every reader's window, and fetches them over up to `concurrency` range
@@ -48,7 +47,9 @@ enum class StreamRole { FOREGROUND, BACKGROUND }
  * takes the next free slot, though, and a slot a background read already holds
  * is not taken back; so while the account has foreground demand, a file with
  * none of its own keeps at most [BACKGROUND_WORKERS_WHILE_FOREGROUND] requests
- * in flight, each a single block.
+ * in flight, each a single block. A foreground reader counts as that demand
+ * while it reads and for five seconds after, so a paused player, or one sitting
+ * on a full buffer, does not hold the rest of the account back.
  *
  * A block that cannot be fetched fails the read waiting on it; the reader stays
  * usable and a later read of that block tries again.
@@ -63,22 +64,6 @@ class PikPakStreamReader internal constructor(
     private val ownsCache: Boolean,
     initialRole: StreamRole,
 ) : AutoCloseable {
-
-    /**
-     * @param source where the bytes come from. Pass a [PikPakFileHandle] when
-     *   the file id may move under the reader; a plain [RangeReader] adapted
-     *   with [asRangeSource] is enough for a file that will not. Prefer
-     *   [PikPakFileHandle.openStream], which shares one cache between readers.
-     * @param concurrency range requests in flight at once. Defaults to a whole
-     *   per-URL connection budget, which is what a cold open needs; lower it
-     *   only to leave slots for another file on the same account.
-     */
-    constructor(
-        source: RangeSource,
-        size: Long,
-        concurrency: Int = PikPakClient.DEFAULT_CONNECTION_BUDGET,
-        parentCoroutineContext: CoroutineContext = EmptyCoroutineContext,
-    ) : this(source, size, concurrency, parentCoroutineContext, DEFAULT_BLOCK_SIZE)
 
     internal constructor(
         source: RangeSource,

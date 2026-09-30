@@ -50,12 +50,14 @@ class ReadmeCompositionTest {
             initialFileId = "f1",
         )
 
-        val stream: PikPakStreamReader = handle.openStream()
+        val cache: PikPakFileCache = handle.openCache()
+        val stream: PikPakStreamReader = cache.openStream()
 
         // A source over a fixed URL is the other accepted shape.
         val plain: RangeSource = RangeReader(client, { "https://cdn/x" }).asRangeSource()
 
         stream.close()
+        cache.close()
         handle.close()
         client.close()
         assertTrue(plain is RangeSource)
@@ -72,12 +74,14 @@ class ReadmeCompositionTest {
         val client = newClient()
         val handle = PikPakFileHandle(client, gcid = "C".repeat(40), size = 64, name = "x.mkv")
         var entered = false
+        val cache = handle.openCache()
         try {
-            handle.openStream().use { stream ->
+            cache.openStream().use { stream ->
                 entered = true
                 assertEquals(64L, stream.bytesRemaining)
             }
         } finally {
+            cache.close()
             handle.close()
             client.close()
         }

@@ -232,8 +232,8 @@ class PikPakFileHandleMockTest {
      * A rebuild replaces the object the handle was holding, and that object's
      * id is about to be forgotten. Overwriting the slot with the replacement
      * used to lose it, which is how two racing rebuilds stranded one object per
-     * race. The object left over when the ladder gives up is owed too, and only
-     * [PikPakFileHandle.closeAndReport] can collect that one.
+     * race. The object left over when the ladder gives up is owed too, and
+     * [PikPakFileHandle.close] hands it over in the client's background.
      */
     @Test
     fun `a rebuild reports the object it replaces and close reports the last one`() = runBlocking<Unit> {
@@ -253,7 +253,8 @@ class PikPakFileHandleMockTest {
             assertFailsWith<PikPakException> { handle.provideUrl(UrlRequest.Initial) }
             assertEquals(listOf("f1"), minted, "the object the rebuild replaced was not handed over")
 
-            handle.closeAndReport()
+            handle.close()
+            client.background.coroutineContext[Job]!!.children.forEach { it.join() }
             assertEquals(listOf("f1", "f2"), minted, "the rebuilt object was left with nobody able to name it")
         } finally {
             client.close()

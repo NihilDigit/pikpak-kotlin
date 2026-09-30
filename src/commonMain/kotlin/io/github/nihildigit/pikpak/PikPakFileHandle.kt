@@ -2,8 +2,8 @@ package io.github.nihildigit.pikpak
 
 import io.github.nihildigit.pikpak.internal.PriorityGate
 import io.ktor.utils.io.ByteReadChannel
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -57,12 +57,16 @@ data class VariantLink(
  * The variant is fixed for the life of the handle. Re-running preference
  * selection mid-file would change the byte stream under offsets the caller has
  * already read past.
+ *
+ * The handle keeps the file readable and nothing more. The bytes it reads are
+ * kept by a [PikPakFileCache] reading through it, which [openCache] builds; a
+ * handle used to own that cache as well, and with it every stream and download.
  */
 class PikPakFileHandle(
     private val client: PikPakClient,
     /** Content hash, in either case. The one identifier here that cannot go stale. */
     gcid: String,
-    /** Length of the original file. Needed to recreate it, and by [openStream]. */
+    /** Length of the original file. Needed to recreate it, and the size of [openCache] for the original. */
     val size: Long,
     /** Name given to a recreated file object. Cosmetic; the gcid decides the bytes. */
     val name: String,
@@ -92,9 +96,10 @@ class PikPakFileHandle(
      * [initialFileId] is reported the same way, so one rule covers every object
      * that exists, however it came to be.
      *
-     * A report can still be outstanding when a handle is abandoned — a rebuild
-     * whose detail lookup then failed owes one. [closeAndReport] collects it;
-     * [close] cannot, not being suspending.
+     * A report can still be outstanding when a handle is closed — a rebuild
+     * whose detail lookup then failed owes one. [close] makes it in the
+     * client's background, like the delete a lease makes; a client closed
+     * before it runs leaves the object for the caller's sweep.
      */
     private val onObjectMinted: (suspend (String) -> Unit)? = null,
     /**
@@ -119,25 +124,22 @@ class PikPakFileHandle(
     initialLink: VariantLink? = null,
     /** The variant's length when the caller already knows it, which saves a transcode the probe in [streamSize]. */
     streamSize: Long? = null,
-    /** Where fetched blocks are kept beyond memory, and looked for first. See [BlockStore]. */
-    private val blockStore: BlockStore? = null,
-    /** Where the shared cache's workers run. Closing the handle or cancelling this stops them. */
-    private val coroutineContext: CoroutineContext = EmptyCoroutineContext,
 ) : RangeSource, AutoCloseable {
-    /** Upper case whatever the caller passed, so the [BlockStore] key and the stream-size memo agree. */
+    /** Upper case whatever the caller passed, so [contentKey] and the stream-size memo agree. */
     val gcid: String = gcid.canonicalGcid()
+
+    /**
+     * What this handle reads, named by content: the gcid and the variant. The key a
+     * [BlockStore] files its blocks under, so a transcode and the original never share
+     * blocks and a store hit survives a new file object and a new link.
+     */
+    val contentKey: String = "${this.gcid}/${mediaId ?: ORIGINAL_KEY}"
 
     private val mutex = Mutex()
 
     /** The link [provideUrl] handed out last; reused by a new reader while it stays valid. */
     @Volatile
     private var link: VariantLink? = initialLink?.takeIf { it.url.isNotBlank() }
-
-    private val cacheMutex = Mutex()
-
-    /** Shared by every stream opened on this handle; see [openStream]. */
-    @Volatile
-    private var blockCache: BlockCache? = null
 
     /** Guards [unreportedObject] alone, so it is never held across a network call. */
     private val reportMutex = Mutex()
@@ -230,74 +232,26 @@ class PikPakFileHandle(
     suspend fun variants(): List<MediaVariant> = detail().medias
 
     /**
-     * Opens a seekable read position over this file, for playing it.
+     * A [PikPakFileCache] reading through this handle, sized to the variant it reads and
+     * filed under [contentKey] in [blockStore]. One per file: every stream, prefetch and
+     * download of the file goes through it.
      *
-     * Every stream opened here shares one block cache and one set of workers:
-     * several can read at once, each with its own read-ahead window, and what
-     * one fetched the others read from memory. A player that opens a second
-     * connection to seek opens a second stream; nothing has to be cancelled
-     * for it. Reads go through this handle, so a signature that expires or a
-     * file object that has to be rebuilt mid-playback is invisible to them.
+     * Closing the cache does not close the handle, nor the other way round; a caller usually
+     * closes the cache first. Reads the cache makes after the handle is closed fail.
      *
-     * The result must be closed. Closing it gives up its position and leaves
-     * the cache to the handle; [close] on the handle drops the cache.
-     *
-     * The cache takes its size from [streamSize], its connections from the
-     * handle's budget and its workers' context from the handle's
-     * `coroutineContext`. None of that is a per-stream argument: it is one
-     * cache, and a later caller's arguments either changed it under every
-     * other stream or were silently ignored.
-     *
-     * @param role [StreamRole.BACKGROUND] for a file being warmed ahead of the
-     *   one on screen. It can be changed later without losing the cache; see
-     *   [PikPakStreamReader.role].
+     * @param coroutineContext where the cache's workers run. Cancelling it closes the cache.
      */
-    suspend fun openStream(role: StreamRole = StreamRole.FOREGROUND): PikPakStreamReader =
-        PikPakStreamReader(sharedCache(), ownsCache = false, initialRole = role)
-
-    /**
-     * Fetches [ranges] into the shared cache without opening a stream, for a
-     * file the user may play next: its head, the start of an excerpt, a
-     * container index. Streams opened later read them from memory, or from the
-     * [BlockStore] if they were written there.
-     *
-     * Ties at the connection gates go to the older demand, so files warmed in
-     * the order they will be played finish in that order rather than sharing
-     * the line and finishing together. [priority] defaults to the [role]'s warm
-     * band, [PikPakStreamReader.WARM_PRIORITY] in the foreground.
-     *
-     * The job completes once every block is cached and fails when one cannot
-     * be fetched. Cancelling it withdraws the request, and fetches only it
-     * wanted are cancelled; closing the handle withdraws everything.
-     */
-    suspend fun prefetch(
-        ranges: List<LongRange>,
-        role: StreamRole = StreamRole.BACKGROUND,
-        priority: Int? = null,
-    ): Deferred<Unit> = sharedCache().warm(ranges, role, priority)
-
-    private suspend fun sharedCache(): BlockCache = cacheMutex.withLock {
-        check(!closed) { "PikPakFileHandle is closed" }
-        // A cache whose context was cancelled from outside is closed without anyone having asked; build another
-        blockCache?.takeUnless { it.closed }?.let { return@withLock it }
-        val built = BlockCache(
-            source = this,
-            size = streamSize(),
-            concurrency = connectionBudget,
-            parentCoroutineContext = coroutineContext,
-            foregroundStreams = client.foregroundStreams,
-            store = blockStore,
-            storeKey = "$gcid/${mediaId ?: ORIGINAL_KEY}",
-        )
-        blockCache = built
-        // close() does not wait for this lock, and the probe in streamSize can take long enough
-        // for it to run meanwhile; it then saw no cache to close, so this one is closed here
-        if (closed) {
-            built.close()
-            throw IllegalStateException("PikPakFileHandle is closed")
-        }
-        built
-    }
+    suspend fun openCache(
+        blockStore: BlockStore? = null,
+        coroutineContext: CoroutineContext = EmptyCoroutineContext,
+    ): PikPakFileCache = client.fileCache(
+        source = this,
+        size = streamSize(),
+        storeKey = contentKey,
+        blockStore = blockStore,
+        connectionBudget = connectionBudget,
+        coroutineContext = coroutineContext,
+    )
 
     /**
      * Length of the representation this handle reads, which is not always
@@ -324,25 +278,21 @@ class PikPakFileHandle(
         }
     }
 
+    /**
+     * Refuses further reads, and makes the report this handle still owes, if
+     * any, in the client's background.
+     *
+     * A handle whose rebuild succeeded and whose following detail lookup then
+     * failed holds an id nothing else has ever seen; this is the last moment
+     * anything can name it. Reporting suspends and `AutoCloseable.close` does
+     * not, hence the background, the same one a lease's delete runs in.
+     */
     override fun close() {
+        if (closed) return
         closed = true
-        blockCache?.close()
         reader?.close()
         reader = null
-    }
-
-    /**
-     * [close], plus the report this handle still owes, if any.
-     *
-     * [close] cannot do it: reporting suspends and `AutoCloseable.close` does
-     * not. A handle whose rebuild succeeded and whose following detail lookup
-     * then failed holds an id nothing else has ever seen, so a caller that
-     * deletes leases gives a handle up through this rather than through
-     * [close].
-     */
-    suspend fun closeAndReport() {
-        close()
-        reportMinted()
+        if (release != null && unreportedObject != null) client.background.launch { reportMinted() }
     }
 
     /**
@@ -524,7 +474,7 @@ class PikPakFileHandle(
         /** Extra links minted when one lands on a host known to be failing; see [mintAvoidingBadHosts]. */
         internal const val MAX_HOST_REMINTS = 2
 
-        /** What the original is called in a [BlockStore], where transcodes go by their media id. */
+        /** What the original is called in [contentKey], where transcodes go by their media id. */
         internal const val ORIGINAL_KEY = "origin"
     }
 }
@@ -542,8 +492,6 @@ fun PikPakClient.fileHandle(
     mediaId: String? = null,
     parentId: String = detail.parentId,
     streamSize: Long? = null,
-    blockStore: BlockStore? = null,
-    coroutineContext: CoroutineContext = EmptyCoroutineContext,
     onObjectMinted: (suspend (String) -> Unit)? = null,
     leased: Boolean = false,
     onRangeAttempt: ((RangeAttempt) -> Unit)? = null,
@@ -564,7 +512,5 @@ fun PikPakClient.fileHandle(
         onRangeAttempt = onRangeAttempt,
         initialLink = link?.url?.takeIf { it.isNotBlank() }?.let { VariantLink(it, link.expiresAt) },
         streamSize = streamSize ?: detail.sizeBytes.takeIf { mediaId == null },
-        blockStore = blockStore,
-        coroutineContext = coroutineContext,
     )
 }
