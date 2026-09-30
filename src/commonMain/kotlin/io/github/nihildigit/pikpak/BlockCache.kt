@@ -141,6 +141,13 @@ internal class BlockCache(
     private val storeWrites = store?.let { Channel<StoreWrite>(STORE_QUEUE_BLOCKS) }
 
     /**
+     * Blocks in [storeWrites] or being written from it, by slot. The stream that fetched one may
+     * have evicted it from memory already, and until its write lands the store reports it
+     * missing; a download takes the bytes from here rather than fetching them again.
+     */
+    private val offered = HashMap<Int, ByteArray>()
+
+    /**
      * Slots whose last fetch gave up, and why. Workers do not claim them again on their own:
      * a block the CDN will not serve would otherwise be retried for as long as a cursor sits
      * in front of it, and the player would wait on it forever instead of hearing why.
@@ -195,7 +202,7 @@ internal class BlockCache(
         var next = 0
     }
 
-    private class StoreWrite(val offset: Long, val bytes: ByteArray)
+    private class StoreWrite(val slot: Int, val offset: Long, val bytes: ByteArray)
 
     /** A read position and the window it keeps filled. Used by one caller at a time; see [PikPakStreamReader]. */
     inner class Cursor internal constructor(initialRole: StreamRole) {
@@ -273,6 +280,7 @@ internal class BlockCache(
                         throw e
                     } catch (_: Throwable) {
                     }
+                    locked { forgetOffer(write.slot, write.bytes) }
                 }
             }
         }
@@ -389,14 +397,14 @@ internal class BlockCache(
         val want = Want(priority ?: warmPriorityFor(role), RequestOrder.Sequence.next(), durable)
         // A download is never what someone is watching, whatever band it asks at
         val foreground = role == StreamRole.FOREGROUND && !durable
-        // Durable slots already in memory are written from there; fetching them again would
-        // spend a request on bytes a stream brought in a moment ago
+        // Durable slots already in memory, or still queued for the store, are written from there;
+        // fetching them again would spend a request on bytes a stream brought in a moment ago
         val fromMemory = mutableListOf<Pair<Int, ByteArray>>()
         locked {
             val pending = ArrayList<Int>(slots.size)
             for (slot in slots) {
                 if (durable) durableDone.remove(slot)
-                val cached = cache[slot]
+                val cached = cache[slot] ?: if (durable) offered[slot] else null
                 if (cached != null) {
                     if (durable) {
                         persisting += slot
@@ -958,13 +966,22 @@ internal class BlockCache(
 
     // Queued rather than awaited: the readers waiting on these bytes have them already. A full
     // queue drops the offer, which the store's contract allows.
-    private fun offerToStore(fetch: Fetch, bytes: ByteArray, skip: Set<Int>) {
+    private suspend fun offerToStore(fetch: Fetch, bytes: ByteArray, skip: Set<Int>) {
         val queue = storeWrites ?: return
         for (slot in fetch.slots) {
             if (slot in skip) continue
             val block = blockOf(fetch, slot, bytes) ?: break
-            queue.trySend(StoreWrite(slot.toLong() * blockSize, block))
+            // Recorded before the send, so the writer can never forget an offer ahead of this
+            locked { offered[slot] = block }
+            if (!queue.trySend(StoreWrite(slot, slot.toLong() * blockSize, block)).isSuccess) {
+                locked { forgetOffer(slot, block) }
+            }
         }
+    }
+
+    /** Drops [slot]'s offer if it is still [bytes]: a later fetch of the slot may have replaced it. */
+    private fun forgetOffer(slot: Int, bytes: ByteArray) {
+        if (offered[slot] === bytes) offered.remove(slot)
     }
 
     /**

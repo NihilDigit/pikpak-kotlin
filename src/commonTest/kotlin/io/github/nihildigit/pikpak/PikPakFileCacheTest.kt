@@ -42,6 +42,7 @@ class PikPakFileCacheTest {
         concurrency: Int = 4,
         foreground: ForegroundStreams? = null,
         foregroundIdle: Duration = BlockCache.FOREGROUND_IDLE,
+        memoryCapBytes: Long = 2L * 1024 * 1024,
     ) = BlockCache(
         source = source,
         size = size,
@@ -52,7 +53,7 @@ class PikPakFileCacheTest {
         storeKey = "file",
         blockSize = unit,
         readAheadBytes = unit * 4,
-        memoryCapBytes = 2L * 1024 * 1024,
+        memoryCapBytes = memoryCapBytes,
         wideBlockThresholdBytes = unit * 2,
         foregroundIdle = foregroundIdle,
     )
@@ -180,6 +181,42 @@ class PikPakFileCacheTest {
 
             val again = source.requests().drop(before).filter { it.start in fetched }
             assertTrue(again.isEmpty(), "blocks the stream had were fetched again: $again")
+            assertContentEquals(content, store.content(content.size))
+        } finally {
+            stream.close()
+            cache.close()
+        }
+    }
+
+    @Test
+    fun `what a stream fetched and evicted before its write landed is not fetched again`() = runBlocking<Unit> {
+        val content = payload((unit * 32).toInt())
+        val store = DurableMemoryStore()
+        // The disk is slow: every offer the stream makes is still queued when the download starts
+        store.gate = CompletableDeferred()
+        val source = FakeRangeSource(content)
+        // The least memory one worker allows, so a seek evicts the window it leaves behind
+        val cache = cache(source, content.size.toLong(), store, concurrency = 1, memoryCapBytes = unit * 7)
+        val files = PikPakFileCache(cache)
+        val stream = files.openStream()
+        try {
+            val buffer = ByteArray(16)
+            assertEquals(buffer.size, stream.read(buffer, 0, buffer.size))
+            waitUntil("the window is filled") { stream.readAheadDepthForTest() == unit * 4 }
+            val played = source.requests().map { it.start / unit }.toSet()
+            stream.seekTo(unit * 20)
+            assertEquals(buffer.size, stream.read(buffer, 0, buffer.size))
+            // Seven blocks of memory cannot hold both windows, so some of the first are gone
+            waitUntil("the second window is filled") { stream.readAheadDepthForTest() == unit * 4 }
+            val before = source.requests().size
+
+            val download = files.download()
+            delay(200.milliseconds)
+            store.gate.complete(Unit)
+            withTimeout(10.seconds) { download.await() }
+
+            val again = source.requests().drop(before).filter { it.start / unit in played }
+            assertTrue(again.isEmpty(), "blocks queued for the store were fetched again: $again")
             assertContentEquals(content, store.content(content.size))
         } finally {
             stream.close()
