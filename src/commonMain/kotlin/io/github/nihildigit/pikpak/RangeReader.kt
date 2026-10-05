@@ -9,6 +9,8 @@ import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.readAvailable
 import io.ktor.utils.io.writeFully
 import kotlin.time.Instant
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -510,24 +512,32 @@ class RangeReader internal constructor(
      * signature at once must not become eight getFile calls, so a refresh that
      * already happened is reused.
      */
-    private suspend fun refreshUrl(reason: UrlRequest, stale: String, allowSame: Boolean = false): String = urlMutex.withLock {
+    private suspend fun refreshUrl(reason: UrlRequest, stale: String): String = urlMutex.withLock {
         val existing = url
         if (existing != null && existing != stale) return existing
         val fresh = urlProvider(reason)
-        // Same link back is fatal only when the link is what was refused. A host that did not
-        // answer may answer the next time; retrying it is no worse than retrying without a refresh.
-        if (fresh == stale && !allowSame) {
+        // Fatal here, where the link is what was refused. switchHost takes the same link back:
+        // a host that did not answer may answer the next time.
+        if (fresh == stale) {
             throw PikPakException(
                 -1,
                 "RangeReader: urlProvider returned the same rejected URL; it cannot make progress",
                 errorDescription = stale,
             )
         }
+        adopt(fresh)
+    }
+
+    /** Under [urlMutex]. */
+    private fun adopt(fresh: String): String {
         url = fresh
         val now = Clock.System.now()
         _stats.update { it.copy(urlRefreshes = it.urlRefreshes + 1, lastUrlRefreshAt = now) }
-        fresh
+        return fresh
     }
+
+    /** When a host change last failed to get a link; guarded by [urlMutex]. */
+    private var hostChangeFailedAt: TimeMark? = null
 
     /**
      * Moves this reader, and every read on it after this one, off [stale]'s edge host.
@@ -544,11 +554,32 @@ class RangeReader internal constructor(
      * ever lands there; see [HostHealth] for the corroboration it asks for first. A body
      * cut short is not reported: a dropped Wi-Fi or a suspended laptop does that to every
      * connection at once, and would mark the whole pool.
+     *
+     * A link is minted only when no measured sibling can take the next attempt instead. A mint
+     * is a detail lookup, and for a leased handle also a create charged 15 % of the file's size
+     * to the upload allowance; a 594 MB file on a slow line was leased 59 times in ten minutes.
+     *
+     * After a mint fails, the readers queued behind it do not try again for
+     * [HOST_CHANGE_COOLDOWN]. A mint fails that way when the client's network is down, and then
+     * every read on the file fails at once and asks: measured, 62 detail lookups in 16 seconds.
      */
     private suspend fun switchHost(stale: String, silentFor: Duration? = null) {
-        if (silentFor != null) client.hostHealth.markSilent(stale, silentFor)
+        if (silentFor != null) {
+            client.hostHealth.markSilent(stale, silentFor)
+            if (client.hostHealth.route(stale, mayExplore = false) != stale) return
+        }
         try {
-            refreshUrl(UrlRequest.Unresponsive(stale), stale, allowSame = true)
+            urlMutex.withLock {
+                if (url != stale) return
+                if (hostChangeFailedAt?.let { it.elapsedNow() < HOST_CHANGE_COOLDOWN } == true) return
+                val fresh = try {
+                    urlProvider(UrlRequest.Unresponsive(stale))
+                } catch (e: Exception) {
+                    if (e !is CancellationException) hostChangeFailedAt = TimeSource.Monotonic.markNow()
+                    throw e
+                }
+                adopt(fresh)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
@@ -633,6 +664,13 @@ class RangeReader internal constructor(
          * took 1–5 s on that line.
          */
         val BODY_SILENCE = 3.seconds
+
+        /**
+         * How long a failed host change holds off the next on this reader. Long enough that the
+         * reads failing together on a dead network share one lookup, short enough that a host
+         * change after the network returns waits seconds at most.
+         */
+        val HOST_CHANGE_COOLDOWN = 5.seconds
 
         /**
          * A 503 means the URL is at its connection cap; waiting is the whole

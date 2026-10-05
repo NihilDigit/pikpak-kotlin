@@ -213,6 +213,23 @@ class RangeReaderMockTest {
         client.close()
     }
 
+    // Measured with the network down: every read on the file failed at once, and each one asked
+    // for a new link on every retry, 62 detail lookups in 16 seconds that could not succeed
+    @Test
+    fun `reads failing together on a dead network share one failed host change`() = runBlocking {
+        val client = clientWith { throw kotlinx.io.IOException("connection refused") }
+        var asked = 0
+        val reader = RangeReader(client, { request ->
+            asked++
+            if (request is UrlRequest.Initial) "https://cdn/file" else throw kotlinx.io.IOException("connection refused")
+        })
+
+        val reads = (0 until 8).map { i -> async { runCatching { reader.readBytes(i * 128L, 128) } } }.awaitAll()
+        assertTrue(reads.all { it.isFailure })
+        assertEquals(2, asked, "the initial link and one host change, not one per read and retry")
+        client.close()
+    }
+
     @Test
     fun `a provider that cannot refresh fails instead of looping`() = runBlocking {
         val client = clientWith { respond(ByteReadChannel(ByteArray(0)), HttpStatusCode.Forbidden) }
