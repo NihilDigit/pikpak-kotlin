@@ -1,5 +1,6 @@
 package io.github.nihildigit.pikpak
 
+import io.github.nihildigit.pikpak.internal.HostHealth
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.MockRequestHandleScope
@@ -138,7 +139,7 @@ class PikPakFileHandleMockTest {
             // Another file saw this host fail. Every mint here lands on the same host, so what
             // is left to check is that the handle tried to get off it, and gave up in bounded time.
             client.hostHealth.answered("https://elsewhere/f9")
-            client.hostHealth.markSilent("https://cdn/f1")
+            client.hostHealth.markSilent("https://cdn/f1", HostHealth.MIN_DEADLINE)
             handle.provideUrl(UrlRequest.Initial)
             assertEquals(1 + PikPakFileHandle.MAX_HOST_REMINTS, details(), "a link on a failing host was not replaced")
         } finally {

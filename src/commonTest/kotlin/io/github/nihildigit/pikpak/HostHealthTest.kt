@@ -5,6 +5,8 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TestTimeSource
 
 class HostHealthTest {
@@ -12,7 +14,7 @@ class HostHealthTest {
     @Test
     fun `a silence with no other host answering is not held against the host`() {
         val health = HostHealth()
-        health.markSilent("https://a.example/file")
+        health.markSilent("https://a.example/file", HostHealth.MIN_DEADLINE)
         assertFalse(health.isBad("https://a.example/other"))
     }
 
@@ -20,9 +22,35 @@ class HostHealthTest {
     fun `a silence while another host answers marks the host for every link on it`() {
         val health = HostHealth()
         health.answered("https://b.example/file")
-        health.markSilent("https://a.example/file?sig=1")
+        health.markSilent("https://a.example/file?sig=1", HostHealth.MIN_DEADLINE)
         assertTrue(health.isBad("https://a.example/another?sig=2"))
         assertFalse(health.isBad("https://b.example/file"))
+    }
+
+    @Test
+    fun `the first-response deadline follows the line and keeps its floor on a fast one`() {
+        val time = TestTimeSource()
+        val health = HostHealth(timeSource = time)
+        repeat(HostHealth.MIN_LATENCY_SAMPLES) { health.answered("https://a.example/f", 400.milliseconds) }
+        assertEquals(HostHealth.MIN_DEADLINE, health.firstResponseDeadline())
+
+        repeat(HostHealth.MAX_LATENCY_SAMPLES) { health.answered("https://a.example/f", 1500.milliseconds) }
+        assertEquals(3.seconds, health.firstResponseDeadline())
+
+        // A proxy switched on: the slow figures age out instead of holding the deadline up
+        time += HostHealth.LATENCY_MEMORY
+        assertEquals(HostHealth.INITIAL_DEADLINE, health.firstResponseDeadline())
+    }
+
+    // Pooled connections answer in one round trip and are most of the samples; a new connection
+    // spends seconds in its handshake, never answers within a deadline set by the pooled ones,
+    // and so would never be counted at all
+    @Test
+    fun `new connections cut off by the deadline lift it past their handshake`() {
+        val health = HostHealth()
+        repeat(24) { health.answered("https://a.example/f", 400.milliseconds) }
+        repeat(8) { health.markSilent("https://a.example/f", health.firstResponseDeadline()) }
+        assertTrue(health.firstResponseDeadline() > 3.seconds, "deadline ${health.firstResponseDeadline()}")
     }
 
     private val link = "https://dl-z01a-0001.mypikpak.com/download/?fid=F&sign=S"

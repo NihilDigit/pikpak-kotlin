@@ -223,7 +223,7 @@ class RangeReader internal constructor(
     }
 
     /** The CDN took the request and sent nothing back within [limit]. Not a CancellationException, so it reaches the retry path. */
-    private class UnresponsiveHost(limit: Duration) : Exception("no response headers within $limit")
+    private class UnresponsiveHost(val limit: Duration) : Exception("no response headers within $limit")
 
     /**
      * Reads a range into memory. Only for ranges small enough to hold; [read] is the general
@@ -335,21 +335,25 @@ class RangeReader internal constructor(
                     // is left is a host that said nothing at all.
                     // Throwing from the child fails the scope and cancels the request with it.
                     val answered = CompletableDeferred<Unit>()
+                    val limit = client.hostHealth.firstResponseDeadline()
+                    val bodySilence = maxOf(BODY_SILENCE, limit)
                     val deadline = launch {
                         var statusesSeen = attempt.retries.statuses
                         while (true) {
-                            delay(FIRST_RESPONSE_DEADLINE)
+                            delay(limit)
                             if (answered.isCompleted) return@launch
                             val statuses = attempt.retries.statuses
-                            if (statuses == statusesSeen) throw UnresponsiveHost(FIRST_RESPONSE_DEADLINE)
+                            if (statuses == statusesSeen) throw UnresponsiveHost(limit)
                             statusesSeen = statuses
                         }
                     }
                     client.streamRangeFromUrl(attemptUrl, offset, remaining) { stream ->
                         answered.complete(Unit)
                         deadline.cancel()
-                        attempt.headersReceived()
-                        client.hostHealth.answered(attemptUrl)
+                        val waited = attempt.headersReceived()
+                        // A wait that spans a retry below measures the retry policy, not the line
+                        val clean = attempt.retries.statuses == 0 && attempt.retries.transport == 0
+                        client.hostHealth.answered(attemptUrl, waited.takeIf { clean })
                         announced = stream.contentLength
                         clippedAtEof = stream.endsBeforeRequested(offset, remaining)
                         val buffer = ByteArray(READ_CHUNK)
@@ -364,7 +368,7 @@ class RangeReader internal constructor(
                             // requests still waiting for headers, and the retry underneath
                             // turned each into ten to twelve seconds having delivered nothing.
                             val n = try {
-                                withTimeout(BODY_SILENCE) {
+                                withTimeout(bodySilence) {
                                     stream.channel.readAvailable(buffer, 0, buffer.size)
                                 }
                             } catch (e: TimeoutCancellationException) {
@@ -373,7 +377,7 @@ class RangeReader internal constructor(
                                 // retry path the way a truncated body does.
                                 throw PikPakException(
                                     -1,
-                                    "stream went silent for $BODY_SILENCE after $delivered bytes",
+                                    "stream went silent for $bodySilence after $delivered bytes",
                                     cause = e,
                                 )
                             }
@@ -446,7 +450,7 @@ class RangeReader internal constructor(
                         if (failures >= maxAttempts) throw PikPakException(-1, "RangeReader: no host answered at offset $offset", cause = t)
                         bumpRetries()
                         // No backoff: nothing is wrong with the network, only with that host
-                        switchHost(linkUrl, silent = true)
+                        switchHost(linkUrl, silentFor = t.limit)
                     }
                     else -> {
                         report(attempt, RangeAttempt.Outcome.Failed)
@@ -535,14 +539,14 @@ class RangeReader internal constructor(
      * 300–500 ms. A failed refresh keeps [stale] rather than failing the read — the
      * failure may be the network, not the host, and then the old link is as good as any.
      *
-     * A [silent] host, one that sent nothing within the first-response deadline, is also
+     * A host that sent nothing for [silentFor], the first-response deadline, is also
      * reported to the client, so links other files mint for it are replaced before a read
      * ever lands there; see [HostHealth] for the corroboration it asks for first. A body
      * cut short is not reported: a dropped Wi-Fi or a suspended laptop does that to every
      * connection at once, and would mark the whole pool.
      */
-    private suspend fun switchHost(stale: String, silent: Boolean = false) {
-        if (silent) client.hostHealth.markSilent(stale)
+    private suspend fun switchHost(stale: String, silentFor: Duration? = null) {
+        if (silentFor != null) client.hostHealth.markSilent(stale, silentFor)
         try {
             refreshUrl(UrlRequest.Unresponsive(stale), stale, allowSame = true)
         } catch (e: CancellationException) {
@@ -622,22 +626,13 @@ class RangeReader internal constructor(
          * it applies. It stays short on purpose: once bytes are flowing this
          * link sustains megabytes a second, so seconds of none means the
          * connection is gone and re-issuing the range costs one round trip.
-         * The wait for the response headers is a different quantity and is
-         * left to the client's timeout.
+         *
+         * The floor, not the value: a line slow enough to lift the first-response deadline
+         * lifts this with it. There a connection carries 20–40 KB/s with losses, a retransmit
+         * can stall it for seconds, and re-issuing the range costs a new TLS handshake, which
+         * took 1–5 s on that line.
          */
         val BODY_SILENCE = 3.seconds
-
-        /**
-         * How long a request that has been sent may wait for its response headers before the
-         * host is given up on for another; see [switchHost].
-         *
-         * Measured 2026-09-26 across a dozen edge hosts: a healthy one answers in 300–500 ms,
-         * cold ranges no slower than warm ones, with eight requests in flight on the link. The
-         * ones that do not answer then do not answer at all — a minute later the socket times
-         * out. Four times the healthy worst case leaves room for a congested line without letting
-         * a dead host hold a read for long.
-         */
-        val FIRST_RESPONSE_DEADLINE = 2.seconds
 
         /**
          * A 503 means the URL is at its connection cap; waiting is the whole

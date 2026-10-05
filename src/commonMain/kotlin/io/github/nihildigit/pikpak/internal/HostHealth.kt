@@ -70,19 +70,62 @@ internal class HostHealth(
 
     private class RateSample(val bytesPerSecond: Long, val at: TimeMark)
 
-    /** [url]'s host sent response headers. */
-    fun answered(url: String) {
+    /**
+     * [url]'s host sent response headers [after] the request went out. Null when the wait is not
+     * a clean measure, e.g. it spanned a retry inside the HTTP layer.
+     */
+    fun answered(url: String, after: Duration? = null) {
         val host = hostOf(url) ?: return
         answers.update { it + (host to timeSource.markNow()) }
+        if (after != null) recordLatency(after)
     }
 
-    /** [url]'s host sent nothing within the first-response deadline. */
-    fun markSilent(url: String) {
+    /**
+     * [url]'s host sent nothing within [waited], the deadline the request was given.
+     *
+     * The wait counts as a latency sample, a lower bound of the real one. Without it the samples
+     * would only ever be the requests that beat the deadline, and on a line where most do not,
+     * the median would stay below the deadline and never lift it.
+     */
+    fun markSilent(url: String, waited: Duration) {
+        recordLatency(waited)
         val host = hostOf(url) ?: return
         val othersAnswering = answers.value.any { (other, at) -> other != host && at.elapsedNow() < CORROBORATION }
         if (!othersAnswering) return
         val now = timeSource.markNow()
         silences.update { current -> current.filterValues { it.elapsedNow() < memory } + (host to now) }
+    }
+
+    /**
+     * How long a request may wait for its response headers before its host is given up on.
+     *
+     * [LATENCY_RATIO] times the 90th percentile of the waits on this account, never below
+     * [MIN_DEADLINE] nor above [MAX_DEADLINE]. A fixed deadline was tuned on a line where a
+     * healthy host answers in 300–500 ms. On a direct line from mainland China, a 2026-10-02 log
+     * had the fixed 2 s kill 252 of 587 attempts, 175 of them on hosts that served another
+     * request within 5 s, and mark those hosts silent besides. Measured 2026-10-05 on that line:
+     * a pooled connection answers in 0.4 s, one round trip, while a new one takes 1.4–5.8 s to
+     * its first byte, nearly all of it the TLS handshake.
+     *
+     * Not the median, because those are two populations: while pooled connections are most of
+     * the samples the median is theirs, and the deadline it gives kills every new connection,
+     * which is exactly what a host change opens. A tail that more than a tenth of the requests
+     * cross is lifted by their cut-off samples, so the deadline doubles until it covers them.
+     */
+    fun firstResponseDeadline(): Duration {
+        val recent = latencies.value.filter { it.at.elapsedNow() < LATENCY_MEMORY }
+        if (recent.size < MIN_LATENCY_SAMPLES) return INITIAL_DEADLINE
+        val tail = recent.map { it.wait }.sorted()[(recent.size * 9) / 10]
+        return (tail * LATENCY_RATIO).coerceIn(MIN_DEADLINE, MAX_DEADLINE)
+    }
+
+    private class LatencySample(val wait: Duration, val at: TimeMark)
+
+    private val latencies = MutableStateFlow<List<LatencySample>>(emptyList())
+
+    private fun recordLatency(wait: Duration) {
+        val sample = LatencySample(wait, timeSource.markNow())
+        latencies.update { (it + sample).takeLast(MAX_LATENCY_SAMPLES) }
     }
 
     fun isBad(url: String): Boolean {
@@ -218,6 +261,30 @@ internal class HostHealth(
 
         /** How recently another host must have answered for a silence to be the host's own. */
         val CORROBORATION: Duration = 10.seconds
+
+        /** The floor once the line is measured: four times the 500 ms a healthy host takes on a good line. */
+        val MIN_DEADLINE: Duration = 2.seconds
+
+        /**
+         * Before the line is measured. Playback opens a file with eight new connections at once,
+         * and with the floor here, measured 2026-10-05 on a direct line, seven of the eight were
+         * cut off mid-handshake and opened again. A good line measures itself within a second
+         * and drops to the floor; what this costs is a host dead on the very first request.
+         */
+        val INITIAL_DEADLINE: Duration = 5.seconds
+
+        /**
+         * A dead host does not answer within a minute either, so the cap only bounds what one
+         * costs: on a line slow enough to reach it, a 256 KiB block takes longer than that.
+         */
+        val MAX_DEADLINE: Duration = 10.seconds
+
+        const val LATENCY_RATIO = 2
+        const val MIN_LATENCY_SAMPLES = 8
+        const val MAX_LATENCY_SAMPLES = 32
+
+        /** Short against [DEFAULT_MEMORY]: a proxy switched on or off changes the line within seconds. */
+        val LATENCY_MEMORY: Duration = 2.minutes
 
         /**
          * The fast hosts measured within about 2x of each other and the slow ones 20–30x below

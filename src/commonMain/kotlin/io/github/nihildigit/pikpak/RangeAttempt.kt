@@ -245,9 +245,8 @@ internal class RangeAttemptRecorder(
      * only once the status and headers are in hand, so entering that block is
      * the moment, and nothing in the endpoint has to be threaded through.
      */
-    fun headersReceived() {
-        if (headersAt == null) headersAt = mark.elapsedNow()
-    }
+    /** Returns how long the headers took. */
+    fun headersReceived(): Duration = headersAt ?: mark.elapsedNow().also { headersAt = it }
 
     fun record(bytes: Int) {
         if (bytes <= 0) return

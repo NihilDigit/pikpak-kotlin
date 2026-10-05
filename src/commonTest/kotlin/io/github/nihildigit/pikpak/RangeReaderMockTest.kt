@@ -1,5 +1,6 @@
 package io.github.nihildigit.pikpak
 
+import io.github.nihildigit.pikpak.internal.HostHealth
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.MockRequestHandleScope
@@ -79,14 +80,14 @@ class RangeReaderMockTest {
             },
         )
 
-        val bytes = withTimeout(RangeReader.FIRST_RESPONSE_DEADLINE * 3) { reader.readBytes(0, 256) }
+        val bytes = withTimeout(HostHealth.INITIAL_DEADLINE * 2) { reader.readBytes(0, 256) }
         assertContentEquals(content.copyOfRange(0, 256), bytes)
         assertTrue(asked[1] is UrlRequest.Unresponsive, "the second link was asked for as a host change: $asked")
 
         // The next read goes straight to the new host instead of waiting out the dead one again
         val started = kotlin.time.TimeSource.Monotonic.markNow()
         reader.readBytes(256, 256)
-        assertTrue(started.elapsedNow() < RangeReader.FIRST_RESPONSE_DEADLINE, "a later read went back to the dead host")
+        assertTrue(started.elapsedNow() < HostHealth.MIN_DEADLINE, "a later read went back to the dead host")
         client.close()
     }
 
@@ -106,7 +107,7 @@ class RangeReaderMockTest {
         val asked = mutableListOf<UrlRequest>()
         val reader = RangeReader(client, { request -> asked += request; "https://busy/file" })
 
-        val bytes = withTimeout(RangeReader.FIRST_RESPONSE_DEADLINE * 4) { reader.readBytes(0, 128) }
+        val bytes = withTimeout(HostHealth.MIN_DEADLINE * 4) { reader.readBytes(0, 128) }
         assertContentEquals(content.copyOfRange(0, 128), bytes)
         assertEquals(listOf<UrlRequest>(UrlRequest.Initial), asked, "a busy host was abandoned as a silent one")
         assertFalse(client.hostHealth.isBad("https://busy/file"))
