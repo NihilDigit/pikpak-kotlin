@@ -55,9 +55,10 @@ suspend fun PikPakClient.leaseDetail(
 /**
  * Deletes a leased object and swallows the failure. An object that survives
  * costs storage until something sweeps it, never a read: the link it minted
- * no longer depends on it.
+ * no longer depends on it. A second delete of the same id is not sent.
  */
 internal suspend fun PikPakClient.deleteLease(fileId: String) {
+    if (!claimLeaseDelete(fileId)) return
     try {
         deleteFile(fileId)
     } catch (e: CancellationException) {

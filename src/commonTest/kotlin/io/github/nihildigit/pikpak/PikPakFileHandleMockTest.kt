@@ -285,6 +285,28 @@ class PikPakFileHandleMockTest {
         }
     }
 
+    // Every host change on a slow line went GET 404, POST, GET, DELETE: the lookup of the object
+    // the handle itself had deleted was a sure 404 and a round trip before the create. And the
+    // object leaseDetail made was deleted twice, by leaseDetail and again by the handle.
+    @Test
+    fun `a leased handle neither looks up nor deletes again an object already deleted`() = runBlocking<Unit> {
+        val client = newClient()
+        val detail = client.leaseDetail(ResolvedFile(path = "ep.mkv", size = 1000, gcid = GCID))
+        val handle = client.fileHandle(detail, leased = true)
+        try {
+            handle.provideUrl(UrlRequest.Initial)
+            handle.provideUrl(UrlRequest.Unresponsive("https://cdn/f2"))
+            handle.provideUrl(UrlRequest.Unresponsive("https://cdn/f3"))
+            client.background.coroutineContext[Job]!!.children.forEach { it.join() }
+            val lookups = calls.filter { it.startsWith("GET /drive/v1/files/") }
+            assertEquals(listOf("GET /drive/v1/files/f2", "GET /drive/v1/files/f3", "GET /drive/v1/files/f4"), lookups)
+            val deletes = calls.filter { it.startsWith("DELETE ") }.sorted()
+            assertEquals(listOf("DELETE /drive/v1/files/f2", "DELETE /drive/v1/files/f3", "DELETE /drive/v1/files/f4"), deletes)
+        } finally {
+            handle.close(); client.close()
+        }
+    }
+
     /**
      * Deletes run in the background, so without a budget three leases in a row
      * all exist before the first delete lands; on a 6 GB free account the third

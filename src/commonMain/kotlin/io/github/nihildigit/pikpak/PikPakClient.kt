@@ -168,6 +168,20 @@ class PikPakClient(
         streamSizes.update { it + ("$gcid/$mediaId" to size) }
     }
 
+    // A handle built from a leased detail is given the object leaseDetail already deletes, as the
+    // first object it reports, and used to delete it a second time.
+    private val deletedLeases = MutableStateFlow<List<String>>(emptyList())
+
+    /** True the first time [fileId] is claimed for a lease delete, false after. */
+    internal fun claimLeaseDelete(fileId: String): Boolean {
+        var claimed = false
+        deletedLeases.update { ids ->
+            claimed = fileId !in ids
+            if (claimed) (ids + fileId).takeLast(DELETED_LEASES_KEPT) else ids
+        }
+        return claimed
+    }
+
     init {
         // A gate of zero never grants its first slot — nothing holds one, so
         // nothing releases one — and every range read parks forever instead of
@@ -320,6 +334,9 @@ class PikPakClient(
             defaultCdnHttpClient(perHostLimit)
     }
 }
+
+/** A duplicate comes within a lease's own lifetime, so the last few hundred ids are plenty. */
+private const val DELETED_LEASES_KEPT = 256
 
 internal class ClientState(val passwordSupplier: suspend () -> String) {
     val sessionFlow = MutableStateFlow<Session?>(null)

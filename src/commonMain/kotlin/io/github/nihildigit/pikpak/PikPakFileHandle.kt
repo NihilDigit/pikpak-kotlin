@@ -151,8 +151,10 @@ class PikPakFileHandle(
         } else {
             { id ->
                 client.deleteLease(id)
+                // The next link needs a new object anyway; looking this one up first only bought a 404
+                if (fileId == id) fileId = null
                 // Only room this handle took itself: the object a caller passed in was budgeted by
-                // whoever leased it, and is deleted (again, harmlessly) here without a refund
+                // whoever leased it, and is refunded there
                 budgeted.withLock { budgetedObjects.remove(id) }?.let { client.leaseBudget?.release(it) }
                 onObjectMinted?.invoke(id)
             }
