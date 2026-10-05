@@ -29,7 +29,8 @@ import kotlin.time.TimeSource
  * captcha refresh both succeeded under `mypikpak.net`.
  *
  * What moves with the root and what does not:
- *  - `api-drive.*` and `user.*`, every API call, sign-in, token refresh and captcha included.
+ *  - `api-drive.*` and `user.*`, every API call, sign-in, token refresh and captcha included,
+ *    and `api-dav.*` for the WebDAV settings. The WebDAV endpoints themselves do not move.
  *  - Download links follow on their own: a detail fetched under a root hands out links under
  *    that root (`dl-z01a-0047.mypikpak.net`), resolving to the same edge addresses as the
  *    `mypikpak.com` name. The SDK never rewrites a link's root.
@@ -74,7 +75,8 @@ enum class PikPakDomain(val root: String) {
     }
 
     private companion object {
-        val API_SUBDOMAINS = listOf("api-drive", "user")
+        // api-dav answers on all four roots like the others (checked 2026-10-05)
+        val API_SUBDOMAINS = listOf("api-drive", "user", "api-dav")
     }
 }
 

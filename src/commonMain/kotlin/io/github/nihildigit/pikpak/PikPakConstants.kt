@@ -10,6 +10,7 @@ internal object PikPakConstants {
 
     const val USER_BASE = "https://user.mypikpak.com"
     const val DRIVE_BASE = "https://api-drive.mypikpak.com"
+    const val DAV_BASE = "https://api-dav.mypikpak.com"
 
     /**
      * Salt cascade used to derive the captcha_sign parameter.
