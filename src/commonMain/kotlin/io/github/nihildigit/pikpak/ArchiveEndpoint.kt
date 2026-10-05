@@ -158,6 +158,16 @@ data class ArchiveTree(
  * after [listArchive] and gained one with the first [decompressArchive], a
  * single-entry extraction included. All five older archives checked on the
  * same account carried one already.
+ *
+ * The first extraction does not always yield it. Of eleven fresh archives on
+ * 2026-10-05, six still had no tree 11 to 99 seconds after a one-entry
+ * extraction completed; in the five where a second extraction followed, it
+ * produced the tree within 200 ms, four times taking the same entry again and
+ * once a folder. Once present, the
+ * tree covers the whole archive, not only what was extracted, and it outlives
+ * the extracted copy: with that copy deleted for good the entries still list
+ * and their links still answer Range requests with 206. The token differs
+ * between reads; take it from the latest one. See ArchiveLeaseProbeTest.
  */
 val FileStat.archiveTree: ArchiveTree? get() = archiveTreeOf(params)
 
