@@ -167,7 +167,10 @@ data class ArchiveTree(
  * tree covers the whole archive, not only what was extracted, and it outlives
  * the extracted copy: with that copy deleted for good the entries still list
  * and their links still answer Range requests with 206. The token differs
- * between reads; take it from the latest one. See ArchiveLeaseProbeTest.
+ * between reads; take it from the latest one. With the tree in place,
+ * [listArchive] fills [ArchiveEntry.gcid] for every entry, and [instantCreate]
+ * with that gcid yields the entry's exact bytes even for one never extracted.
+ * See ArchiveLeaseProbeTest.
  */
 val FileStat.archiveTree: ArchiveTree? get() = archiveTreeOf(params)
 

@@ -124,6 +124,24 @@ class ArchiveLeaseProbeTest {
             readBig(client, archiveId, big, "after delete")
             log("token unchanged since priming: ${client.getFile(archiveId).archiveTree?.token == tree!!.token}")
 
+            // Could an entry instead go through the vault's lease path, an instant create by gcid?
+            // big.bin was never extracted, so its content exists only inside the archive.
+            val relisted = client.listArchive(archiveId, archive.hash).files
+            log("listArchive gcids now: ${relisted.map { "${it.path}=${it.gcid.take(8).ifEmpty { "-" }}" }}")
+            val treeGcid = client.listArchiveTreePaged(client.getFile(archiveId).archiveTree!!).files.single { it.name == "big.bin" }.hash
+            val bigGcid = relisted.single { it.path == "big.bin" }.gcid.ifEmpty { treeGcid }
+            log("big.bin gcid from list=${relisted.single { it.path == "big.bin" }.gcid.take(8)} from tree=${treeGcid.take(8)}")
+            val created = runCatching { client.instantCreate(ResolvedFile("big.bin", big.size.toLong(), bigGcid), probe) }
+                .onFailure { log("instant create by gcid failed: $it") }
+                .getOrNull()
+            if (created != null) {
+                val url = client.getFile(created).downloadUrl
+                val bytes = url?.let {
+                    HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI(it)).GET().build(), HttpResponse.BodyHandlers.ofByteArray()).body()
+                }
+                log("instant create by gcid: id=$created bytes match=${bytes?.contentEquals(big)}")
+            }
+
             val after = client.getQuota()
             log("after delete: usage=${after.quota.usageBytes} trash=${after.quota.usageInTrash} cloud=${after.quotas.cloudDownload.usage}")
         } catch (e: Throwable) {
