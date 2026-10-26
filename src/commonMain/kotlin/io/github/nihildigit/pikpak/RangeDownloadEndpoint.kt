@@ -1,17 +1,20 @@
 package io.github.nihildigit.pikpak
 
+import io.github.nihildigit.pikpak.internal.ReadTelemetry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.withContext
 import kotlinx.io.Sink
 import kotlinx.io.buffered
 import kotlinx.io.files.Path
 import kotlinx.io.files.SystemFileSystem
 import kotlinx.io.write
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /** Default block one request of [RangeSource.downloadTo] fetches. */
@@ -209,26 +212,41 @@ private suspend fun slideWindow(
     limiter: BandwidthLimiter?,
     onWritten: (Long) -> Unit,
 ): Unit = coroutineScope {
-    val window = ArrayDeque<Deferred<ByteArray>>(concurrency)
+    val window = ArrayDeque<Deferred< Triple<ByteArray, Long, ReadTelemetry> >>(concurrency)
     var nextOffset = from
     var written = from
+    var currentBlockSize = if (concurrency == 1 && blockSize == DIRECT_DOWNLOAD_BLOCK_SIZE && limiter == null) {
+        minOf(MAX_ADAPTIVE_DOWNLOAD_BLOCK_SIZE, maxOf(blockSize, totalSize - from))
+    } else {
+        blockSize
+    }
+    val adaptive = blockSize == DIRECT_DOWNLOAD_BLOCK_SIZE && limiter == null
 
     fun issueNext() {
         if (nextOffset >= totalSize) return
         val start = nextOffset
-        val length = minOf(blockSize, totalSize - start)
+        val length = minOf(currentBlockSize, totalSize - start)
         nextOffset = start + length
         window += async {
             // Before the request, so a throttled block waits without a connection open
             limiter?.acquire(length)
-            fetchBlock(source, start, length, priority)
+            val telemetry = ReadTelemetry()
+            val bytes = withContext(telemetry) { fetchBlock(source, start, length, priority) }
+            Triple(bytes, length, telemetry)
         }
     }
 
     repeat(concurrency) { issueNext() }
 
     while (window.isNotEmpty()) {
-        val bytes = window.removeFirst().await()
+        val (bytes, length, telemetry) = window.removeFirst().await()
+        if (adaptive && telemetry.isClean && telemetry.deliveredBytes == length) {
+            if (telemetry.networkDuration in 10.milliseconds..600.milliseconds && length >= currentBlockSize) {
+                currentBlockSize = minOf(MAX_ADAPTIVE_DOWNLOAD_BLOCK_SIZE, currentBlockSize * 2)
+            } else if (telemetry.networkDuration > 1600.milliseconds) {
+                currentBlockSize = maxOf(blockSize, currentBlockSize / 2)
+            }
+        }
         // Flushed per block, not per window: the caller is told the new length
         // immediately below, and progress must never claim bytes the file does
         // not have yet. A cancellation landing here leaves a whole number of
@@ -285,4 +303,6 @@ private suspend fun fetchBlock(
 
 private fun existingLength(dest: Path): Long =
     runCatching { SystemFileSystem.metadataOrNull(dest)?.size }.getOrNull() ?: 0L
+
+private const val MAX_ADAPTIVE_DOWNLOAD_BLOCK_SIZE: Long = 4L * 1024 * 1024
 

@@ -56,7 +56,7 @@ internal class HostHealth(
     private val timeSource: TimeSource = TimeSource.Monotonic,
     /** False keeps every attempt on its link's own host; only silence is still remembered. */
     private val steering: Boolean = true,
-    seeds: Collection<String> = SEED_HOSTS,
+    seeds: Collection<String> = emptyList(),
 ) {
     private val silences = MutableStateFlow<Map<String, TimeMark>>(emptyMap())
     private val answers = MutableStateFlow<Map<String, TimeMark>>(emptyMap())
@@ -67,6 +67,10 @@ internal class HostHealth(
     private val learned = MutableStateFlow<List<String>>(emptyList())
     private val seedLabels = seeds.toList()
     private val lastExplore = MutableStateFlow<TimeMark?>(null)
+    private val activeDrains = MutableStateFlow(0)
+    private val preferredByCluster = MutableStateFlow<Map<String, String>>(emptyMap())
+    private val idleSockets = MutableStateFlow<Map<String, Int>>(emptyMap())
+    private val lastClusterUrl = MutableStateFlow<Map<String, String>>(emptyMap())
 
     private class RateSample(val bytesPerSecond: Long, val at: TimeMark)
 
@@ -77,7 +81,22 @@ internal class HostHealth(
     fun answered(url: String, after: Duration? = null) {
         val host = hostOf(url) ?: return
         answers.update { it + (host to timeSource.markNow()) }
+        if (host in silences.value) silences.update { it - host }
         if (after != null) recordLatency(after)
+        Edge.parse(url)?.let { edge ->
+            lastClusterUrl.update { it + ("${edge.family}.${edge.root}" to url) }
+        }
+    }
+
+    fun onRequestStarted(url: String) {
+        val host = hostOf(url) ?: return
+        idleSockets.update { cur -> cur + (host to ((cur[host] ?: 0) - 1).coerceAtLeast(0)) }
+    }
+
+    fun onSocketReturned(url: String) {
+        val host = hostOf(url) ?: return
+        answers.update { it + (host to timeSource.markNow()) }
+        idleSockets.update { cur -> cur + (host to ((cur[host] ?: 0) + 1)) }
     }
 
     /**
@@ -90,6 +109,7 @@ internal class HostHealth(
     fun markSilent(url: String, waited: Duration) {
         recordLatency(waited)
         val host = hostOf(url) ?: return
+        if (answers.value[host]?.let { it.elapsedNow() < waited } == true) return
         val othersAnswering = answers.value.any { (other, at) -> other != host && at.elapsedNow() < CORROBORATION }
         if (!othersAnswering) return
         val now = timeSource.markNow()
@@ -133,6 +153,36 @@ internal class HostHealth(
         return isSilent(host)
     }
 
+    fun isAnswering(url: String): Boolean {
+        val host = hostOf(url) ?: return false
+        return answers.value[host]?.let { it.elapsedNow() < CORROBORATION } == true
+    }
+
+    fun isWarm(url: String): Boolean {
+        val host = hostOf(url) ?: return false
+        return (idleSockets.value[host] ?: 0) > 0 && answers.value[host]?.let { it.elapsedNow() < WARM_TTL } == true
+    }
+
+    fun hasAnyWarmHost(): Boolean =
+        idleSockets.value.entries.any { (host, count) ->
+            count > 0 && answers.value[host]?.let { it.elapsedNow() < WARM_TTL } == true
+        }
+
+    fun coldClusterUrls(): List<String> =
+        lastClusterUrl.value.values.map { route(it, mayExplore = false) }.distinct().filter { !isWarm(it) }
+
+    fun tryAcquireDrain(): Boolean {
+        while (true) {
+            val cur = activeDrains.value
+            if (cur >= MAX_CONCURRENT_DRAINS) return false
+            if (activeDrains.compareAndSet(cur, cur + 1)) return true
+        }
+    }
+
+    fun releaseDrain() {
+        activeDrains.update { (it - 1).coerceAtLeast(0) }
+    }
+
     /**
      * One finished attempt on [host]: [bytes] delivered at [bytesPerSecond] from the first byte on.
      *
@@ -164,7 +214,9 @@ internal class HostHealth(
         val edge = Edge.parse(url) ?: return url
         learn(edge.label)
 
+        val clusterKey = "${edge.family}.${edge.root}"
         val siblings = siblingsOf(edge)
+        val allCandidates = siblings + edge
         val best = siblings
             .filter { usable(it.host) }
             .mapNotNull { sibling -> medianRate(sibling.host)?.let { sibling to it } }
@@ -172,10 +224,44 @@ internal class HostHealth(
         if (best != null) {
             val own = medianRate(edge.host)
             val ownIsSlow = own != null && own * SLOW_RATIO < best.second
-            if (ownIsSlow || isSilent(edge.host)) return edge.rewrite(url, best.first)
+            if (ownIsSlow || isSilent(edge.host)) {
+                preferredByCluster.update { it + (clusterKey to best.first.label) }
+                return edge.rewrite(url, best.first)
+            }
+        }
+
+        // Sticky cluster preferred host: once a host in this cluster has proven healthy,
+        // keep routing unmeasured sibling links in the same cluster to it so all files
+        // share the warm connection pool and never flip-flop mid-file. Ages out with [memory].
+        val currentPreferredLabel = preferredByCluster.value[clusterKey]
+        val currentPreferred = currentPreferredLabel?.let { label ->
+            allCandidates.firstOrNull { it.label == label && usable(it.host) && medianRate(it.host) != null }
+        }
+        val preferredEdge = if (currentPreferred != null) {
+            val prefRate = medianRate(currentPreferred.host)!!
+            val beatenByBest = best != null && prefRate * SLOW_RATIO < best.second
+            if (!beatenByBest) currentPreferred else best.first
+        } else {
+            if (currentPreferredLabel != null) {
+                preferredByCluster.update { it - clusterKey }
+            }
+            allCandidates.firstOrNull { cand ->
+                usable(cand.host) && (medianRate(cand.host) ?: 0L) >= GOOD_RATE_BYTES_PER_SEC
+            }
+        }
+        if (preferredEdge != null) {
+            if (preferredEdge.label != currentPreferredLabel) {
+                preferredByCluster.update { it + (clusterKey to preferredEdge.label) }
+            }
+            val own = medianRate(edge.host)
+            if (own == null && recentRates(edge.host).isEmpty()) {
+                return if (preferredEdge.label == edge.label) url else edge.rewrite(url, preferredEdge)
+            }
         }
 
         if (!mayExplore) return url
+        val ownRate = medianRate(edge.host) ?: recentRates(edge.host).maxOrNull()
+        if (ownRate != null && ownRate >= GOOD_RATE_BYTES_PER_SEC) return url
         val measured = (siblings + edge).count { medianRate(it.host) != null }
         if (measured >= EXPLORE_TARGET) return url
         // A sibling half measured goes first, or every candidate would stop at one sample and
@@ -190,6 +276,13 @@ internal class HostHealth(
     private fun learn(label: String) {
         if (label in learned.value) return
         learned.update { if (label in it) it else it + label }
+    }
+
+    /** Records every CDN edge host present in [detail] as a live candidate for its cluster. */
+    fun observe(detail: io.github.nihildigit.pikpak.FileDetail) {
+        Edge.parse(detail.webContentLink)?.let { learn(it.label) }
+        for (link in detail.links.values) Edge.parse(link.url)?.let { learn(it.label) }
+        for (media in detail.medias) Edge.parse(media.link.url)?.let { learn(it.label) }
     }
 
     /** Same family and root, learned labels before seeds, never the host itself. */
@@ -226,7 +319,7 @@ internal class HostHealth(
         }
     }
 
-    /** A `dl-<family>-<number>.<root>` host, the only shape a link is rerouted between. */
+    /** A `<cluster>-<number>.<root>` edge host, rerouted only within the same `<cluster>` and `<root>`. */
     private class Edge(val label: String, val family: String, val root: String) {
         val host: String get() = "$label.$root"
 
@@ -234,7 +327,7 @@ internal class HostHealth(
             url.substringBefore("://") + "://" + to.host + url.substringAfter("://").removePrefix(host)
 
         companion object {
-            private val SHAPE = Regex("""^(dl-[a-z0-9]+)-\d+$""")
+            private val SHAPE = Regex("""^([a-z0-9]+(?:-[a-z0-9]+)+)-\d+$""")
 
             fun familyOf(label: String): String? = SHAPE.matchEntire(label)?.groupValues?.get(1)
 
@@ -261,6 +354,7 @@ internal class HostHealth(
 
         /** How recently another host must have answered for a silence to be the host's own. */
         val CORROBORATION: Duration = 10.seconds
+        val WARM_TTL: Duration = 12.seconds
 
         /** The floor once the line is measured: four times the 500 ms a healthy host takes on a good line. */
         val MIN_DEADLINE: Duration = 2.seconds
@@ -291,6 +385,8 @@ internal class HostHealth(
          * them; four leaves the healthy spread alone and still catches the slow ones.
          */
         const val SLOW_RATIO = 4
+        const val GOOD_RATE_BYTES_PER_SEC = 250L * 1024
+        const val MAX_CONCURRENT_DRAINS = 2
 
         const val MIN_SAMPLES = 2
         const val MAX_SAMPLES = 6
@@ -301,24 +397,9 @@ internal class HostHealth(
 
         /**
          * A sibling needs [MIN_SAMPLES] explorations before it can be compared, so this sets how
-         * long a read stays on a slow host. Measured 2026-09-28, eight background reads pinned to
-         * a slow host fetched 42 of their first 96 MiB there before leaving at 10 s, 24 at 5 s;
-         * the 96 MiB took 47 s and 29 s, against 60 s for 24–56 MiB with steering off.
+         * long a read stays on a slow host.
          */
         val EXPLORE_INTERVAL: Duration = 5.seconds
-
-        /**
-         * Hosts seen in PikPak links as of 2026-09-28, candidates only. Of the 26 `dl-z01a`
-         * ones, 20 served a swapped link and 6 dropped the TLS handshake; a hard-coded list goes
-         * stale, which is why a candidate is used only after it has delivered.
-         */
-        val SEED_HOSTS: List<String> = buildList {
-            (listOf(14, 15, 16, 26, 27) + (41..55) + (59..64)).forEach { add("dl-z01a-" + it.toString().padStart(4, '0')) }
-            listOf(
-                621, 622, 624, 625, 822, 835, 858, 859, 860, 861, 862, 863, 868, 869, 1193, 1194, 1195, 1196,
-                1531, 1532, 1533, 1542, 1543, 1551, 1552, 1553, 1554, 1555, 1556, 1557, 1558,
-            ).forEach { add("dl-a10b-" + it.toString().padStart(4, '0')) }
-        }
 
         fun hostOf(url: String): String? =
             url.substringAfter("://", "").substringBefore('/').substringBefore('?').substringBefore(':').ifEmpty { null }

@@ -1,6 +1,14 @@
 package io.github.nihildigit.pikpak
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.withTimeout
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.mock.MockEngine
+import io.ktor.client.engine.mock.respond
+import io.ktor.http.HttpMethod
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -12,6 +20,70 @@ import kotlin.test.assertTrue
 import kotlin.time.TimeSource
 
 class RateLimiterTest {
+
+    @Test
+    fun `queued requests use descending priority and FIFO ties`() = runBlocking<Unit> {
+        val limiter = RateLimiter(capacity = 1, refillPerSecond = 10.0)
+        limiter.acquire()
+        val order = mutableListOf<String>()
+        val jobs = listOf("bulk1" to -10, "bulk2" to -10, "normal" to 0, "high1" to 5, "high2" to 5).map { (name, priority) ->
+            async(start = CoroutineStart.UNDISPATCHED) { limiter.acquire(priority); order += name }
+        }
+        withTimeout(3_000) { jobs.awaitAll() }
+        assertEquals(listOf("high1", "high2", "normal", "bulk1", "bulk2"), order)
+    }
+
+    @Test
+    fun `cancelled reservations do not leave debt or stranded waiters`() = runBlocking<Unit> {
+        val limiter = RateLimiter(capacity = 1, refillPerSecond = 10.0)
+        limiter.acquire()
+        val abandoned = List(50) { async(start = CoroutineStart.UNDISPATCHED) { limiter.acquire(10) } }
+        val survivor = async(start = CoroutineStart.UNDISPATCHED) { limiter.acquire(-10) }
+        abandoned.forEach { it.cancelAndJoin() }
+        withTimeout(1_000) { survivor.await() }
+        // Cancelling reservations must not mint tokens: the survivor spent the
+        // next token, so this call still has to wait for a refill.
+        val start = TimeSource.Monotonic.markNow()
+        limiter.acquire()
+        assertTrue(start.elapsedNow().inWholeMilliseconds >= 40)
+    }
+
+    @Test
+    fun `HTTP requests inherit priority and restore the enclosing context`() = runBlocking<Unit> {
+        val limiter = RateLimiter(capacity = 1, refillPerSecond = 10.0)
+        val order = mutableListOf<String>()
+        val http = HttpClient(MockEngine { request ->
+            order += request.url.encodedPath
+            respond("{}")
+        })
+        val c = PikPakClient("mock@x", "pw", sessionStore = InMemorySessionStore(), rateLimiter = limiter, httpClient = http)
+        try {
+            limiter.acquire()
+            val bulk = async(start = CoroutineStart.UNDISPATCHED) {
+                withApiPriority(-10) { c.http.requestRaw(HttpMethod.Get, "https://api.test/bulk") }
+            }
+            val normal = async(start = CoroutineStart.UNDISPATCHED) {
+                c.http.requestRaw(HttpMethod.Get, "https://api.test/normal")
+            }
+            val high = async(start = CoroutineStart.UNDISPATCHED) {
+                withApiPriority(10) {
+                    assertEquals(10, currentCoroutineContext()[ApiRequestPriority]?.priority)
+                    c.http.requestRaw(HttpMethod.Get, "https://api.test/high")
+                }
+                assertEquals(null, currentCoroutineContext()[ApiRequestPriority])
+            }
+            withTimeout(3_000) { bulk.await(); normal.await(); high.await() }
+            assertEquals(listOf("/high", "/normal", "/bulk"), order)
+        } finally { c.close(); http.close() }
+    }
+
+    @Test
+    fun `default factory has twenty four initial tokens`() = runBlocking<Unit> {
+        val start = TimeSource.Monotonic.markNow()
+        val limiter = RateLimiter.default()
+        repeat(24) { limiter.acquire() }
+        assertTrue(start.elapsedNow().inWholeMilliseconds < 100)
+    }
 
     @Test
     fun `capacity tokens acquire immediately without suspension`() = runBlocking {

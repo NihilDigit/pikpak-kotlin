@@ -1,5 +1,6 @@
 package io.github.nihildigit.pikpak.internal
 
+import io.github.nihildigit.pikpak.ApiRequestPriority
 import io.github.nihildigit.pikpak.ErrorCodes
 import io.github.nihildigit.pikpak.PikPakClient
 import io.github.nihildigit.pikpak.PikPakConstants
@@ -262,7 +263,7 @@ internal class HttpEngine(
         val replayable = method != HttpMethod.Post
         var attempt = 0
         while (true) {
-            if (rateLimited) pikpak.rateLimiter.acquire()
+            if (rateLimited) pikpak.rateLimiter.acquire(currentCoroutineContext()[ApiRequestPriority]?.priority ?: 0)
             var blockEntered = false
             try {
                 return client.prepareRequest(url) {

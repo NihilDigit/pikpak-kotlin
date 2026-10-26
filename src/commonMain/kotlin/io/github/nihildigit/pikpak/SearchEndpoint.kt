@@ -8,6 +8,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.serialization.json.JsonElement
 
 /**
  * Substring search (case-insensitive) over entry names under [parentId]. Scope
@@ -161,7 +162,9 @@ fun PikPakClient.searchFilesRecursive(
                 if (budgeted.isEmpty()) return@flow
                 listed += budgeted.size
                 val listings = coroutineScope {
-                    budgeted.map { folder -> async { folder to listFiles(folder.id) } }.awaitAll()
+                    budgeted.map { folder ->
+                        async(SuppressFolderPrefetch) { folder to listFiles(folder.id) }
+                    }.awaitAll()
                 }
                 for ((folder, entries) in listings) {
                     for (entry in entries) {
@@ -177,6 +180,63 @@ fun PikPakClient.searchFilesRecursive(
             }
             level = next
             depth++
+        }
+    }
+}
+
+/** Lists live folders across every parent using the server's flat listing. */
+suspend fun PikPakClient.listAllDriveFolders(pageSize: Int = 500): List<FileStat> =
+    listFiles(parentId = "*", pageSize = pageSize, extraFilters = mapOf(FileFilter.kind(FileKind.FOLDER)))
+
+/** Streams non-empty pages of live entries across every parent. */
+fun PikPakClient.listAllDriveEntriesFlow(
+    pageSize: Int = 500,
+    extraFilters: Map<String, JsonElement> = emptyMap(),
+): Flow<List<FileStat>> = flow {
+    var token = ""
+    do {
+        val page = listFilesPaged(parentId = "*", pageSize = pageSize, pageToken = token, extraFilters = extraFilters)
+        if (page.files.isNotEmpty()) emit(page.files)
+        token = page.nextPageToken
+    } while (token.isNotEmpty())
+}
+
+/**
+ * Case-insensitive name search using flat listings, folders first and then file pages.
+ * Breadcrumbs exclude [parentId] itself. Entries with missing or cyclic ancestry
+ * are skipped because their path and membership in the subtree cannot be established.
+ * Listings are not a snapshot: concurrent moves can change ancestry during a search.
+ */
+fun PikPakClient.searchDriveFlat(
+    keyword: String,
+    parentId: String = "",
+    pageSize: Int = 500,
+): Flow<SearchHit> {
+    require(keyword.isNotEmpty()) { "keyword must not be empty" }
+    return flow {
+        val folders = listAllDriveFolders(pageSize)
+        val folderMap = folders.associateBy { it.id }
+        fun breadcrumb(entry: FileStat): List<String>? {
+            if (entry.id == parentId) return null
+            val names = mutableListOf<String>()
+            val seen = mutableSetOf(entry.id)
+            var ancestor = entry.parentId
+            while (ancestor != parentId) {
+                if (ancestor.isEmpty() || !seen.add(ancestor)) return null
+                val folder = folderMap[ancestor] ?: return null
+                names += folder.name
+                ancestor = folder.parentId
+            }
+            return names.asReversed()
+        }
+        suspend fun match(entry: FileStat) {
+            if (entry.name.contains(keyword, ignoreCase = true)) {
+                breadcrumb(entry)?.let { emit(SearchHit(entry, it)) }
+            }
+        }
+        folders.forEach { match(it) }
+        listAllDriveEntriesFlow(pageSize, mapOf(FileFilter.kind(FileKind.FILE))).collect { entries ->
+            entries.forEach { match(it) }
         }
     }
 }

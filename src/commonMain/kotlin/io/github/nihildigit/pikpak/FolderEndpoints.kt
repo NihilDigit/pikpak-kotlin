@@ -3,6 +3,8 @@ package io.github.nihildigit.pikpak
 import io.github.nihildigit.pikpak.internal.buildUrl
 import io.github.nihildigit.pikpak.internal.jsonBody
 import io.ktor.http.HttpMethod
+import io.ktor.utils.io.readAvailable
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -128,6 +130,7 @@ suspend fun PikPakClient.deleteFile(fileId: String) {
         captchaAction = "DELETE:/drive/v1/files",
     )
     folderIds.invalidateAll()
+    invalidatePrefetchedDetail()
 }
 
 /**
@@ -155,6 +158,17 @@ suspend fun PikPakClient.batchDelete(ids: List<String>) =
  */
 suspend fun PikPakClient.batchUntrash(ids: List<String>) =
     batchOperate(ids, "batchUntrash")
+
+/** Permanently removes every item in the account's trash. */
+suspend fun PikPakClient.emptyTrash() {
+    http.request(
+        method = HttpMethod.Patch,
+        url = "$DRIVE$FILES_PATH/trash:empty",
+        captchaAction = "PATCH:/drive/v1/files/trash:empty",
+    )
+    folderIds.invalidateAll()
+    invalidatePrefetchedDetail()
+}
 
 /**
  * One `files:<op>` call per [BATCH_ID_LIMIT] ids.
@@ -186,6 +200,7 @@ internal suspend fun PikPakClient.batchOperate(
         }
     } finally {
         folderIds.invalidateAll()
+        invalidatePrefetchedDetail()
     }
 }
 
@@ -251,6 +266,26 @@ suspend fun PikPakClient.rename(fileId: String, newName: String) {
         captchaAction = "PATCH:/drive/v1/files",
     ) { jsonBody(json, body) }
     folderIds.invalidateAll()
+    invalidatePrefetchedDetail()
+}
+
+internal suspend fun PikPakClient.fetchFileDetailLive(fileId: String): FileDetail {
+    if (ownsCdnClient) {
+        for (coldUrl in hostHealth.coldClusterUrls()) {
+            warmHostIfCold(coldUrl)
+        }
+    }
+    val response = http.request(
+        method = HttpMethod.Get,
+        url = buildUrl(DRIVE, "$FILES_PATH/$fileId", mapOf("thumbnail_size" to THUMBNAIL_SIZE)),
+        captchaAction = "GET:/drive/v1/files",
+    )
+    return json.decodeFromJsonElement(FileDetail.serializer(), response).also { detail ->
+        hostHealth.observe(detail)
+        if (ownsCdnClient) {
+            detail.downloadUrl?.let { warmHostIfCold(it) }
+        }
+    }
 }
 
 /**
@@ -258,10 +293,16 @@ suspend fun PikPakClient.rename(fileId: String, newName: String) {
  * listings prefer [listFiles] — this endpoint is per-id and slower at scale.
  */
 suspend fun PikPakClient.getFile(fileId: String): FileDetail {
-    val response = http.request(
-        method = HttpMethod.Get,
-        url = buildUrl(DRIVE, "$FILES_PATH/$fileId", mapOf("thumbnail_size" to THUMBNAIL_SIZE)),
-        captchaAction = "GET:/drive/v1/files",
-    )
-    return json.decodeFromJsonElement(FileDetail.serializer(), response)
+    consumePrefetchedDetail(fileId)?.let { prefetched ->
+        try {
+            return prefetched.await()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            kotlinx.coroutines.currentCoroutineContext().let { ctx ->
+                if (ctx[kotlinx.coroutines.Job]?.isActive == false) throw e
+            }
+        } catch (_: Throwable) {
+            // Fall through to a live request if the background prefetch failed or was cancelled.
+        }
+    }
+    return fetchFileDetailLive(fileId)
 }

@@ -13,10 +13,10 @@ import kotlin.time.TimeSource
 /**
  * A ceiling on the combined rate of every download given this limiter, changeable while they run.
  *
- * One instance is meant to be held by the caller for the whole process and passed to each
- * [RangeSource.downloadTo]; the downloads and all of their connections then share one budget.
- * Playback reads never see it: [PikPakStreamReader], prefetch and the size probes do not take a
- * limiter, so a limited download cannot slow the video on screen.
+ * [PikPakClient.downloadLimiter] applies to durable cache downloads on that client. The same
+ * instance can also be passed to [RangeSource.downloadTo] or other clients so their downloads
+ * and connections share one budget. Playback, ordinary prefetch and size probes do not acquire
+ * download tokens. A cache cancels a waiting download reservation when playback needs it.
  *
  * Bytes are paid for before a block is requested, not while its body streams. Throttling the
  * body would hold a connection open and nearly idle, which is what the CDN's socket timeout and

@@ -124,6 +124,7 @@ class RangeReaderMockTest {
             if (req.url.host == "dl-z01a-9999.mypikpak.com") partial(req, content)
             else respond(ByteReadChannel(ByteArray(0)), HttpStatusCode.NotFound)
         }
+        client.hostHealth.observe(FileDetail(webContentLink = "https://dl-z01a-0001.mypikpak.com/f/file"))
         val asked = mutableListOf<UrlRequest>()
         val reader = RangeReader(client, { request -> asked += request; "https://dl-z01a-9999.mypikpak.com/f/file?sign=s" })
 

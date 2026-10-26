@@ -124,4 +124,35 @@ class HostHealthTest {
         health.measure("dl-z01a-0002.mypikpak.com", 5_000_000)
         assertEquals(link, health.route(link, mayExplore = true))
     }
+
+    @Test
+    fun `a host that just answered another connection is not marked silent by a single timeout`() {
+        val time = TestTimeSource()
+        val health = HostHealth(timeSource = time)
+        health.answered("https://b.example/file")
+        health.answered("https://a.example/file")
+        time += 500.milliseconds
+        health.markSilent("https://a.example/file", HostHealth.MIN_DEADLINE)
+        assertFalse(health.isBad("https://a.example/file"))
+    }
+
+    @Test
+    fun `unmeasured sibling links reuse sticky preferred host until its samples age out`() {
+        val time = TestTimeSource()
+        val health = HostHealth(timeSource = time)
+        health.observe(
+            FileDetail(
+                webContentLink = "https://dl-z01a-0002.mypikpak.com/download/?fid=F",
+                medias = listOf(MediaVariant(link = DownloadLink(url = "https://dl-z01a-0003.mypikpak.com/download/?fid=F"))),
+            ),
+        )
+        health.measure("dl-z01a-0002.mypikpak.com", 1_200_000)
+
+        assertEquals(
+            "https://dl-z01a-0002.mypikpak.com/download/?fid=F&sign=S",
+            health.route(link, mayExplore = false),
+        )
+        time += HostHealth.DEFAULT_MEMORY
+        assertEquals(link, health.route(link, mayExplore = false))
+    }
 }

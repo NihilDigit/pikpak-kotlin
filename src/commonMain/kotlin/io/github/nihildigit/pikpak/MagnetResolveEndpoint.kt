@@ -22,7 +22,11 @@ data class ResolvedFile(
      * for it and the caller has to fall back to an offline-download task.
      */
     val gcid: String?,
+    val mimeType: String? = null,
+    val thumbnailLink: String? = null,
 ) {
+    constructor(path: String, size: Long, gcid: String?) : this(path, size, gcid, null, null)
+
     val name: String get() = path.substringAfterLast('/')
 }
 
@@ -136,6 +140,8 @@ private fun collect(
                 // file_size arrives as a JSON string, not a number.
                 size = obj.str("file_size")?.toLongOrNull() ?: 0L,
                 gcid = obj.obj("meta")?.str("hash")?.takeIf { it.isNotBlank() }?.canonicalGcid(),
+                mimeType = obj.obj("meta")?.str("mime_type")?.takeIf { it.isNotBlank() },
+                thumbnailLink = obj.obj("meta")?.str("thumbnail_link")?.takeIf { it.isNotBlank() },
             )
         }
     }

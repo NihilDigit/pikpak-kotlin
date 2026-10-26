@@ -97,8 +97,9 @@ class PikPakFileCache internal constructor(
      * caller's: call again. Cancelling it withdraws what it had not fetched yet.
      *
      * By default a background download: priority [PikPakStreamReader.BACKGROUND_READ_AHEAD_PRIORITY],
-     * and at most [PikPakStreamReader.BACKGROUND_WORKERS_WHILE_FOREGROUND] requests while the
-     * account plays something else.
+     * throttled to at most [PikPakStreamReader.BACKGROUND_WORKERS_WHILE_FOREGROUND] single-block
+     * requests while any foreground stream on the account is hungry, and sharing up to half the
+     * account budget with adaptive multi-slot spans once foreground buffers are comfortable.
      *
      * @throws IllegalStateException through the job when the cache has no [DurableBlockStore].
      */
@@ -124,6 +125,7 @@ class PikPakFileCache internal constructor(
  * @param connectionBudget requests in flight at once for this file, taken from the account's
  *   budget as well. The default is the per-link cap PikPak enforces.
  * @param coroutineContext where the workers run. Cancelling it closes the cache.
+ * @param mediaBytesPerSecond average media consumption in bytes per second, when known.
  */
 fun PikPakClient.fileCache(
     source: RangeSource,
@@ -132,6 +134,7 @@ fun PikPakClient.fileCache(
     blockStore: BlockStore? = null,
     connectionBudget: Int = this.connectionBudget,
     coroutineContext: CoroutineContext = EmptyCoroutineContext,
+    mediaBytesPerSecond: Long? = null,
 ): PikPakFileCache = PikPakFileCache(
     BlockCache(
         source = source,
@@ -141,5 +144,8 @@ fun PikPakClient.fileCache(
         foregroundStreams = foregroundStreams,
         store = blockStore,
         storeKey = storeKey,
+        mediaBytesPerSecond = mediaBytesPerSecond,
+        scheduler = scheduler,
+        downloadLimiter = downloadLimiter,
     ),
 )

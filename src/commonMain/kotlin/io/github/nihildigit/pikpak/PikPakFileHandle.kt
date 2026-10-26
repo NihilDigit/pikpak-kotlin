@@ -124,6 +124,8 @@ class PikPakFileHandle(
     initialLink: VariantLink? = null,
     /** The variant's length when the caller already knows it, which saves a transcode the probe in [streamSize]. */
     streamSize: Long? = null,
+    /** Metadata of the fixed representation, used to size its playback reserve. */
+    @Volatile private var videoInfo: VideoInfo? = null,
 ) : RangeSource, AutoCloseable {
     /** Upper case whatever the caller passed, so [contentKey] and the stream-size memo agree. */
     val gcid: String = gcid.canonicalGcid()
@@ -246,14 +248,31 @@ class PikPakFileHandle(
     suspend fun openCache(
         blockStore: BlockStore? = null,
         coroutineContext: CoroutineContext = EmptyCoroutineContext,
-    ): PikPakFileCache = client.fileCache(
-        source = this,
-        size = streamSize(),
-        storeKey = contentKey,
-        blockStore = blockStore,
-        connectionBudget = connectionBudget,
-        coroutineContext = coroutineContext,
-    )
+    ): PikPakFileCache {
+        val length = streamSize()
+        link?.url?.let { rawUrl ->
+            client.warmHostIfCold(rawUrl)?.let { warm ->
+                if (kotlinx.coroutines.withTimeoutOrNull(900) { warm.await() } == null) {
+                    warm.cancel()
+                }
+            }
+        }
+        val mediaBytesPerSecond = videoInfo?.let { video ->
+            (video.bitRate / 8).takeIf { it > 0 }
+                ?: video.duration.takeIf { it > 0 }?.let { duration ->
+                    (length / duration).takeIf { it > 0 }
+                }
+        }
+        return client.fileCache(
+            source = this,
+            size = length,
+            storeKey = contentKey,
+            blockStore = blockStore,
+            connectionBudget = connectionBudget,
+            coroutineContext = coroutineContext,
+            mediaBytesPerSecond = mediaBytesPerSecond,
+        )
+    }
 
     /**
      * Length of the representation this handle reads, which is not always
@@ -399,7 +418,7 @@ class PikPakFileHandle(
      * hits the same dead id, and letting that one 404 while the read path
      * heals would make the file id look like the identity again.
      */
-    private suspend fun detail(): FileDetail = try {
+    private suspend fun detail(): FileDetail = (try {
         client.getFile(ensureFileId())
     } catch (e: PikPakException) {
         // The id died between calls. A reader cannot report this as a
@@ -408,6 +427,10 @@ class PikPakFileHandle(
         if (!isFileGone(e)) throw e
         rebuild()
         client.getFile(ensureFileId())
+    }).also { detail ->
+        val variant = if (mediaId == null) detail.medias.firstOrNull { it.isOrigin }
+            else detail.medias.firstOrNull { it.mediaId == mediaId }
+        videoInfo = variant?.video ?: videoInfo
     }
 
     private fun linkOf(detail: FileDetail): VariantLink? {
@@ -500,7 +523,10 @@ fun PikPakClient.fileHandle(
 ): PikPakFileHandle {
     // Read off the detail directly, not through variant(): that throws for an original with no
     // link, and a missing link here only means the handle mints the first one itself
-    val link = if (mediaId == null) detail.octetStream else detail.medias.firstOrNull { it.mediaId == mediaId }?.link
+    val variant = if (mediaId == null) detail.medias.firstOrNull { it.isOrigin }
+        else detail.medias.firstOrNull { it.mediaId == mediaId }
+    val link = if (mediaId == null) detail.octetStream else variant?.link
+    hostHealth.observe(detail)
     return PikPakFileHandle(
         client = this,
         gcid = detail.hash,
@@ -514,5 +540,6 @@ fun PikPakClient.fileHandle(
         onRangeAttempt = onRangeAttempt,
         initialLink = link?.url?.takeIf { it.isNotBlank() }?.let { VariantLink(it, link.expiresAt) },
         streamSize = streamSize ?: detail.sizeBytes.takeIf { mediaId == null },
+        videoInfo = variant?.video,
     )
 }

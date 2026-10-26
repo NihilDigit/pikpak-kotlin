@@ -6,20 +6,32 @@ import io.github.nihildigit.pikpak.internal.ForegroundStreams
 import io.github.nihildigit.pikpak.internal.HostHealth
 import io.github.nihildigit.pikpak.internal.HttpEngine
 import io.github.nihildigit.pikpak.internal.PriorityGate
+import io.github.nihildigit.pikpak.internal.TransferScheduler
 import io.github.nihildigit.pikpak.internal.defaultCdnHttpClient
 import io.ktor.client.HttpClient
 import kotlin.concurrent.Volatile
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
+import io.ktor.utils.io.readAvailable
 import org.kotlincrypto.hash.md.MD5
 
 /**
@@ -75,6 +87,8 @@ class PikPakClient(
      * compare with. Off keeps every read on the host its link names. See [HostHealth].
      */
     steerEdgeHosts: Boolean = true,
+    /** Shared download ceiling; pass the same limiter to clients that share one connection. */
+    val downloadLimiter: BandwidthLimiter = BandwidthLimiter(),
 ) {
     constructor(
         account: String,
@@ -88,6 +102,7 @@ class PikPakClient(
         accountConnectionBudget: Int = DEFAULT_ACCOUNT_CONNECTION_BUDGET,
         domain: PikPakDomain = PikPakDomain.MYPIKPAK_COM,
         steerEdgeHosts: Boolean = true,
+        downloadLimiter: BandwidthLimiter = BandwidthLimiter(),
     ) : this(
         account,
         { password },
@@ -100,6 +115,7 @@ class PikPakClient(
         accountConnectionBudget,
         domain,
         steerEdgeHosts,
+        downloadLimiter,
     )
 
     val deviceId: String = MD5().digest(account.encodeToByteArray()).toHex()
@@ -118,7 +134,7 @@ class PikPakClient(
     internal val ownsHttpClient = httpClient == null
     internal val apiClient: HttpClient = httpClient ?: HttpEngine.defaultClient()
 
-    private val ownsCdnClient = cdnHttpClient == null && httpClient == null
+    internal val ownsCdnClient = cdnHttpClient == null && httpClient == null
 
     /**
      * Client for signed CDN and OSS URLs.
@@ -146,6 +162,18 @@ class PikPakClient(
      * independent per-file gates.
      */
     internal val accountGate = PriorityGate(accountConnectionBudget)
+
+    internal val scheduler = TransferScheduler(accountConnectionBudget, connectionBudget, downloadLimiter)
+
+    /** Download ceiling in bytes per second, or null for unlimited. Changes apply to active downloads. */
+    var downloadBytesPerSecond: Long?
+        get() = downloadLimiter.bytesPerSecond
+        set(value) {
+            downloadLimiter.bytesPerSecond = value
+        }
+
+    /** Marks user interaction so background transfers can leave room for interactive work. */
+    fun notifyInteractiveActivity() = scheduler.onInteractiveActivity()
 
     /**
      * Foreground readers open on this account. Priority alone orders the
@@ -207,6 +235,103 @@ class PikPakClient(
      * stays until the caller sweeps its lease folder.
      */
     internal val background = CoroutineScope(SupervisorJob())
+
+    private class PrefetchedDetail(val fileId: String, val at: TimeMark, val deferred: Deferred<FileDetail>)
+
+    private val warmMutex = Mutex()
+    private var folderWarmJob: Job? = null
+    private val inFlightHostWarms = MutableStateFlow<Map<String, Deferred<Unit>>>(emptyMap())
+    private val prefetchedDetail = MutableStateFlow<PrefetchedDetail?>(null)
+
+    internal fun invalidatePrefetchedDetail() {
+        prefetchedDetail.update { old ->
+            old?.deferred?.cancel()
+            null
+        }
+    }
+
+    internal fun consumePrefetchedDetail(fileId: String): Deferred<FileDetail>? {
+        while (true) {
+            val current = prefetchedDetail.value ?: return null
+            if (current.fileId != fileId || current.at.elapsedNow() >= 15.seconds || current.deferred.isCancelled) {
+                if (prefetchedDetail.compareAndSet(current, null)) {
+                    if (current.fileId != fileId) current.deferred.cancel()
+                    return null
+                }
+                continue
+            }
+            if (prefetchedDetail.compareAndSet(current, null)) return current.deferred
+        }
+    }
+
+    internal fun warmHostIfCold(rawUrl: String): Deferred<Unit>? {
+        if (!ownsCdnClient || rawUrl.isBlank()) return null
+        val targetUrl = hostHealth.route(rawUrl, mayExplore = false)
+        if (hostHealth.isWarm(targetUrl)) return null
+        val host = HostHealth.hostOf(targetUrl) ?: return null
+        while (true) {
+            val map = inFlightHostWarms.value
+            map[host]?.takeIf { it.isActive }?.let { return it }
+            lateinit var created: Deferred<Unit>
+            created = background.async(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+                accountGate.acquire(PikPakStreamReader.BACKGROUND_READ_AHEAD_PRIORITY, Long.MAX_VALUE)
+                try {
+                    withTimeoutOrNull(900.milliseconds) {
+                        val t0 = TimeSource.Monotonic.markNow()
+                        hostHealth.onRequestStarted(targetUrl)
+                        streamRangeFromUrl(targetUrl, 0L, 1L) { stream ->
+                            hostHealth.answered(targetUrl, t0.elapsedNow())
+                            val buf = ByteArray(1)
+                            while (stream.channel.readAvailable(buf, 0, 1) != -1) {
+                                // drain 1 byte to EOF
+                            }
+                            hostHealth.onSocketReturned(targetUrl)
+                        }
+                    }
+                } catch (_: Throwable) {
+                } finally {
+                    accountGate.release()
+                    inFlightHostWarms.update { cur -> if (cur[host] === created) cur - host else cur }
+                }
+            }
+            if (inFlightHostWarms.compareAndSet(map, map + (host to created))) {
+                created.start()
+                return created
+            }
+            created.cancel()
+        }
+    }
+
+    internal fun onFolderListed(files: List<FileStat>, isFirstPage: Boolean) {
+        if (!ownsCdnClient || !isFirstPage) return
+        val candidate = files.firstOrNull { it.isFile && it.sizeBytes > 64 * 1024 && !it.trashed }
+        background.launch {
+            warmMutex.withLock {
+                folderWarmJob?.cancel()
+                if (candidate == null) {
+                    folderWarmJob = null
+                    return@withLock
+                }
+                invalidatePrefetchedDetail()
+                val debounce = if (hostHealth.hasAnyWarmHost()) 150.milliseconds else 40.milliseconds
+                folderWarmJob = background.launch {
+                    delay(debounce)
+                    val detailDef = background.async {
+                        withApiPriority(-10) { fetchFileDetailLive(candidate.id) }
+                    }
+                    val entry = PrefetchedDetail(candidate.id, TimeSource.Monotonic.markNow(), detailDef)
+                    prefetchedDetail.value = entry
+                    try {
+                        val detail = detailDef.await()
+                        detail.downloadUrl?.let { warmHostIfCold(it)?.await() }
+                    } catch (t: Throwable) {
+                        prefetchedDetail.compareAndSet(entry, null)
+                        detailDef.cancel()
+                    }
+                }
+            }
+        }
+    }
 
     /**
      * Bounds the storage leased objects take at once; see [LeaseBudget]. Null

@@ -49,6 +49,22 @@ class FileOpsMockTest {
         )
     }
 
+    @Test
+    fun `emptyTrash patches the trash endpoint and invalidates folder ids`() = runBlocking<Unit> {
+        val c = client()
+        try {
+            val generation = c.folderIds.generation()
+            c.folderIds.put("", "folder", "F", generation)
+            assertEquals("F", c.folderIds.get("", "folder"))
+            c.emptyTrash()
+            assertEquals("PATCH", sent.single().method)
+            assertEquals("/drive/v1/files/trash:empty", sent.single().path)
+            assertEquals(null, c.folderIds.get("", "folder"))
+        } finally {
+            c.close()
+        }
+    }
+
     private fun ids(body: String) = Json.parseToJsonElement(body).jsonObject["ids"]!!.jsonArray.map { it.jsonPrimitive.content }
 
     @Test

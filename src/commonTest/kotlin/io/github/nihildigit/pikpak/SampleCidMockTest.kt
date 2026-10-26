@@ -7,7 +7,11 @@ import io.ktor.http.Headers
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.utils.io.ByteReadChannel
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
@@ -32,6 +36,50 @@ class SampleCidMockTest {
             val expected = XunleiCid.of(size.toLong()) { offset, length -> content.copyOfRange(offset.toInt(), offset.toInt() + length) }
             assertEquals(expected, client.sampleCid(detail), "size $size")
             client.close()
+        }
+    }
+
+    @Test
+    fun `thumbnail helpers canonicalize hashes and select type and size`() {
+        val base = "https://sg-thumbnail-drive.mypikpak.com/v0"
+        assertEquals("$base/screenshot-thumbnails/ABCD/240/720", thumbnailUrlOf("abcd"))
+        assertEquals(thumbnailUrlOf("abcd"), videoThumbnailUrlOf("abcd"))
+        assertEquals("$base/screenshot-thumbnails/ABCD/720/2048", videoThumbnailUrlOf("abcd", large = true))
+        assertEquals("$base/thumbnails/ABCD/240/720", imageThumbnailUrlOf("abcd"))
+        assertEquals("$base/thumbnails/ABCD/720/2048", imageThumbnailUrlOf("abcd", large = true))
+    }
+
+    @Test
+    fun `all sample windows start before any response completes`() = runBlocking<Unit> {
+        val content = ByteArray(200_003) { (it * 31 + it / 7).toByte() }
+        val allStarted = CompletableDeferred<Unit>()
+        val mutex = Mutex()
+        var started = 0
+        val http = HttpClient(MockEngine { request ->
+            mutex.withLock { if (++started == 3) allStarted.complete(Unit) }
+            allStarted.await()
+            val (start, end) = request.headers[HttpHeaders.Range]!!.removePrefix("bytes=").split('-').map { it.toInt() }
+            respond(
+                ByteReadChannel(content.copyOfRange(start, end + 1)),
+                HttpStatusCode.PartialContent,
+                Headers.build {
+                    append(HttpHeaders.ContentRange, "bytes $start-$end/${content.size}")
+                    append(HttpHeaders.ContentLength, (end - start + 1).toString())
+                },
+            )
+        })
+        val client = PikPakClient("mock@x", "pw", sessionStore = InMemorySessionStore(), httpClient = http)
+        try {
+            val detail = FileDetail(id = "f", size = content.size.toString(),
+                links = mapOf(FileDetail.OCTET_STREAM to DownloadLink(url = "https://cdn/f")))
+            val expected = XunleiCid.of(content.size.toLong()) { offset, length ->
+                content.copyOfRange(offset.toInt(), offset.toInt() + length)
+            }
+            assertEquals(expected, withTimeout(5_000) { client.sampleCid(detail) })
+            assertEquals(3, started)
+        } finally {
+            client.close()
+            http.close()
         }
     }
 

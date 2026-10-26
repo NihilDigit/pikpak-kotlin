@@ -120,5 +120,14 @@ suspend fun PikPakClient.listFilesPaged(
         url = buildUrl(DRIVE, FILES_PATH, query),
         captchaAction = "GET:/drive/v1/files",
     )
-    return json.decodeFromJsonElement(FileListPage.serializer(), response)
+    val suppressPrefetch = kotlin.coroutines.coroutineContext[SuppressFolderPrefetch.Key] != null
+    return json.decodeFromJsonElement(FileListPage.serializer(), response).also {
+        if (!suppressPrefetch && parentId != "*" && extraFilters.isEmpty() && pageToken.isEmpty()) {
+            onFolderListed(it.files, isFirstPage = true)
+        }
+    }
+}
+
+internal object SuppressFolderPrefetch : kotlin.coroutines.AbstractCoroutineContextElement(SuppressFolderPrefetch.Key) {
+    object Key : kotlin.coroutines.CoroutineContext.Key<SuppressFolderPrefetch>
 }

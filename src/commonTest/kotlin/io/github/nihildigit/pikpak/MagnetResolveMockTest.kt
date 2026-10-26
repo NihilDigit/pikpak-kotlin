@@ -52,6 +52,8 @@ class MagnetResolveMockTest {
         assertEquals("A3C62CB153B61CF265298986AD97EA07A85112DF", file.gcid)
         // file_size is quoted in the wire format; a naive decode leaves it a String.
         assertEquals(1_536_851_968L, file.size)
+        assertEquals("application/octet-stream", file.mimeType)
+        assertEquals("https://thumbnail/image", file.thumbnailLink)
         client.close()
     }
 
@@ -106,6 +108,20 @@ class MagnetResolveMockTest {
     fun `a paged top level is reported as truncated`() {
         val paged = """{"list":{"next_page_token":"N","resources":[{"name":"a.mkv","file_size":"1","is_dir":false,"meta":{"hash":"${"A".repeat(40)}"}}]}}"""
         assertTrue(assertNotNull(parseMagnetResource(parser.parseToJsonElement(paged) as JsonObject)).truncated)
+    }
+
+    @Test
+    fun `missing and blank media metadata remain null`() {
+        val missing = parse(nestedResponse)!!.files.first()
+        assertNull(missing.mimeType)
+        assertNull(missing.thumbnailLink)
+        val blank = parse(singleFileResponse.replace("application/octet-stream", " ").replace("https://thumbnail/image", ""))!!.files.single()
+        assertNull(blank.mimeType)
+        assertNull(blank.thumbnailLink)
+        val legacy = ResolvedFile("dir/file", 1L, "ABCD")
+        assertNull(legacy.mimeType)
+        assertNull(legacy.thumbnailLink)
+        assertEquals("file", legacy.name)
     }
 
     // --- instantCreate ---
@@ -179,7 +195,7 @@ class MagnetResolveMockTest {
          {"id":"kiGgmTBis2PGAotKZBn_SH0CxUE.0","name":"archlinux-2026.04.01-x86_64.iso",
           "file_size":"1536851968","file_count":1,"file_index":0,
           "meta":{"hash":"A3C62CB153B61CF265298986AD97EA07A85112DF",
-                  "mime_type":"application/octet-stream","status":"1"},
+                  "mime_type":"application/octet-stream","thumbnail_link":"https://thumbnail/image","status":"1"},
           "is_dir":false,"dir":null,"parent_id":"","resolver":"DIRECT"}]}}
     """.trimIndent()
 

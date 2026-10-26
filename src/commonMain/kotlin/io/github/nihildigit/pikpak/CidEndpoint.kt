@@ -3,6 +3,9 @@ package io.github.nihildigit.pikpak
 import io.github.nihildigit.pikpak.internal.buildUrl
 import io.ktor.http.HttpMethod
 import io.ktor.utils.io.toByteArray
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
@@ -62,7 +65,15 @@ object XunleiCid {
  * only a gcid, a file it no longer holds, still has its thumbnail. What the
  * `240/720` segments mean is not known; they are the values listings carry.
  */
-fun thumbnailUrlOf(gcid: String): String = "https://sg-thumbnail-drive.mypikpak.com/v0/screenshot-thumbnails/${gcid.canonicalGcid()}/240/720"
+fun thumbnailUrlOf(gcid: String): String = videoThumbnailUrlOf(gcid, large = false)
+
+/** Unsigned screenshot URL for video content. */
+fun videoThumbnailUrlOf(gcid: String, large: Boolean = false): String =
+    "https://sg-thumbnail-drive.mypikpak.com/v0/screenshot-thumbnails/${gcid.canonicalGcid()}/${if (large) "720/2048" else "240/720"}"
+
+/** Unsigned thumbnail URL for image content. */
+fun imageThumbnailUrlOf(gcid: String, large: Boolean = false): String =
+    "https://sg-thumbnail-drive.mypikpak.com/v0/thumbnails/${gcid.canonicalGcid()}/${if (large) "720/2048" else "240/720"}"
 
 /**
  * The CID of [detail]'s original, read from its octet-stream link: at most
@@ -70,13 +81,23 @@ fun thumbnailUrlOf(gcid: String): String = "https://sg-thumbnail-drive.mypikpak.
  * to check later whether PikPak still holds some content keeps this beside it.
  */
 suspend fun PikPakClient.sampleCid(detail: FileDetail): String {
-    val url = detail.downloadUrl ?: throw PikPakException(-1, "sampleCid: file ${detail.id} has no download link")
-    val parts = XunleiCid.windows(detail.sizeBytes).map { (offset, length) ->
-        if (length == 0) {
-            ByteArray(0)
-        } else {
-            streamRangeFromUrl(url, start = offset, length = length.toLong()) { it.channel.toByteArray() }
-        }
+    val rawUrl = detail.downloadUrl ?: throw PikPakException(-1, "sampleCid: file ${detail.id} has no download link")
+    val url = hostHealth.route(rawUrl, mayExplore = false)
+    suspend fun readWindow(targetUrl: String, offset: Long, length: Int): ByteArray =
+        if (length == 0) ByteArray(0)
+        else streamRangeFromUrl(targetUrl, start = offset, length = length.toLong()) { it.channel.toByteArray() }
+    val parts = coroutineScope {
+        XunleiCid.windows(detail.sizeBytes).map { (offset, length) ->
+            async {
+                try {
+                    readWindow(url, offset, length)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    if (url != rawUrl) readWindow(rawUrl, offset, length) else throw t
+                }
+            }
+        }.awaitAll()
     }
     return XunleiCid.digest(parts)
 }

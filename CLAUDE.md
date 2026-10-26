@@ -96,7 +96,7 @@ PIKPAK_WEAKLINK=1 ./gradlew jvmTest --tests '*WeakLinkSmoke*' --rerun  # what fa
 ./gradlew iosSimulatorArm64Test --tests 'io.github.nihildigit.pikpak.PikPakHashTest.hello matches reference'
 ```
 
-`publishToMavenLocal` runs `signAllPublications()` unconditionally, so it needs a GPG signatory configured locally and fails with "no configured signatory" without one. It is not a credential-free wiring check; on a machine without the key, compiling every target is the closest equivalent.
+`publishToMavenLocal` signs publications only when `-PsigningInMemoryKey=...` is supplied (as in CI), so it can be run locally without a GPG key. Compiling every target plus `compileCommonMainKotlinMetadata` and `jvmTest` is the full pre-release check.
 
 Live integration tests create/delete folders in the test account. `IntegrationUploadTest` + `CleanupOrphansTest` handle their own cleanup; if a run crashes mid-test, `CleanupOrphansTest` trashes leftover `pikpak-kotlin-*` folders on the next run.
 

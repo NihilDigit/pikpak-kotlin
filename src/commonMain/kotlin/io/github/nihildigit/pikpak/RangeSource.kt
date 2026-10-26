@@ -60,17 +60,9 @@ interface RangeSource {
     }
 }
 
-/** Serves a fixed [RangeReader]. Use [PikPakFileHandle] instead when the file id may move. */
-fun RangeReader.asRangeSource(): RangeSource = RangeReaderSource(this)
-
-private class RangeReaderSource(private val reader: RangeReader) : RangeSource {
-    override suspend fun <T> read(
-        start: Long,
-        length: Long,
-        priority: Int,
-        block: suspend (ByteReadChannel) -> T,
-    ): T = reader.read(start, length, priority, block)
-}
+/** [RangeReader] is already a [RangeSource]; no adapter is needed. */
+@Deprecated("RangeReader implements RangeSource directly", ReplaceWith("this"))
+fun RangeReader.asRangeSource(): RangeSource = this
 
 /** Up to [length] bytes, fewer only at EOF. */
 internal suspend fun ByteReadChannel.readFully(length: Int): ByteArray {

@@ -13,6 +13,10 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.minutes
 
@@ -174,6 +178,71 @@ class RecursiveSearchMockTest {
         assertEquals(listOf("*"), listed)
         assertEquals(listOf("t1"), trash.map { it.id })
         client.close()
+    }
+
+    @Test
+    fun `flat search reconstructs paths and streams folders before paged files`() = runBlocking<Unit> {
+        val requests = mutableListOf<String>()
+        val c = flatClient(requests)
+        try {
+            val hits = c.searchDriveFlat("MATCH", pageSize = 2).toList()
+            assertEquals(listOf("B", "root", "deep", "outside"), hits.map { it.file.id })
+            assertEquals(listOf("A/match folder", "rootmatch", "A/match folder/deepmatch", "othermatch"), hits.map { it.path })
+            assertEquals(listOf("drive#folder:", "drive#folder:folders2", "drive#file:", "drive#file:files2", "drive#file:files3"), requests)
+        } finally { c.close() }
+    }
+
+    @Test
+    fun `flat search scopes ancestry relative to a folder and excludes that folder`() = runBlocking<Unit> {
+        val c = flatClient(mutableListOf())
+        try {
+            val hits = c.searchDriveFlat("match", parentId = "B", pageSize = 2).toList()
+            assertEquals(listOf("deep"), hits.map { it.file.id })
+            assertEquals(emptyList(), hits.single().breadcrumb)
+            assertEquals(emptyList(), c.searchDriveFlat("match", parentId = "missing", pageSize = 2).toList())
+            assertFailsWith<IllegalArgumentException> { c.searchDriveFlat("") }
+        } finally { c.close() }
+    }
+
+    @Test
+    fun `flat entries skip empty pages and collection stops before later pages`() = runBlocking<Unit> {
+        val requests = mutableListOf<String>()
+        val c = flatClient(requests)
+        try {
+            val pages = c.listAllDriveEntriesFlow(2, mapOf(FileFilter.kind(FileKind.FILE))).toList()
+            assertEquals(listOf(1, 4), pages.map { it.size })
+            requests.clear()
+            assertEquals("B", c.searchDriveFlat("match", pageSize = 2).first().file.id)
+            assertEquals(listOf("drive#folder:", "drive#folder:folders2"), requests)
+        } finally { c.close() }
+    }
+
+    private fun flatClient(requests: MutableList<String>): PikPakClient {
+        val engine = MockEngine { req ->
+            when {
+                req.url.encodedPath.endsWith("/v1/shield/captcha/init") -> respondJson("""{"captcha_token":"CAP"}""")
+                req.url.encodedPath.endsWith("/v1/auth/signin") -> respondJson("""{"access_token":"AT","refresh_token":"RT","sub":"UID","expires_in":3600}""")
+                else -> {
+                    assertEquals("*", req.url.parameters["parent_id"])
+                    assertEquals("2", req.url.parameters["limit"])
+                    val filters = Json.parseToJsonElement(req.url.parameters["filters"]!!).jsonObject
+                    val kind = filters["kind"]!!.jsonObject["eq"]!!.jsonPrimitive.content
+                    assertEquals("false", filters["trashed"]!!.jsonObject["eq"]!!.jsonPrimitive.content)
+                    val key = "$kind:${req.url.parameters["page_token"].orEmpty()}"
+                    requests += key
+                    respondJson(when (key) {
+                        "drive#folder:" -> """{"files":[{"kind":"drive#folder","id":"B","name":"match folder","parent_id":"A"}],"next_page_token":"folders2"}"""
+                        "drive#folder:folders2" -> """{"files":[{"kind":"drive#folder","id":"A","name":"A","parent_id":""},{"kind":"drive#folder","id":"cycle","name":"match cycle","parent_id":"cycle"}]}"""
+                        "drive#file:" -> """{"files":[{"id":"root","name":"rootmatch","parent_id":""}],"next_page_token":"files2"}"""
+                        "drive#file:files2" -> """{"files":[],"next_page_token":"files3"}"""
+                        "drive#file:files3" -> """{"files":[{"id":"deep","name":"deepmatch","parent_id":"B"},{"id":"outside","name":"othermatch","parent_id":""},{"id":"orphan","name":"match orphan","parent_id":"gone"},{"id":"loop","name":"match loop","parent_id":"cycle"}]}"""
+                        else -> error("unexpected page $key")
+                    })
+                }
+            }
+        }
+        return PikPakClient("mock@x", "pw", sessionStore = InMemorySessionStore(),
+            rateLimiter = RateLimiter.unlimited(), httpClient = HttpClient(engine))
     }
 
     private fun treeClient(
