@@ -352,22 +352,7 @@ internal class HttpEngine(
         // An injected HttpClient must honour the same two constraints, plus one
         // more: no HttpRequestRetry (see below). If yours installs any of the
         // three, hand the SDK a separate client instead of your app-wide one.
-        fun defaultClient(): HttpClient = HttpClient {
-            install(HttpTimeout) {
-                connectTimeoutMillis = 15_000
-                // This client carries JSON API calls only; bytes go over the CDN
-                // client. Bounded, because sign-in and captcha requests run under
-                // the client's auth mutex, and one that stalls holds up every
-                // login and captcha refresh behind it for as long as it is let.
-                requestTimeoutMillis = 60_000
-                socketTimeoutMillis = 30_000
-            }
-            // HttpRequestRetry is intentionally NOT installed. The SDK's own
-            // retry loop (driven by RetryPolicy) already handles transient
-            // failures; stacking both plugins compounds backoff and multiplies
-            // attempt counts in surprising ways.
-            expectSuccess = false
-        }
+        fun defaultClient(): HttpClient = defaultApiHttpClient()
     }
 }
 

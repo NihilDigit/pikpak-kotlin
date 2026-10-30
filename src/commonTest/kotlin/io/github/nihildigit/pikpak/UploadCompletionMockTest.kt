@@ -64,6 +64,40 @@ class UploadCompletionMockTest {
     }
 
     @Test
+    fun `fresh session uploads parts and completes without listing parts`() = runBlocking<Unit> {
+        val exchanges = mutableListOf<String>()
+        val progress = mutableListOf<Long>()
+        val client = PikPakClient(
+            account = "mock@x",
+            password = "pw",
+            sessionStore = InMemorySessionStore(),
+            httpClient = HttpClient(MockEngine { req ->
+                exchanges += "${req.method.value} ${req.url.encodedQuery}"
+                when (req.method.value) {
+                    "PUT" -> respond("", HttpStatusCode.OK, headersOf(HttpHeaders.ETag, "\"part-etag\""))
+                    "POST" -> respond("<CompleteMultipartUploadResult/>", HttpStatusCode.OK)
+                    else -> error("Unexpected request: $req")
+                }
+            }),
+        )
+        try {
+            client.continueUpload(
+                session,
+                open = { offset ->
+                    assertEquals(0L, offset)
+                    Buffer().apply { write(ByteArray(10)) }
+                },
+                onProgress = { progress += it },
+                freshSession = true,
+            )
+            assertEquals(listOf("PUT partNumber=1&uploadId=U1", "POST uploadId=U1"), exchanges)
+            assertEquals(listOf(0L, 10L), progress)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
     fun `cancelling a completed upload leaves the file alone`() = runBlocking {
         val client = client()
         client.cancelUpload(session)

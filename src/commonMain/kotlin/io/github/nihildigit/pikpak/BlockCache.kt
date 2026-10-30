@@ -946,13 +946,22 @@ internal class BlockCache(
         val owner = targetCursor
         val blocking = owner != null && target == slotOf(owner.position)
         val downloadWant = targetWant?.takeIf { owner == null && it.durable }
+        val streamWarm = targetWant?.takeIf { owner == null && !it.durable }
         val mayWiden = if (scheduler != null) {
-            (owner != null && !blocking && (!owner.seeking || wide(owner))) || (downloadWant != null && !wasAccountHungry)
+            (owner != null && !blocking && (!owner.seeking || wide(owner))) ||
+                (downloadWant != null && !wasAccountHungry) ||
+                (streamWarm != null && !wasAccountHungry)
         } else {
-            !throttled() && ((owner != null && wide(owner)) || (downloadWant != null && !downloadsThrottled()))
+            !throttled() && ((owner != null && wide(owner)) ||
+                (downloadWant != null && !downloadsThrottled()) ||
+                streamWarm != null)
         }
         val spanWorkers = if (downloadWant != null) minOf(durableLimit, localLimit) else activeWorkers()
-        val maxSpan = if (mayWiden) registration?.let { scheduler!!.spanFor(it, spanWorkers, downloadWant != null) } ?: 2 else 1
+        val maxSpan = when {
+            !mayWiden -> 1
+            streamWarm != null -> 2
+            else -> registration?.let { scheduler!!.spanFor(it, spanWorkers, downloadWant != null) } ?: 2
+        }
         val windows = live.map(::windowOf)
         val outside = cache.keys.filter { slot -> slot !in persisting && windows.none { slot in it } }
         val baseFree = memoryCapBytes - cachedBytes - inFlightBytes() - pendingPersistBytes

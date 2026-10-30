@@ -155,4 +155,43 @@ class HostHealthTest {
         time += HostHealth.DEFAULT_MEMORY
         assertEquals(link, health.route(link, mayExplore = false))
     }
+
+    @Test
+    fun `cold host gets handshake headroom while warm pooled host keeps tight deadline`() {
+        val time = TestTimeSource()
+        val health = HostHealth(timeSource = time)
+        val warmUrl = "https://dl-z01a-0002.mypikpak.com/download/?fid=F"
+        val coldUrl = "https://dl-z01a-0003.mypikpak.com/download/?fid=F"
+
+        repeat(HostHealth.MIN_LATENCY_SAMPLES) {
+            health.onRequestStarted(warmUrl)
+            health.answered(warmUrl, 400.milliseconds)
+            health.onSocketReturned(warmUrl)
+        }
+
+        assertEquals(HostHealth.MIN_DEADLINE, health.firstResponseDeadline(warmUrl))
+        assertTrue(
+            health.firstResponseDeadline(coldUrl) >= HostHealth.INITIAL_DEADLINE,
+            "cold deadline=${health.firstResponseDeadline(coldUrl)}",
+        )
+        assertEquals(HostHealth.URGENT_BODY_SILENCE, health.bodySilenceDeadline(PikPakStreamReader.BLOCKING_PRIORITY))
+        assertEquals(HostHealth.BODY_SILENCE, health.bodySilenceDeadline(PikPakStreamReader.READ_AHEAD_PRIORITY))
+    }
+
+    @Test
+    fun `mid-body stalled host is recorded and routed to usable sibling even below sample byte floor`() {
+        val time = TestTimeSource()
+        val health = HostHealth(timeSource = time)
+        val goodSibling = "https://dl-z01a-0002.mypikpak.com/download/?fid=F&sign=S"
+        health.observe(FileDetail(webContentLink = goodSibling))
+        health.answered(goodSibling, 250.milliseconds)
+
+        // 0001 answered promptly, sent only 100 KiB (< MIN_SAMPLE_BYTES), then stalled for 3 s
+        health.answered(link, 200.milliseconds)
+        time += 3.seconds
+        health.stalled(link, deliveredBytes = 100 * 1024L, bodyBytesPerSecond = 34 * 1024L, silenceDuration = 3.seconds)
+
+        assertTrue(health.isBad(link))
+        assertEquals(goodSibling, health.route(link, mayExplore = false))
+    }
 }

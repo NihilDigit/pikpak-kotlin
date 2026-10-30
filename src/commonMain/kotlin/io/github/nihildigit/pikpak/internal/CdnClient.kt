@@ -28,6 +28,22 @@ import io.ktor.client.HttpClient
  */
 internal expect fun defaultCdnHttpClient(perHostLimit: Int): HttpClient
 
+/**
+ * Builds the HTTP client used for JSON API calls (`api-drive`, `user`).
+ *
+ * PikPak's API speaks HTTP/2, yet OkHttp's `Dispatcher` still caps concurrent
+ * async calls per host at 5 before they reach the multiplexed h2 socket,
+ * artificially ceiling throughput at ~24 req/s on a 200 ms line. Lifting the
+ * per-host cap lets [io.github.nihildigit.pikpak.RateLimiter] govern the real
+ * request rate.
+ */
+internal expect fun defaultApiHttpClient(perHostLimit: Int = DEFAULT_API_PER_HOST_LIMIT): HttpClient
+
+internal const val DEFAULT_API_PER_HOST_LIMIT = 64
+internal const val API_CONNECT_TIMEOUT_MS = 15_000L
+internal const val API_REQUEST_TIMEOUT_MS = 60_000L
+internal const val API_SOCKET_TIMEOUT_MS = 30_000L
+
 internal const val CDN_CONNECT_TIMEOUT_MS = 15_000L
 
 /**

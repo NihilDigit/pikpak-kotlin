@@ -17,6 +17,43 @@ internal actual fun defaultCdnHttpClient(perHostLimit: Int): HttpClient =
         unconfiguredCdnClient()
     }
 
+internal actual fun defaultApiHttpClient(perHostLimit: Int): HttpClient =
+    try {
+        okHttpApiClient(perHostLimit)
+    } catch (_: LinkageError) {
+        unconfiguredApiClient()
+    }
+
+private fun okHttpApiClient(perHostLimit: Int): HttpClient = HttpClient(OkHttp) {
+    engine {
+        config {
+            // Keep default ALPN (HTTP/2 + HTTP/1.1): api-drive negotiates h2.
+            connectionPool(ConnectionPool(perHostLimit.coerceAtLeast(16), 5, TimeUnit.MINUTES))
+            dispatcher(
+                Dispatcher().apply {
+                    maxRequestsPerHost = perHostLimit
+                    maxRequests = perHostLimit * 2
+                },
+            )
+        }
+    }
+    install(HttpTimeout) {
+        connectTimeoutMillis = API_CONNECT_TIMEOUT_MS
+        requestTimeoutMillis = API_REQUEST_TIMEOUT_MS
+        socketTimeoutMillis = API_SOCKET_TIMEOUT_MS
+    }
+    expectSuccess = false
+}
+
+private fun unconfiguredApiClient(): HttpClient = HttpClient {
+    install(HttpTimeout) {
+        connectTimeoutMillis = API_CONNECT_TIMEOUT_MS
+        requestTimeoutMillis = API_REQUEST_TIMEOUT_MS
+        socketTimeoutMillis = API_SOCKET_TIMEOUT_MS
+    }
+    expectSuccess = false
+}
+
 private fun okHttpCdnClient(perHostLimit: Int): HttpClient = HttpClient(OkHttp) {
     engine {
         config {

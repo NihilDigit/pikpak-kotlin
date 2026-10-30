@@ -254,6 +254,10 @@ class RangeReader internal constructor(
     /** The CDN took the request and sent nothing back within [limit]. Not a CancellationException, so it reaches the retry path. */
     private class UnresponsiveHost(val limit: Duration) : Exception("no response headers within $limit")
 
+    /** Headers arrived, then the body delivered nothing for [limit] after [afterBytes]. */
+    private class BodySilence(val limit: Duration, val afterBytes: Long) :
+        Exception("stream went silent for $limit after $afterBytes bytes")
+
     /**
      * Reads a range into memory. Only for ranges small enough to hold; [read] is the general
      * form. Like [RangeSource.readBytes], a range past the end of the file comes back short.
@@ -347,6 +351,7 @@ class RangeReader internal constructor(
         var offset = start
         var remaining = length
         var failures = 0
+        var bodyStalls = 0
         var throttles = 0
         var rejectionRefreshed = false
         val failedReroutes = HashSet<String>()
@@ -391,8 +396,8 @@ class RangeReader internal constructor(
                     // is left is a host that said nothing at all.
                     // Throwing from the child fails the scope and cancels the request with it.
                     val answered = CompletableDeferred<Unit>()
-                    val limit = client.hostHealth.firstResponseDeadline()
-                    val bodySilence = maxOf(BODY_SILENCE, limit)
+                    val limit = client.hostHealth.firstResponseDeadline(attemptUrl)
+                    val bodySilence = client.hostHealth.bodySilenceDeadline(priority)
                     val deadline = launch {
                         var statusesSeen = attempt.retries.statuses
                         while (true) {
@@ -416,23 +421,21 @@ class RangeReader internal constructor(
                         state.delivered = 0L
                         clippedAtEof = stream.endsBeforeRequested(offset, remaining)
                         val buffer = ByteArray(READ_CHUNK)
+                        var firstByteAt: TimeMark? = null
                         while (true) {
                             val n = try {
                                 withTimeout(bodySilence) {
                                     stream.channel.readAvailable(buffer, 0, buffer.size)
                                 }
                             } catch (e: TimeoutCancellationException) {
-                                throw PikPakException(
-                                    -1,
-                                    "stream went silent for $bodySilence after $delivered bytes",
-                                    cause = e,
-                                )
+                                throw BodySilence(bodySilence, delivered)
                             }
                             if (n == -1) {
                                 client.hostHealth.onSocketReturned(attemptUrl)
                                 break
                             }
                             if (n > 0) {
+                                if (firstByteAt == null) firstByteAt = TimeSource.Monotonic.markNow()
                                 attempt.record(n)
                                 if (telemetry != null && telemetry.timeToFirstByte == null) {
                                     telemetry.timeToFirstByte = started?.elapsedNow()
@@ -448,6 +451,18 @@ class RangeReader internal constructor(
                                         throw e
                                     } catch (_: Throwable) {
                                     }
+                                }
+                                // A throttled "drip" edge sending a few KiB every 1–2 s resets per-read
+                                // bodySilence forever and drags a 256 KiB block to 9+ s. Cut over once a
+                                // healthy sibling is already proven on this cluster.
+                                val expectedRemaining = remaining
+                                val bodyElapsed = firstByteAt.elapsedNow()
+                                if (bodyElapsed >= bodySilence &&
+                                    (expectedRemaining == null || delivered < expectedRemaining) &&
+                                    attempt.bodyBytesPerSecond() in 1 until MIN_VIABLE_BODY_BYTES_PER_SEC &&
+                                    client.hostHealth.hasHealthySibling(attemptUrl)
+                                ) {
+                                    throw BodySilence(bodyElapsed, delivered)
                                 }
                             }
                         }
@@ -483,7 +498,10 @@ class RangeReader internal constructor(
                     routedHost?.let { failedReroutes += it }
                     val rejected = t is UrlExpiredException || (t is PikPakException && t.httpStatus in 400..499)
                     report(attempt, if (rejected) RangeAttempt.Outcome.Rejected else RangeAttempt.Outcome.Failed)
-                    if (rejected || (delivered == 0L && !client.hostHealth.isAnswering(attemptUrl))) {
+                    if (t is BodySilence) {
+                        client.hostHealth.stalled(attemptUrl, attempt.delivered, attempt.bodyBytesPerSecond(), t.limit)
+                    }
+                    if (rejected || t is BodySilence || (delivered == 0L && !client.hostHealth.isAnswering(attemptUrl))) {
                         client.hostHealth.refused(attemptUrl)
                     }
                     continue
@@ -517,6 +535,20 @@ class RangeReader internal constructor(
                         if (failures >= maxAttempts) throw PikPakException(-1, "RangeReader: no host answered at offset $offset", cause = t)
                         bumpRetries()
                         // No backoff: nothing is wrong with the network, only with that host
+                        switchHost(linkUrl, silentFor = t.limit)
+                    }
+                    t is BodySilence -> {
+                        report(attempt, RangeAttempt.Outcome.Failed)
+                        client.hostHealth.stalled(attemptUrl, attempt.delivered, attempt.bodyBytesPerSecond(), t.limit)
+                        bodyStalls++
+                        if (delivered == 0L || bodyStalls >= maxAttempts * 2) {
+                            failures++
+                            if (failures >= maxAttempts || bodyStalls >= maxAttempts * 2) {
+                                throw PikPakException(-1, "RangeReader: body silent at offset $offset", cause = t)
+                            }
+                        }
+                        bumpRetries()
+                        // No backoff: bytes before the stall were kept, steer off the stalled host immediately
                         switchHost(linkUrl, silentFor = t.limit)
                     }
                     else -> {
@@ -742,6 +774,7 @@ class RangeReader internal constructor(
          * took 1–5 s on that line.
          */
         val BODY_SILENCE = 3.seconds
+        const val MIN_VIABLE_BODY_BYTES_PER_SEC = 24L * 1024
         const val EXPLORE_MIN_OFFSET_BYTES = 2L * 1024 * 1024
         const val DRAIN_SOCKET_MAX_BYTES = 128L * 1024
         val DRAIN_SOCKET_GRACE = 80.milliseconds

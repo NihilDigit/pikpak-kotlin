@@ -132,11 +132,69 @@ internal class HostHealth(
      * which is exactly what a host change opens. A tail that more than a tenth of the requests
      * cross is lifted by their cut-off samples, so the deadline doubles until it covers them.
      */
-    fun firstResponseDeadline(): Duration {
+    fun firstResponseDeadline(url: String? = null): Duration {
         val recent = latencies.value.filter { it.at.elapsedNow() < LATENCY_MEMORY }
-        if (recent.size < MIN_LATENCY_SAMPLES) return INITIAL_DEADLINE
-        val tail = recent.map { it.wait }.sorted()[(recent.size * 9) / 10]
-        return (tail * LATENCY_RATIO).coerceIn(MIN_DEADLINE, MAX_DEADLINE)
+        val base = if (recent.size < MIN_LATENCY_SAMPLES) {
+            INITIAL_DEADLINE
+        } else {
+            val tail = recent.map { it.wait }.sorted()[(recent.size * 9) / 10]
+            (tail * LATENCY_RATIO).coerceIn(MIN_DEADLINE, MAX_DEADLINE)
+        }
+        // Warm pooled sockets answer in one RTT and pull P90 down to MIN_DEADLINE, while opening
+        // fresh TLS connections to a cold host through a proxy can take 2–3x longer. Give cold
+        // hosts handshake headroom so an 8-way cold open does not cascade across the cluster.
+        if (url != null && hasAnyWarmHost() && !isWarm(url)) {
+            return maxOf(base * COLD_DEADLINE_RATIO, INITIAL_DEADLINE).coerceAtMost(MAX_DEADLINE)
+        }
+        return base
+    }
+
+    /**
+     * How long an already-answered response body may stop delivering bytes before the attempt is
+     * cut off and resumed elsewhere. Independent of cold TLS handshake waits: once headers have
+     * arrived the handshake is over, so a stalled body on an urgent playback/seek read should
+     * fail over in 2–3 s rather than waiting 8–9 s behind cold-open latency samples.
+     */
+    fun bodySilenceDeadline(priority: Int = 0): Duration {
+        val recent = latencies.value.filter { it.at.elapsedNow() < LATENCY_MEMORY }
+        val median = if (recent.size < MIN_LATENCY_SAMPLES) null else {
+            recent.map { it.wait }.sorted()[(recent.size - 1) / 2]
+        }
+        val urgentFloor = if (priority >= io.github.nihildigit.pikpak.PikPakStreamReader.BLOCKING_PRIORITY) {
+            URGENT_BODY_SILENCE
+        } else {
+            BODY_SILENCE
+        }
+        if (median == null || median < 1.seconds) return urgentFloor
+        return (median * 3).coerceIn(urgentFloor, MAX_DEADLINE)
+    }
+
+    fun hasHealthySibling(url: String): Boolean {
+        val edge = Edge.parse(url) ?: return false
+        return siblingsOf(edge).any { sibling ->
+            usable(sibling.host) && (medianRate(sibling.host) ?: 0L) >= GOOD_RATE_BYTES_PER_SEC
+        }
+    }
+
+    /**
+     * [url]'s host answered headers promptly, then stalled mid-body for [silenceDuration].
+     *
+     * Such hosts (e.g. an edge throttled to 10–40 KB/s after a 100 KiB initial burst) beat the
+     * first-response deadline and fail short of [MIN_SAMPLE_BYTES], escaping both [markSilent]
+     * and [delivered]. Record their effective rate regardless of sample size and mark them silent
+     * (subject to [markSilent]'s corroboration checks) so subsequent reads steer to a healthy sibling.
+     */
+    fun stalled(url: String, deliveredBytes: Long, bodyBytesPerSecond: Long, silenceDuration: Duration) {
+        val host = hostOf(url)
+        if (host != null && deliveredBytes > 0L) {
+            val effectiveRate = bodyBytesPerSecond.coerceAtLeast(1L)
+            val sample = RateSample(effectiveRate, timeSource.markNow())
+            rates.update { current ->
+                val kept = current[host].orEmpty().filter { it.at.elapsedNow() < memory }.takeLast(MAX_SAMPLES - 1)
+                current + (host to kept + sample)
+            }
+        }
+        markSilent(url, silenceDuration)
     }
 
     private class LatencySample(val wait: Duration, val at: TimeMark)
@@ -227,6 +285,12 @@ internal class HostHealth(
             if (ownIsSlow || isSilent(edge.host)) {
                 preferredByCluster.update { it + (clusterKey to best.first.label) }
                 return edge.rewrite(url, best.first)
+            }
+        } else if (isSilent(edge.host)) {
+            // Even before any sibling has accumulated MIN_SAMPLES full completions, a known-silent
+            // host must immediately yield to any usable observed sibling in the same cluster.
+            siblings.firstOrNull { usable(it.host) }?.let { fallback ->
+                return edge.rewrite(url, fallback)
             }
         }
 
@@ -374,6 +438,9 @@ internal class HostHealth(
         val MAX_DEADLINE: Duration = 10.seconds
 
         const val LATENCY_RATIO = 2
+        const val COLD_DEADLINE_RATIO = 2
+        val BODY_SILENCE: Duration = 3.seconds
+        val URGENT_BODY_SILENCE: Duration = 2.seconds
         const val MIN_LATENCY_SAMPLES = 8
         const val MAX_LATENCY_SAMPLES = 32
 

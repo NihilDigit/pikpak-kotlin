@@ -107,7 +107,7 @@ suspend fun PikPakClient.upload(
     }
     try {
         // A fresh session has no parts yet, so continueUpload asks for offset 0 only
-        continueUpload(session, open = { offset -> check(offset == 0L) { "unexpected offset $offset" }; open() }, onProgress)
+        continueUpload(session, open = { offset -> check(offset == 0L) { "unexpected offset $offset" }; open() }, onProgress, freshSession = true)
     } catch (e: Throwable) {
         // A cancelled coroutine cannot send these without NonCancellable. Best
         // effort: the original failure is what the caller needs to see.
@@ -260,9 +260,21 @@ suspend fun PikPakClient.continueUpload(
     session: UploadSession,
     open: (offset: Long) -> RawSource,
     onProgress: (uploadedBytes: Long) -> Unit = {},
+) = continueUpload(session, open, onProgress, freshSession = false)
+
+/**
+ * [continueUpload] with an explicit fresh-session fast path. Set [freshSession] only for a
+ * newly started session with no uploaded parts; it skips the OSS part-list request.
+ * Leave it false when resuming so parts already on OSS are preserved.
+ */
+suspend fun PikPakClient.continueUpload(
+    session: UploadSession,
+    open: (offset: Long) -> RawSource,
+    onProgress: (uploadedBytes: Long) -> Unit = {},
+    freshSession: Boolean,
 ) {
     try {
-        sendMissingParts(session, open, onProgress)
+        sendMissingParts(session, open, onProgress, freshSession)
     } catch (e: PikPakException) {
         if (e.httpStatus != 404 || !uploadCompleted(session.fileId)) throw e
     }
@@ -272,8 +284,9 @@ private suspend fun PikPakClient.sendMissingParts(
     session: UploadSession,
     open: (offset: Long) -> RawSource,
     onProgress: (uploadedBytes: Long) -> Unit,
+    freshSession: Boolean,
 ) {
-    val parts = listUploadedParts(session).toMutableMap()
+    val parts = if (freshSession) mutableMapOf<Int, String>() else listUploadedParts(session).toMutableMap()
     val partCount = ((session.size + session.partSize - 1) / session.partSize).toInt().coerceAtLeast(1)
     fun partLength(number: Int) = minOf(session.partSize, session.size - (number - 1) * session.partSize).toInt()
     onProgress(parts.keys.sumOf { partLength(it).toLong() })

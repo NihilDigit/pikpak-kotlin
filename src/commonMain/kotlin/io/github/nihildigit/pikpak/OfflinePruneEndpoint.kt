@@ -14,6 +14,10 @@ data class PruneResult(
      * is expected, not a failure.
      */
     val missing: Set<String>,
+    /** Drive IDs of files and folders permanently deleted during pruning. */
+    val deletedIds: Set<String> = emptySet(),
+    /** Parent folder IDs from which entries were deleted during pruning. */
+    val touchedFolderIds: Set<String> = emptySet(),
 )
 
 /**
@@ -49,10 +53,16 @@ suspend fun PikPakClient.pruneOfflineOutput(task: DriveTask, keep: Set<String>):
         // name match then deleted, permanently, the only file the task produced.
         if (keep.isNotEmpty()) return PruneResult(deleted = emptyList(), missing = emptySet())
         batchDelete(listOf(root.id))
-        return PruneResult(deleted = listOf(root.name), missing = emptySet())
+        return PruneResult(
+            deleted = listOf(root.name),
+            missing = emptySet(),
+            deletedIds = setOf(root.id),
+            touchedFolderIds = setOf(root.parentId),
+        )
     }
 
-    val doomedIds = mutableListOf<String>()
+    val doomedIds = LinkedHashSet<String>()
+    val touchedFolders = LinkedHashSet<String>()
     val deleted = mutableListOf<String>()
     val found = mutableSetOf<String>()
 
@@ -62,12 +72,14 @@ suspend fun PikPakClient.pruneOfflineOutput(task: DriveTask, keep: Set<String>):
             when {
                 entry.isFolder && keep.none { it.startsWith("$path/") } -> {
                     doomedIds += entry.id
+                    touchedFolders += folderId
                     deleted += "$path/"
                 }
                 entry.isFolder -> walk(entry.id, path)
                 path in keep -> found += path
                 else -> {
                     doomedIds += entry.id
+                    touchedFolders += folderId
                     deleted += path
                 }
             }
@@ -75,6 +87,11 @@ suspend fun PikPakClient.pruneOfflineOutput(task: DriveTask, keep: Set<String>):
     }
     walk(task.fileId, "")
 
-    batchDelete(doomedIds)
-    return PruneResult(deleted = deleted, missing = keep - found)
+    batchDelete(doomedIds.toList())
+    return PruneResult(
+        deleted = deleted,
+        missing = keep - found,
+        deletedIds = doomedIds,
+        touchedFolderIds = touchedFolders,
+    )
 }

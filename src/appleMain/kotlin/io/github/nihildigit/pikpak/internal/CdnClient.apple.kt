@@ -22,3 +22,17 @@ internal actual fun defaultCdnHttpClient(perHostLimit: Int): HttpClient = HttpCl
     }
     expectSuccess = false
 }
+
+internal actual fun defaultApiHttpClient(perHostLimit: Int): HttpClient = HttpClient(Darwin) {
+    engine {
+        configureSession {
+            setHTTPMaximumConnectionsPerHost(perHostLimit.toLong())
+        }
+    }
+    install(HttpTimeout) {
+        connectTimeoutMillis = API_CONNECT_TIMEOUT_MS
+        requestTimeoutMillis = API_REQUEST_TIMEOUT_MS
+        socketTimeoutMillis = API_SOCKET_TIMEOUT_MS
+    }
+    expectSuccess = false
+}
