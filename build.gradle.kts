@@ -13,7 +13,7 @@ plugins {
 }
 
 group = "io.github.nihildigit"
-version = "2.4.2-SNAPSHOT"
+version = "2.5.0"
 
 @OptIn(ExperimentalKotlinGradlePluginApi::class)
 kotlin {
