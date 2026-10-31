@@ -250,13 +250,6 @@ class PikPakFileHandle(
         coroutineContext: CoroutineContext = EmptyCoroutineContext,
     ): PikPakFileCache {
         val length = streamSize()
-        link?.url?.let { rawUrl ->
-            client.warmHostIfCold(rawUrl)?.let { warm ->
-                if (kotlinx.coroutines.withTimeoutOrNull(900) { warm.await() } == null) {
-                    warm.cancel()
-                }
-            }
-        }
         val mediaBytesPerSecond = videoInfo?.let { video ->
             (video.bitRate / 8).takeIf { it > 0 }
                 ?: video.duration.takeIf { it > 0 }?.let { duration ->

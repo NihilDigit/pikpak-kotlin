@@ -153,7 +153,7 @@ class RangeStreamMockTest {
     // --- Content-Range missing ---
 
     @Test
-    fun `missing Content-Range leaves the range fields null`() = runBlocking {
+    fun `missing Content-Range is rejected before exposing the body`() = runBlocking<Unit> {
         val body = ByteArray(50) { it.toByte() }
 
         val client = clientWithCdnHandler { _ ->
@@ -164,14 +164,17 @@ class RangeStreamMockTest {
             )
         }
 
-        client.streamRangeFromUrl("https://cdn/file", start = 0L, length = 50L) { stream ->
-            assertEquals(null, stream.totalSize)
-            assertEquals(null, stream.rangeStart)
-            assertEquals(null, stream.rangeEndInclusive)
-            // contentLength comes from Content-Length header
-            assertEquals(50L, stream.contentLength)
+        var bodyExposed = false
+        try {
+            assertFailsWith<PikPakException> {
+                client.streamRangeFromUrl("https://cdn/file", start = 0L, length = 50L) {
+                    bodyExposed = true
+                }
+            }
+            assertEquals(false, bodyExposed)
+        } finally {
+            client.close()
         }
-        client.close()
     }
 
     // --- Content-Range with * total ---

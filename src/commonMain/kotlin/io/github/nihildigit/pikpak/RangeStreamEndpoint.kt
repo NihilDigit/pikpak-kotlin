@@ -98,13 +98,18 @@ public suspend fun <T> PikPakClient.streamRangeFromUrl(
         throw PikPakException(-1, "streamRangeFromUrl: length must be >= 1 when non-null, got $length")
     }
 
+    if (length != null && length - 1 > Long.MAX_VALUE - start) {
+        throw PikPakException(-1, "streamRangeFromUrl: range end overflows")
+    }
+
     val rangeHeader = if (length == null) {
         "bytes=$start-"
     } else {
         "bytes=$start-${start + length - 1}"
     }
 
-    return http.sendRaw(
+    return signedUrlGates.withSlot(url) {
+        http.sendRaw(
         method = HttpMethod.Get,
         url = url,
         configure = {
@@ -139,18 +144,30 @@ public suspend fun <T> PikPakClient.streamRangeFromUrl(
         }
 
         val parsed = parseContentRange(response.headers[HttpHeaders.ContentRange])
-        val rawContentLength = response.headers[HttpHeaders.ContentLength]?.toLongOrNull()?.takeIf { it >= 0L }
-        val derivedLength = parsed?.let { it.endInclusive - it.start + 1L }
+            ?: throw PikPakException(-1, "streamRangeFromUrl: missing or invalid Content-Range")
+        val derivedLength = parsed.endInclusive - parsed.start + 1L
+        val contentLengthHeader = response.headers[HttpHeaders.ContentLength]
+        val rawContentLength = contentLengthHeader?.toLongOrNull()
+        val requestedEnd = length?.let { start + it - 1 }
+        if (parsed.start != start ||
+            (requestedEnd != null && parsed.endInclusive > requestedEnd) ||
+            (requestedEnd != null && parsed.endInclusive < requestedEnd &&
+                parsed.totalSize != parsed.endInclusive + 1) ||
+            (contentLengthHeader != null && rawContentLength != derivedLength)
+        ) {
+            throw PikPakException(-1, "streamRangeFromUrl: response does not match requested range")
+        }
 
         block(
             RangeStream(
                 channel = response.bodyAsChannel(),
                 contentLength = rawContentLength ?: derivedLength,
-                totalSize = parsed?.totalSize,
-                rangeStart = parsed?.start,
-                rangeEndInclusive = parsed?.endInclusive,
+                totalSize = parsed.totalSize,
+                rangeStart = parsed.start,
+                rangeEndInclusive = parsed.endInclusive,
             ),
         )
+        }
     }
 }
 
@@ -167,7 +184,7 @@ private data class ContentRange(
  * or malformed; an unparseable header is not a range we can reason about.
  */
 private fun parseContentRange(header: String?): ContentRange? {
-    if (header == null) return null
+    if (header == null || !header.startsWith("bytes ")) return null
     val withoutPrefix = header.removePrefix("bytes ").trim()
     val slashIndex = withoutPrefix.indexOf('/')
     if (slashIndex < 0) return null
@@ -178,5 +195,7 @@ private fun parseContentRange(header: String?): ContentRange? {
     val start = rangePart.substring(0, dashIndex).toLongOrNull() ?: return null
     val end = rangePart.substring(dashIndex + 1).toLongOrNull() ?: return null
     val total = if (totalPart == "*") null else totalPart.toLongOrNull() ?: return null
+    if (start < 0 || end < start || end == Long.MAX_VALUE) return null
+    if (total != null && (total <= 0 || end >= total)) return null
     return ContentRange(start, end, total)
 }

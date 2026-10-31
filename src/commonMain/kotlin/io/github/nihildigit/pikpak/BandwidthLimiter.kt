@@ -18,12 +18,11 @@ import kotlin.time.TimeSource
  * and connections share one budget. Playback, ordinary prefetch and size probes do not acquire
  * download tokens. A cache cancels a waiting download reservation when playback needs it.
  *
- * Bytes are paid for before a block is requested, not while its body streams. Throttling the
- * body would hold a connection open and nearly idle, which is what the CDN's socket timeout and
- * the reader's own silence check both read as a dead connection; paying up front leaves no
- * connection open while it waits. The cost is granularity: a block arrives at the line's speed
- * and the next one waits, so over any stretch longer than a few blocks the rate holds, and
- * within one block it does not.
+ * Bytes are paid for at block boundaries. The first block is admitted before its request;
+ * later blocks of a long range can apply backpressure while that connection remains open.
+ * These consumer waits are excluded from network service-rate observations. A block arrives
+ * at the line's speed and the next one waits, so the ceiling holds over stretches longer
+ * than a few blocks rather than for each individual read.
  *
  * A token bucket that may go into debt. A request is granted once the balance is not negative
  * and then takes its whole size, so a block larger than a second's worth is still granted, and
@@ -35,11 +34,10 @@ import kotlin.time.TimeSource
  * sleeping too: it recomputes its wait against the new rate. Null lifts the limit and releases
  * every waiter.
  */
-class BandwidthLimiter internal constructor(
-    bytesPerSecond: Long?,
-    private val timeSource: TimeSource,
+class BandwidthLimiter(
+    bytesPerSecond: Long? = null,
+    private val timeSource: TimeSource = TimeSource.Monotonic,
 ) {
-    constructor(bytesPerSecond: Long? = null) : this(bytesPerSecond, TimeSource.Monotonic)
 
     private val rate = MutableStateFlow(bytesPerSecond.validated())
     private val mutex = Mutex()

@@ -7,6 +7,7 @@ import io.github.nihildigit.pikpak.internal.HostHealth
 import io.github.nihildigit.pikpak.internal.HttpEngine
 import io.github.nihildigit.pikpak.internal.PriorityGate
 import io.github.nihildigit.pikpak.internal.TransferScheduler
+import io.github.nihildigit.pikpak.internal.TransportMemoryBudget
 import io.github.nihildigit.pikpak.internal.defaultCdnHttpClient
 import io.ktor.client.HttpClient
 import kotlin.concurrent.Volatile
@@ -24,14 +25,12 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeMark
 import kotlin.time.TimeSource
-import io.ktor.utils.io.readAvailable
 import org.kotlincrypto.hash.md.MD5
 
 /**
@@ -89,6 +88,13 @@ class PikPakClient(
     steerEdgeHosts: Boolean = true,
     /** Shared download ceiling; pass the same limiter to clients that share one connection. */
     val downloadLimiter: BandwidthLimiter = BandwidthLimiter(),
+    /**
+     * Shared SDK-owned block, persistence-queue and known pump-page budget across this
+     * client's caches. HTTP engine/channel pools, socket buffers, caller buffers and
+     * arbitrary custom RangeSource allocations are outside this ownership budget.
+     */
+    transportMemoryBudgetBytes: Long = DEFAULT_TRANSPORT_MEMORY_BUDGET_BYTES,
+    internal val timeSource: TimeSource = TimeSource.Monotonic,
 ) {
     constructor(
         account: String,
@@ -103,6 +109,8 @@ class PikPakClient(
         domain: PikPakDomain = PikPakDomain.MYPIKPAK_COM,
         steerEdgeHosts: Boolean = true,
         downloadLimiter: BandwidthLimiter = BandwidthLimiter(),
+        transportMemoryBudgetBytes: Long = DEFAULT_TRANSPORT_MEMORY_BUDGET_BYTES,
+        timeSource: TimeSource = TimeSource.Monotonic,
     ) : this(
         account,
         { password },
@@ -116,6 +124,8 @@ class PikPakClient(
         domain,
         steerEdgeHosts,
         downloadLimiter,
+        transportMemoryBudgetBytes,
+        timeSource,
     )
 
     val deviceId: String = MD5().digest(account.encodeToByteArray()).toHex()
@@ -162,8 +172,26 @@ class PikPakClient(
      * independent per-file gates.
      */
     internal val accountGate = PriorityGate(accountConnectionBudget)
+    internal val signedUrlGates = io.github.nihildigit.pikpak.internal.SignedUrlGates()
 
-    internal val scheduler = TransferScheduler(accountConnectionBudget, connectionBudget, downloadLimiter)
+    internal val scheduler = TransferScheduler(accountConnectionBudget, connectionBudget, downloadLimiter, timeSource = timeSource)
+
+    internal val transportMemoryBudget = TransportMemoryBudget(transportMemoryBudgetBytes)
+
+    /** Current shared transport storage limit. */
+    val transportMemoryBudgetBytes: Long get() = transportMemoryBudget.budgetBytes
+
+    /** Bytes currently charged to the transport budget. */
+    val transportMemoryUsedBytes: Long get() = transportMemoryBudget.usedBytes
+
+    /** High water mark of charged transport storage for this client. */
+    val transportMemoryPeakBytes: Long get() = transportMemoryBudget.peakBytes
+
+    /**
+     * Adjusts the shared budget, for example after Android onTrimMemory.
+     * Existing borrowed buffers drain safely; new allocations wait for available credits.
+     */
+    fun setTransportMemoryBudgetBytes(bytes: Long) = transportMemoryBudget.setBudgetBytes(bytes)
 
     /** Download ceiling in bytes per second, or null for unlimited. Changes apply to active downloads. */
     var downloadBytesPerSecond: Long?
@@ -184,7 +212,7 @@ class PikPakClient(
     internal val foregroundStreams = ForegroundStreams()
 
     /** Edge hosts that failed or crawled recently, and the siblings reads may move to instead. */
-    internal val hostHealth = HostHealth(steering = steerEdgeHosts)
+    internal val hostHealth = HostHealth(steering = steerEdgeHosts, timeSource = timeSource)
 
     // Keyed by content and variant: a transcode's length is only learned by a probe, and it
     // cannot change while the content exists, whichever file object or link reaches it.
@@ -240,7 +268,6 @@ class PikPakClient(
 
     private val warmMutex = Mutex()
     private var folderWarmJob: Job? = null
-    private val inFlightHostWarms = MutableStateFlow<Map<String, Deferred<Unit>>>(emptyMap())
     private val prefetchedDetail = MutableStateFlow<PrefetchedDetail?>(null)
 
     internal fun invalidatePrefetchedDetail() {
@@ -264,43 +291,9 @@ class PikPakClient(
         }
     }
 
-    internal fun warmHostIfCold(rawUrl: String): Deferred<Unit>? {
-        if (!ownsCdnClient || rawUrl.isBlank()) return null
-        val targetUrl = hostHealth.route(rawUrl, mayExplore = false)
-        if (hostHealth.isWarm(targetUrl)) return null
-        val host = HostHealth.hostOf(targetUrl) ?: return null
-        while (true) {
-            val map = inFlightHostWarms.value
-            map[host]?.takeIf { it.isActive }?.let { return it }
-            lateinit var created: Deferred<Unit>
-            created = background.async(start = kotlinx.coroutines.CoroutineStart.LAZY) {
-                accountGate.acquire(PikPakStreamReader.BACKGROUND_READ_AHEAD_PRIORITY, Long.MAX_VALUE)
-                try {
-                    withTimeoutOrNull(900.milliseconds) {
-                        val t0 = TimeSource.Monotonic.markNow()
-                        hostHealth.onRequestStarted(targetUrl)
-                        streamRangeFromUrl(targetUrl, 0L, 1L) { stream ->
-                            hostHealth.answered(targetUrl, t0.elapsedNow())
-                            val buf = ByteArray(1)
-                            while (stream.channel.readAvailable(buf, 0, 1) != -1) {
-                                // drain 1 byte to EOF
-                            }
-                            hostHealth.onSocketReturned(targetUrl)
-                        }
-                    }
-                } catch (_: Throwable) {
-                } finally {
-                    accountGate.release()
-                    inFlightHostWarms.update { cur -> if (cur[host] === created) cur - host else cur }
-                }
-            }
-            if (inFlightHostWarms.compareAndSet(map, map + (host to created))) {
-                created.start()
-                return created
-            }
-            created.cancel()
-        }
-    }
+    // Demand owns connection admission. A speculative one-byte request would bypass
+    // the signed URL gate and can delay the first useful byte on high-latency edges.
+    internal fun warmHostIfCold(@Suppress("UNUSED_PARAMETER") rawUrl: String): Deferred<Unit>? = null
 
     internal fun onFolderListed(files: List<FileStat>, isFirstPage: Boolean) {
         if (!ownsCdnClient || !isFirstPage) return
@@ -319,7 +312,7 @@ class PikPakClient(
                     val detailDef = background.async {
                         withApiPriority(-10) { fetchFileDetailLive(candidate.id) }
                     }
-                    val entry = PrefetchedDetail(candidate.id, TimeSource.Monotonic.markNow(), detailDef)
+                    val entry = PrefetchedDetail(candidate.id, timeSource.markNow(), detailDef)
                     prefetchedDetail.value = entry
                     try {
                         val detail = detailDef.await()
@@ -393,6 +386,9 @@ class PikPakClient(
     }
 
     companion object {
+        /** Shared live block and persistence buffer budget, independent of declared HTTP range size. */
+        const val DEFAULT_TRANSPORT_MEMORY_BUDGET_BYTES: Long = 64L * 1024 * 1024
+
         /**
          * Concurrent connections one file reads over, and the default budget
          * of a [RangeReader].

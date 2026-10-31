@@ -49,6 +49,9 @@ class PikPakFileCache internal constructor(
      */
     val wastedBytes: Long get() = cache.wastedBytes
 
+    /** Updates the expected media consumption rate; null clears the external estimate. */
+    fun updateMediaBytesPerSecond(bytesPerSecond: Long?) = cache.updateMediaBytesPerSecond(bytesPerSecond)
+
     /**
      * Opens a read position over the file, for playing it.
      *
@@ -147,5 +150,7 @@ fun PikPakClient.fileCache(
         mediaBytesPerSecond = mediaBytesPerSecond,
         scheduler = scheduler,
         downloadLimiter = downloadLimiter,
+        memoryBudget = transportMemoryBudget,
+        timeSource = timeSource,
     ),
 )

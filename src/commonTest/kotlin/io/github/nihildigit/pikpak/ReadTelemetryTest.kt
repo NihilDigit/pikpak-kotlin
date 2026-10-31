@@ -24,6 +24,42 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
 class ReadTelemetryTest {
+    @Test
+    fun `stream progress is monotonic and clean steering remains trainable`() = runBlocking<Unit> {
+        val clock = kotlin.time.TestTimeSource()
+        val increments = mutableListOf<Long>()
+        val telemetry = ReadTelemetry(clock) { increments += it }
+        telemetry.attempts = 1
+        telemetry.rerouted = true
+        telemetry.recordBytes(4)
+        clock += 10.milliseconds
+        telemetry.recordBytes(7)
+        assertEquals(listOf(4L, 7L), increments)
+        assertEquals(11L, telemetry.deliveredBytes)
+        assertEquals(10.milliseconds, telemetry.elapsed)
+        assertTrue(telemetry.isClean)
+        telemetry.rightCensored = true
+        assertFalse(telemetry.isClean)
+    }
+
+    @Test
+    fun `attempt service rate excludes consumer blocking and cancellation is censored`() = runBlocking<Unit> {
+        val clock = kotlin.time.TestTimeSource()
+        val recorder = RangeAttemptRecorder(0, 200, 1, 0, 0, timeSource = clock)
+        clock += 10.milliseconds
+        recorder.record(100)
+        clock += 100.milliseconds
+        recorder.recordSinkWait(100.milliseconds)
+        clock += 10.milliseconds
+        recorder.record(100)
+        val sample = recorder.finish(RangeAttempt.Outcome.Cancelled)
+        assertEquals(20.milliseconds, sample.networkDuration)
+        assertEquals(20_000L, recorder.bodyBytesPerSecond())
+        assertEquals(20_000L, sample.bytesPerSecondAfterFirstByte)
+        assertTrue(sample.rightCensored)
+        assertEquals(200L, sample.timeline.sum())
+    }
+
     @Suppress("DEPRECATION")
     @Test
     fun `reader is its own source and nullable reads remain available`() = runBlocking<Unit> {

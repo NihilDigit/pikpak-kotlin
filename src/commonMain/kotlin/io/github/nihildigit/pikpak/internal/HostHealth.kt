@@ -36,11 +36,10 @@ import kotlin.time.TimeSource
  * signature got 403 and a host of the other family (`dl-a10b-*`) got 404. So [route] may send
  * an attempt to a sibling host, and does so in two cases only:
  *
- *  - the link's host has measured at least [SLOW_RATIO] times slower than a sibling that has
- *    itself delivered bytes on this account, or has gone silent; only a sibling with figures
- *    of its own is a destination;
- *  - a background or read-ahead attempt, at most one per [EXPLORE_INTERVAL] account-wide, may
- *    try a sibling not measured yet, until [EXPLORE_TARGET] hosts of the family have figures.
+ *  - a sibling's predicted latency plus body transfer time improves on the current host by
+ *    more than measured variation and setup cost, or the current host has gone silent;
+ *  - a background or read-ahead attempt may try an unmeasured sibling after a cooldown based
+ *    on measured completion cost and uncertainty, until [EXPLORE_TARGET] hosts have figures.
  *    Without this a single file never compares its host with anything. Playback's blocking
  *    reads never explore, since a sibling may turn out to be one of the slow ones.
  *
@@ -62,6 +61,7 @@ internal class HostHealth(
     private val answers = MutableStateFlow<Map<String, TimeMark>>(emptyMap())
     private val refusals = MutableStateFlow<Map<String, TimeMark>>(emptyMap())
     private val rates = MutableStateFlow<Map<String, List<RateSample>>>(emptyMap())
+    private val hostLatencies = MutableStateFlow<Map<String, List<LatencySample>>>(emptyMap())
 
     /** Host labels without the root domain, in the order links named them. Tried before [seedLabels]. */
     private val learned = MutableStateFlow<List<String>>(emptyList())
@@ -82,7 +82,11 @@ internal class HostHealth(
         val host = hostOf(url) ?: return
         answers.update { it + (host to timeSource.markNow()) }
         if (host in silences.value) silences.update { it - host }
-        if (after != null) recordLatency(after)
+        if (after != null) {
+            recordLatency(after)
+            val sample = LatencySample(after, timeSource.markNow())
+            hostLatencies.update { it + (host to (it[host].orEmpty() + sample).takeLast(MAX_SAMPLES)) }
+        }
         Edge.parse(url)?.let { edge ->
             lastClusterUrl.update { it + ("${edge.family}.${edge.root}" to url) }
         }
@@ -267,7 +271,7 @@ internal class HostHealth(
      * The URL an attempt on [url] should go to: [url] itself, or the same path and query on a
      * sibling host. [mayExplore] allows a sibling with no figures yet; see the class comment.
      */
-    fun route(url: String, mayExplore: Boolean): String {
+    fun route(url: String, mayExplore: Boolean, requestedBytes: Long = MIN_SAMPLE_BYTES): String {
         if (!steering) return url
         val edge = Edge.parse(url) ?: return url
         learn(edge.label)
@@ -275,13 +279,17 @@ internal class HostHealth(
         val clusterKey = "${edge.family}.${edge.root}"
         val siblings = siblingsOf(edge)
         val allCandidates = siblings + edge
+        val bytes = requestedBytes.coerceAtLeast(1)
         val best = siblings
             .filter { usable(it.host) }
-            .mapNotNull { sibling -> medianRate(sibling.host)?.let { sibling to it } }
-            .maxByOrNull { it.second }
+            .mapNotNull { sibling -> completionSeconds(sibling.host, bytes)?.let { sibling to it } }
+            .minByOrNull { it.second }
         if (best != null) {
-            val own = medianRate(edge.host)
-            val ownIsSlow = own != null && own * SLOW_RATIO < best.second
+            val own = completionSeconds(edge.host, bytes)
+            // Require a gain beyond observed variability and a fresh request's setup cost.
+            val ownIsSlow = own != null && own - best.second >
+                uncertaintySeconds(edge.host, bytes) + uncertaintySeconds(best.first.host, bytes) +
+                latencySeconds(best.first.host)
             if (ownIsSlow || isSilent(edge.host)) {
                 preferredByCluster.update { it + (clusterKey to best.first.label) }
                 return edge.rewrite(url, best.first)
@@ -302,15 +310,17 @@ internal class HostHealth(
             allCandidates.firstOrNull { it.label == label && usable(it.host) && medianRate(it.host) != null }
         }
         val preferredEdge = if (currentPreferred != null) {
-            val prefRate = medianRate(currentPreferred.host)!!
-            val beatenByBest = best != null && prefRate * SLOW_RATIO < best.second
+            val prefTime = completionSeconds(currentPreferred.host, bytes)!!
+            val beatenByBest = best != null && prefTime - best.second >
+                uncertaintySeconds(currentPreferred.host, bytes) + uncertaintySeconds(best.first.host, bytes) +
+                latencySeconds(best.first.host)
             if (!beatenByBest) currentPreferred else best.first
         } else {
             if (currentPreferredLabel != null) {
                 preferredByCluster.update { it - clusterKey }
             }
             allCandidates.firstOrNull { cand ->
-                usable(cand.host) && (medianRate(cand.host) ?: 0L) >= GOOD_RATE_BYTES_PER_SEC
+                usable(cand.host) && medianRate(cand.host) != null
             }
         }
         if (preferredEdge != null) {
@@ -324,8 +334,6 @@ internal class HostHealth(
         }
 
         if (!mayExplore) return url
-        val ownRate = medianRate(edge.host) ?: recentRates(edge.host).maxOrNull()
-        if (ownRate != null && ownRate >= GOOD_RATE_BYTES_PER_SEC) return url
         val measured = (siblings + edge).count { medianRate(it.host) != null }
         if (measured >= EXPLORE_TARGET) return url
         // A sibling half measured goes first, or every candidate would stop at one sample and
@@ -333,7 +341,16 @@ internal class HostHealth(
         val candidate = siblings
             .filter { usable(it.host) && recentRates(it.host).size < MIN_SAMPLES }
             .maxByOrNull { recentRates(it.host).size } ?: return url
-        if (!claimExploreSlot()) return url
+        // Exploration pays one estimated request. More uncertain paths justify earlier sampling;
+        // a stable measured path waits longer, regardless of its absolute throughput.
+        // A long download must not postpone its next observation for the entire
+        // declared range lifetime. Exploration needs only one committed sample.
+        val sampleBytes = minOf(bytes, MIN_SAMPLE_BYTES)
+        val expected = completionSeconds(edge.host, sampleBytes)
+        val uncertainty = uncertaintySeconds(edge.host, sampleBytes)
+        val cooldown = if (expected == null) EXPLORE_INTERVAL else
+            maxOf(EXPLORE_INTERVAL, (expected * (1.0 + expected / uncertainty.coerceAtLeast(expected / 4))).seconds)
+        if (!claimExploreSlot(cooldown)) return url
         return edge.rewrite(url, candidate)
     }
 
@@ -375,10 +392,26 @@ internal class HostHealth(
     private fun recentRates(host: String): List<Long> =
         rates.value[host].orEmpty().filter { it.at.elapsedNow() < memory }.map { it.bytesPerSecond }
 
-    private fun claimExploreSlot(): Boolean {
+    private fun latencySeconds(host: String): Double {
+        val waits = hostLatencies.value[host].orEmpty().filter { it.at.elapsedNow() < memory }
+            .map { it.wait.inWholeNanoseconds / 1e9 }.sorted()
+        return if (waits.isEmpty()) 0.0 else waits[(waits.size - 1) / 2]
+    }
+
+    private fun completionSeconds(host: String, bytes: Long): Double? =
+        medianRate(host)?.let { latencySeconds(host) + bytes.toDouble() / it }
+
+    private fun uncertaintySeconds(host: String, bytes: Long): Double {
+        val samples = recentRates(host)
+        if (samples.isEmpty()) return 0.0
+        val times = samples.map { bytes.toDouble() / it }
+        return (times.maxOrNull()!! - times.minOrNull()!!) / kotlin.math.sqrt(samples.size.toDouble())
+    }
+
+    private fun claimExploreSlot(cooldown: Duration): Boolean {
         while (true) {
             val last = lastExplore.value
-            if (last != null && last.elapsedNow() < EXPLORE_INTERVAL) return false
+            if (last != null && last.elapsedNow() < cooldown) return false
             if (lastExplore.compareAndSet(last, timeSource.markNow())) return true
         }
     }
@@ -447,11 +480,6 @@ internal class HostHealth(
         /** Short against [DEFAULT_MEMORY]: a proxy switched on or off changes the line within seconds. */
         val LATENCY_MEMORY: Duration = 2.minutes
 
-        /**
-         * The fast hosts measured within about 2x of each other and the slow ones 20–30x below
-         * them; four leaves the healthy spread alone and still catches the slow ones.
-         */
-        const val SLOW_RATIO = 4
         const val GOOD_RATE_BYTES_PER_SEC = 250L * 1024
         const val MAX_CONCURRENT_DRAINS = 2
 

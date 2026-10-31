@@ -415,6 +415,99 @@ class RangeReaderMockTest {
         client.close()
     }
 
+    @Test
+    fun `invalid range metadata is rejected before exposing a body`() = runBlocking<Unit> {
+        val invalid = listOf(
+            "bytes 1-3/4" to "3",
+            "bytes 0-3/4" to "3",
+            "bytes 0-2/2" to "3",
+            "items 0-2/3" to "3",
+            "bytes 0-1/*" to "2",
+            "bytes -1-2/3" to "4",
+            "bytes 0-2/3" to "invalid",
+        )
+        for ((range, length) in invalid) {
+            val client = clientWith {
+                respond(ByteReadChannel(byteArrayOf(1, 2, 3)), HttpStatusCode.PartialContent,
+                    Headers.build {
+                        append(HttpHeaders.ContentRange, range)
+                        append(HttpHeaders.ContentLength, length)
+                    })
+            }
+            try {
+                var entered = false
+                assertFailsWith<PikPakException> {
+                    client.streamRangeFromUrl("https://cdn/file", 0, 3) { entered = true }
+                }
+                assertFalse(entered, range)
+            } finally {
+                client.close()
+            }
+        }
+    }
+
+    @Test
+    fun `changed total on a resume cannot publish the replacement bytes`() = runBlocking<Unit> {
+        var calls = 0
+        val client = clientWith { req ->
+            calls++
+            val (from, to) = parseRange(req.headers[HttpHeaders.Range]!!)
+            respond(
+                ByteReadChannel(if (calls == 1) byteArrayOf(1) else byteArrayOf(2, 3)),
+                HttpStatusCode.PartialContent,
+                Headers.build {
+                    append(HttpHeaders.ContentRange, "bytes $from-$to/${if (calls == 1) 3 else 4}")
+                    append(HttpHeaders.ContentLength, (to - from + 1).toString())
+                },
+            )
+        }
+        try {
+            val reader = RangeReader(client, { "https://cdn/file" }, maxAttempts = 1)
+            assertFailsWith<PikPakException> { reader.readBytes(0, 3) }
+            assertEquals(1L, reader.stats.value.bytesRead)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun `independent readers share the signed URL ceiling`() = runBlocking<Unit> {
+        val release = CompletableDeferred<Unit>()
+        val eightStarted = CompletableDeferred<Unit>()
+        val counter = Mutex()
+        var active = 0
+        var peak = 0
+        val client = clientWith { req ->
+            counter.withLock {
+                active++
+                peak = maxOf(peak, active)
+                if (active == 8) eightStarted.complete(Unit)
+            }
+            try {
+                release.await()
+                partial(req, content)
+            } finally {
+                counter.withLock { active-- }
+            }
+        }
+        try {
+            withTimeout(5_000) {
+                val readers = List(2) { RangeReader(client, { "https://cdn/file?sign=shared" }, connectionBudget = 16) }
+                val reads = List(16) { i -> async { readers[i % 2].readBytes(0, 64) } }
+                eightStarted.await()
+                // Give every runnable request a chance to enter the engine before releasing it.
+                repeat(32) { kotlinx.coroutines.yield() }
+                assertEquals(8, peak)
+                release.complete(Unit)
+                reads.awaitAll()
+                assertEquals(8, peak)
+            }
+        } finally {
+            release.complete(Unit)
+            client.close()
+        }
+    }
+
     // --- helpers ---
 
     /** Serves like a real CDN: clips the range at EOF and answers 416 past it. */

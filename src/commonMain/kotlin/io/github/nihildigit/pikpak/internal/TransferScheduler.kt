@@ -2,6 +2,7 @@ package io.github.nihildigit.pikpak.internal
 
 import io.github.nihildigit.pikpak.BandwidthLimiter
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlin.math.ceil
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -12,7 +13,7 @@ internal class TransferScheduler(
     private val accountBudget: Int,
     private val connectionBudget: Int,
     private val downloadLimiter: BandwidthLimiter,
-    private val clock: TimeSource = TimeSource.Monotonic,
+    private val timeSource: TimeSource = TimeSource.Monotonic,
 ) {
     internal class Registration internal constructor(
         internal val connectionBudget: Int,
@@ -25,11 +26,12 @@ internal class TransferScheduler(
         val hungry: Boolean = false,
         val background: Boolean = false,
         val span: Int = 1,
-        val fastSamples: Int = 0,
+        val bodyRate: Double = 0.0,
+        val latency: Duration = Duration.ZERO,
         val spanSettled: Boolean = false,
         val workers: Int,
     )
-    private data class Sample(val at: Duration, val bytes: Long)
+    private data class Sample(val owner: Registration, val at: Duration, val bytes: Long)
     private data class Probe(
         val owner: Registration,
         val started: Duration,
@@ -40,12 +42,11 @@ internal class TransferScheduler(
     )
     private data class State(
         val caches: Map<Registration, CacheState> = emptyMap(),
-        val learnedSpan: Int = 1,
         val interactiveUntil: Duration = Duration.ZERO,
         val samples: List<Sample> = emptyList(),
         val probe: Probe? = null,
     )
-    private val origin = clock.markNow()
+    private val origin = timeSource.markNow()
     private val state = MutableStateFlow(State())
 
     private inline fun change(transform: (State) -> State) {
@@ -68,7 +69,7 @@ internal class TransferScheduler(
         onScheduleChanged: () -> Unit,
     ): Registration {
         val reg = Registration(connectionBudget.coerceAtLeast(1), blockSize.coerceAtLeast(1), onScheduleChanged)
-        change { it.copy(caches = it.caches + (reg to CacheState(span = it.learnedSpan.coerceIn(1, 4), workers = reg.connectionBudget))) }
+        change { it.copy(caches = it.caches + (reg to CacheState(workers = reg.connectionBudget))) }
         return reg
     }
 
@@ -96,7 +97,7 @@ internal class TransferScheduler(
 
     private fun workersFor(state: State, reg: Registration, durable: Boolean): Int {
         val own = state.caches[reg] ?: return 0
-        if (own.foreground && !durable) return reg.connectionBudget
+        if (own.foreground && !durable) return own.workers
         val backgrounds = state.caches.filterValues { it.background }
         val count = backgrounds.size.coerceAtLeast(1)
         val hungry = state.caches.values.any { it.hungry }
@@ -108,7 +109,7 @@ internal class TransferScheduler(
             else -> accountBudget
         }
         if (!foreground && !burst && !hungry && count >= 2) {
-            return (accountBudget / count).coerceIn(1, reg.connectionBudget)
+            return minOf(own.workers, (accountBudget / count).coerceIn(1, reg.connectionBudget))
         }
         // In capped pools distribute the remainder without exceeding the account ceiling.
         val index = backgrounds.keys.indexOf(reg).coerceAtLeast(0)
@@ -122,43 +123,57 @@ internal class TransferScheduler(
         val own = snapshot.caches[reg] ?: return 1
         val hungry = snapshot.caches.values.any { it.hungry }
         if (hungry && (!own.foreground || durable)) return 1
-        val workerCap = when {
-            workers <= 1 -> 16
-            workers <= 2 -> 8
-            else -> 4
-        }
-        val desired = own.span.coerceAtMost(workerCap)
-        val rate = downloadLimiter.bytesPerSecond ?: return desired
-        val slots = rate / workers.coerceAtLeast(1) / reg.blockSize
-        return SPANS.lastOrNull { it <= desired && it <= slots } ?: 1
+        val ceiling = if (durable) MAX_DURABLE_RANGE_BYTES else MAX_PLAYBACK_RANGE_BYTES
+        val limitedRate = downloadLimiter.bytesPerSecond?.takeIf { durable }
+            ?.toDouble()?.div(workers.coerceAtLeast(1))
+        val rate = limitedRate?.let { minOf(own.bodyRate, it) } ?: own.bodyRate
+        // 95% body duty cycle: S / r = 19 L. Range ownership is not a buffer reservation.
+        val bytes = rate * own.latency.inWholeNanoseconds / 1e9 * 19.0
+        return ceil(bytes.coerceIn(0.0, ceiling.toDouble()) / reg.blockSize)
+            .toInt().coerceAtLeast(1)
     }
 
-    /** Only complete clean network samples train spans; throughput includes every delivered byte. */
-    fun recordSample(reg: Registration, telemetry: ReadTelemetry, requestedBytes: Long, truncated: Boolean) {
+    /** Streaming byte deltas, never a request's accumulated bytes at completion. */
+    fun recordProgress(reg: Registration, bytes: Long) {
+        if (bytes <= 0) return
         val now = origin.elapsedNow()
         change { state ->
-            val own = state.caches[reg] ?: return@change state
-            val samples = state.samples.filter { now - it.at <= 4.seconds } +
-                if (telemetry.deliveredBytes > 0) listOf(Sample(now, telemetry.deliveredBytes)) else emptyList()
-            var next = own
-            val clean = telemetry.isClean && telemetry.deliveredBytes == requestedBytes && !truncated
-            if (clean) {
-                val ttfb = telemetry.timeToFirstByte ?: Duration.ZERO
-                val bodyDuration = (telemetry.networkDuration - ttfb).coerceAtLeast(Duration.ZERO)
-                val growCeiling = maxOf(600.milliseconds, ttfb * 2)
-                val shrinkFloor = maxOf(1600.milliseconds, ttfb * 4)
-                val highRttFloor = if (ttfb >= 80.milliseconds && bodyDuration <= 3200.milliseconds) 4 else 1
-                next = when {
-                    bodyDuration > shrinkFloor -> own.copy(span = maxOf(highRttFloor, own.span / 2), fastSamples = 0)
-                    own.span < highRttFloor -> own.copy(span = highRttFloor, fastSamples = 0)
-                    bodyDuration < growCeiling && requestedBytes >= own.span * reg.blockSize -> if (own.fastSamples >= 1)
-                        own.copy(span = minOf(16, own.span * 2), fastSamples = 0)
-                    else own.copy(fastSamples = own.fastSamples + 1)
-                    else -> own.copy(fastSamples = 0)
+            if (reg !in state.caches) return@change state
+            val recent = state.samples.filter { now - it.at <= 4.seconds }
+            val bucket = recent.indexOfLast { it.owner === reg && now - it.at < 100.milliseconds }
+            val samples = if (bucket < 0) recent + Sample(reg, now, bytes) else
+                recent.mapIndexed { index, sample -> if (index == bucket) sample.copy(bytes = sample.bytes + bytes) else sample }
+            var probe = state.probe
+            var caches = state.caches
+            if (probe != null && !probe.resolved && probe.owner === reg) {
+                probe = probe.copy(deliveredBytes = probe.deliveredBytes + bytes)
+                if (now - probe.started >= 2.seconds) {
+                    val measured = rate(probe.deliveredBytes, now - probe.started)
+                    val owner = caches[reg]!!
+                    val accepted = if (owner.workers < probe.previousWorkers)
+                        measured >= probe.baseline * 0.95 else measured >= probe.baseline * 1.05
+                    if (!accepted) caches = caches + (reg to owner.copy(workers = probe.previousWorkers))
+                    probe = probe.copy(resolved = true)
                 }
-                next = next.copy(spanSettled = bodyDuration in growCeiling..shrinkFloor ||
-                    (next.span == 16 && bodyDuration < growCeiling))
             }
+            state.copy(samples = samples, caches = caches, probe = probe)
+        }
+    }
+
+    /** Completed uncensored reads train the service model, including successful steering. */
+    fun recordSample(reg: Registration, telemetry: ReadTelemetry, requestedBytes: Long, truncated: Boolean) {
+        change { state ->
+            val own = state.caches[reg] ?: return@change state
+            val ttfb = telemetry.timeToFirstByte
+            val clean = telemetry.isClean && telemetry.deliveredBytes == requestedBytes && !truncated
+            val body = ttfb?.let { telemetry.networkDuration - it }
+            val next = if (clean && ttfb != null && body != null && body > Duration.ZERO) {
+                val measuredRate = requestedBytes.toDouble() / body.inWholeNanoseconds * 1e9
+                val bytes = measuredRate * ttfb.inWholeNanoseconds / 1e9 * 19.0
+                own.copy(bodyRate = measuredRate, latency = ttfb,
+                    span = ceil(bytes.coerceIn(0.0, MAX_DURABLE_RANGE_BYTES.toDouble()) / reg.blockSize)
+                        .toInt().coerceAtLeast(1), spanSettled = true)
+            } else own
             var caches = state.caches + (reg to next)
             var probe = state.probe
             if (probe?.owner === reg && !probe.resolved && next.span != own.span) {
@@ -166,22 +181,7 @@ internal class TransferScheduler(
                 caches = caches + (reg to next.copy(workers = probe.previousWorkers))
                 probe = probe.copy(resolved = true)
             }
-            if (probe != null && !probe.resolved) {
-                probe = probe.copy(deliveredBytes = probe.deliveredBytes + telemetry.deliveredBytes)
-                if (now - probe.started >= 2.seconds) {
-                    val measured = rate(probe.deliveredBytes, now - probe.started)
-                    val owner = caches[probe.owner]
-                    if (owner != null) {
-                        // A downward probe wins if it preserves throughput; an upward one must improve it.
-                        val accepted = if (owner.workers < probe.previousWorkers)
-                            measured >= probe.baseline * 0.95 else measured >= probe.baseline * 1.05
-                        if (!accepted) caches = caches + (probe.owner to owner.copy(workers = probe.previousWorkers))
-                    }
-                    // Retain ownership until finally releases it: an old owner cannot release a new probe.
-                    probe = probe.copy(resolved = true)
-                }
-            }
-            state.copy(caches = caches, learnedSpan = if (clean) next.span.coerceIn(1, 4) else state.learnedSpan, samples = samples, probe = probe)
+            state.copy(caches = caches, probe = probe)
         }
     }
 
@@ -190,9 +190,9 @@ internal class TransferScheduler(
         while (true) {
             val before = state.value
             val own = before.caches[reg] ?: return false
-            if (before.probe != null || before.caches.values.any { it.hungry } || !own.spanSettled || own.fastSamples != 0) return false
+            if (before.probe != null || before.caches.values.any { it.hungry } || !own.spanSettled) return false
             val now = origin.elapsedNow()
-            val samples = before.samples.filter { now - it.at <= 4.seconds }
+            val samples = before.samples.filter { it.owner === reg && now - it.at <= 4.seconds }
             if (samples.size < 2) return false
             val target = if (own.workers < reg.connectionBudget) own.workers + 1 else maxOf(1, own.workers - 1)
             if (target == own.workers) return false
@@ -223,6 +223,7 @@ internal class TransferScheduler(
 
     private companion object {
         const val SLOT_BYTES = 256L * 1024
-        val SPANS = listOf(1, 2, 4, 8, 16)
+        const val MAX_DURABLE_RANGE_BYTES = 1024L * 1024 * 1024
+        const val MAX_PLAYBACK_RANGE_BYTES = 32L * 1024 * 1024
     }
 }

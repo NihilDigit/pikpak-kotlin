@@ -344,9 +344,10 @@ class PikPakStreamReaderTest {
             first.readAheadLimit = unit * 4
             second.readAheadLimit = unit * 4
             val buffer = ByteArray(unit.toInt())
-            assertEquals(buffer.size, first.read(buffer, 0, buffer.size))
+            readExactly(first, buffer)
+            assertContentEquals(content.copyOfRange(0, buffer.size), buffer)
             second.seekTo(unit * 40)
-            assertEquals(buffer.size, second.read(buffer, 0, buffer.size))
+            readExactly(second, buffer)
             assertContentEquals(content.copyOfRange((unit * 40).toInt(), (unit * 41).toInt()), buffer)
             waitUntil("both windows are filled") {
                 first.readAheadDepthForTest() == unit * 4 && second.readAheadDepthForTest() == unit * 4
@@ -356,7 +357,7 @@ class PikPakStreamReaderTest {
             // What the first reader fetched is already there for the second
             val before = source.requests().size
             second.seekTo(unit)
-            assertEquals(buffer.size, second.read(buffer, 0, buffer.size))
+            readExactly(second, buffer)
             assertContentEquals(content.copyOfRange(unit.toInt(), (unit * 2).toInt()), buffer)
             assertTrue(source.requests().drop(before).none { it.start == unit }, "a cached block was fetched again")
         } finally {
@@ -506,7 +507,8 @@ class PikPakStreamReaderTest {
         try {
             val buffer = ByteArray(unit.toInt())
             repeat(4) { round ->
-                assertEquals(buffer.size, reader.read(buffer, 0, buffer.size), "short read in round $round")
+                readExactly(reader, buffer)
+                assertContentEquals(content.copyOfRange(round * buffer.size, (round + 1) * buffer.size), buffer)
             }
             waitUntil("read-ahead covers the whole window") { reader.readAheadDepthForTest() == window }
         } finally {
@@ -532,7 +534,8 @@ class PikPakStreamReaderTest {
 
         try {
             val buffer = ByteArray(unit.toInt())
-            assertEquals(buffer.size, reader.read(buffer, 0, buffer.size), "short read at the head")
+            readExactly(reader, buffer)
+            assertContentEquals(content.copyOfRange(0, buffer.size), buffer)
             waitUntil("read-ahead has filled the window") { reader.readAheadDepthForTest() == window }
             assertEquals(0, reader.wastedBytes, "nothing has been dropped yet")
 
@@ -542,7 +545,9 @@ class PikPakStreamReaderTest {
             // fetches that follow the seek, not by the seek itself.
             reader.seekTo(unit * 32)
             repeat(6) { round ->
-                assertEquals(buffer.size, reader.read(buffer, 0, buffer.size), "short read in round $round")
+                readExactly(reader, buffer)
+                val start = ((32 + round) * unit).toInt()
+                assertContentEquals(content.copyOfRange(start, start + buffer.size), buffer)
             }
             waitUntil("the abandoned blocks are evicted") { reader.wastedBytes > 0 }
 
@@ -695,6 +700,15 @@ class PikPakStreamReaderTest {
         } catch (e: PikPakException) {
             e
         }
+
+    private suspend fun readExactly(reader: PikPakStreamReader, buffer: ByteArray) = withTimeout(10.seconds) {
+        var filled = 0
+        while (filled < buffer.size) {
+            val count = reader.read(buffer, filled, buffer.size - filled)
+            assertTrue(count > 0, "stream ended before ${buffer.size} bytes were read")
+            filled += count
+        }
+    }
 
     private suspend fun waitUntil(what: String, timeoutMillis: Long = 20_000, condition: suspend () -> Boolean) {
         val deadline = TimeSource.Monotonic.markNow()

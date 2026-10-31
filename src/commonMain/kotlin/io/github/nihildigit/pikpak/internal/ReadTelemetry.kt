@@ -3,6 +3,7 @@ package io.github.nihildigit.pikpak.internal
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration
+import kotlin.time.TimeSource
 
 /**
  * Measurements for one read, installed by its caller and updated by RangeReader.
@@ -10,12 +11,28 @@ import kotlin.time.Duration
  * Use a fresh instance per read. The pump is its only writer after gate acquisition;
  * callers inspect it after the read has finished, including cancellation cleanup.
  */
-internal class ReadTelemetry : AbstractCoroutineContextElement(ReadTelemetry) {
+internal class ReadTelemetry(
+    timeSource: TimeSource = TimeSource.Monotonic,
+    private val onBytes: ((Long) -> Unit)? = null,
+) : AbstractCoroutineContextElement(ReadTelemetry) {
+    private val origin = timeSource.markNow()
+    val elapsed: Duration get() = origin.elapsedNow()
+
+    /** Consumer blocking is not evidence of slow network service. */
+    var sinkWait: Duration = Duration.ZERO
+    /** A stopped request only establishes a lower bound on completion time. */
+    var rightCensored: Boolean = false
+
+    fun recordBytes(bytes: Int) {
+        if (bytes <= 0) return
+        deliveredBytes += bytes
+        onBytes?.invoke(bytes.toLong())
+    }
     companion object Key : CoroutineContext.Key<ReadTelemetry>
 
     /** Time acquiring the file and account slots, including a cancelled wait. */
     var gateWait: Duration = Duration.ZERO
-    /** Pump lifetime after both gates, including URL lookup, backoff and consumer backpressure. */
+    /** Attempt lifetime excluding consumer backpressure; retries remain separately labelled. */
     var networkDuration: Duration = Duration.ZERO
     /** Pump start to the first positive body read, before writing to the consumer. */
     var timeToFirstByte: Duration? = null
@@ -32,5 +49,5 @@ internal class ReadTelemetry : AbstractCoroutineContextElement(ReadTelemetry) {
 
     val isClean: Boolean
         get() = attempts == 1 && retries == 0 && throttled == 0 &&
-            !refreshed && !rerouted && deliveredBytes > 0
+            !refreshed && !rightCensored && deliveredBytes > 0
 }

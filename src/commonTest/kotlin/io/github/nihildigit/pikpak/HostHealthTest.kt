@@ -59,7 +59,7 @@ class HostHealthTest {
         repeat(HostHealth.MIN_SAMPLES) { delivered(host, HostHealth.MIN_SAMPLE_BYTES, bytesPerSecond) }
 
     @Test
-    fun `a host far slower than a measured sibling is left for it and the healthy spread is not`() {
+    fun `measured completion benefit selects the faster sibling`() {
         val health = HostHealth(seeds = listOf("dl-z01a-0002", "dl-z01a-0003"))
         health.measure("dl-z01a-0001.mypikpak.com", 170_000)
         health.measure("dl-z01a-0002.mypikpak.com", 5_000_000)
@@ -67,7 +67,7 @@ class HostHealthTest {
 
         assertEquals("https://dl-z01a-0002.mypikpak.com/download/?fid=F&sign=S", health.route(link, mayExplore = false))
         val halfAsFast = "https://dl-z01a-0003.mypikpak.com/download/?fid=F&sign=S"
-        assertEquals(halfAsFast, health.route(halfAsFast, mayExplore = false))
+        assertEquals(link.replace("0001", "0002"), health.route(halfAsFast, mayExplore = false))
     }
 
     @Test
@@ -106,6 +106,32 @@ class HostHealthTest {
         health.measure("dl-z01a-0003.mypikpak.com", 3_000_000)
 
         assertEquals(link, health.route(link, mayExplore = true))
+    }
+
+    @Test
+    fun `steady moderate throughput still explores unknown siblings`() {
+        val time = TestTimeSource()
+        val health = HostHealth(timeSource = time, seeds = listOf("dl-z01a-0002"))
+        health.measure("dl-z01a-0001.mypikpak.com", 350 * 1024)
+        health.answered(link, 1350.milliseconds)
+        assertEquals(link.replace("0001", "0002"), health.route(link, true))
+        assertEquals(link, health.route(link, true))
+        time += 1.seconds
+        assertEquals(link, health.route(link, true))
+    }
+
+    @Test
+    fun `small requests prefer latency while large requests prefer body rate`() {
+        val health = HostHealth(seeds = listOf("dl-z01a-0002"))
+        val sibling = link.replace("0001", "0002")
+        health.measure("dl-z01a-0001.mypikpak.com", 1024 * 1024)
+        health.measure("dl-z01a-0002.mypikpak.com", 10 * 1024 * 1024)
+        repeat(2) {
+            health.answered(link, 50.milliseconds)
+            health.answered(sibling, 1350.milliseconds)
+        }
+        assertEquals(link, health.route(link, false, 64 * 1024))
+        assertEquals(sibling, health.route(link, false, 64 * 1024 * 1024))
     }
 
     @Test

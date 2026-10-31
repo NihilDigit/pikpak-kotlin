@@ -110,7 +110,12 @@ class RangeAttempt(
      * left for a fresh link, so consecutive attempts of one read can name different hosts.
      */
     val host: String? = null,
+    /** Consumer wait, excluded from network service measurements. */
+    val sinkWait: Duration = Duration.ZERO,
 ) {
+    val rightCensored: Boolean get() = outcome == Outcome.Cancelled
+    val networkDuration: Duration get() = (duration - sinkWait).coerceAtLeast(Duration.ZERO)
+
     /**
      * How the attempt ended. Everything but [Complete] and [Cancelled] means another
      * attempt followed.
@@ -154,7 +159,7 @@ class RangeAttempt(
     val bytesPerSecondAfterFirstByte: Long
         get() {
             val ttfb = timeToFirstByte ?: return 0
-            val body = duration - ttfb
+            val body = (networkDuration - ttfb).coerceAtLeast(Duration.ZERO)
             if (delivered <= 0) return 0
             return delivered * 1000 / body.inWholeMilliseconds.coerceAtLeast(1)
         }
@@ -212,6 +217,7 @@ internal class RangeAttemptRecorder(
     private val queuedReads: Int,
     private val priority: Int,
     val host: String? = null,
+    private val timeSource: TimeSource = TimeSource.Monotonic,
 ) {
     /**
      * Installed on the coroutine that issues this attempt's request, so the
@@ -220,7 +226,20 @@ internal class RangeAttemptRecorder(
      */
     val retries = AttemptRetries()
 
-    private val mark = TimeSource.Monotonic.markNow()
+    private var mark = timeSource.markNow()
+    private var admittedWait: Duration? = null
+    val admission = io.github.nihildigit.pikpak.internal.RangeAdmission {
+        admittedWait = mark.elapsedNow()
+        mark = timeSource.markNow()
+    }
+    val gateWait: Duration get() = admittedWait ?: mark.elapsedNow()
+    var sinkWait: Duration = Duration.ZERO
+        private set
+    private var sinkWaitAtLastByte: Duration = Duration.ZERO
+
+    fun recordSinkWait(duration: Duration) {
+        sinkWait += duration.coerceAtLeast(Duration.ZERO)
+    }
     private val timeline = LongArray(RangeAttempt.BUCKETS)
     private var headersAt: Duration? = null
     private var firstByteAt: Duration? = null
@@ -235,7 +254,7 @@ internal class RangeAttemptRecorder(
     fun bodyBytesPerSecond(): Long {
         val first = firstByteAt ?: return 0
         val last = lastByteAt ?: return 0
-        return delivered * 1000 / (last - first).inWholeMilliseconds.coerceAtLeast(1)
+        return delivered * 1000 / (last - first - sinkWaitAtLastByte).inWholeMilliseconds.coerceAtLeast(1)
     }
 
     /**
@@ -253,6 +272,7 @@ internal class RangeAttemptRecorder(
         val elapsed = mark.elapsedNow()
         if (firstByteAt == null) firstByteAt = elapsed
         lastByteAt = elapsed
+        sinkWaitAtLastByte = sinkWait
         delivered += bytes
         // The tail of an attempt longer than the array folds into the last slot
         // rather than being dropped, so the sum still reconciles with delivered.
@@ -278,5 +298,6 @@ internal class RangeAttemptRecorder(
         retriedTransport = retries.transport,
         retryBackoff = retries.waited,
         host = host,
+        sinkWait = sinkWait,
     )
 }

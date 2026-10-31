@@ -6,7 +6,6 @@ import kotlin.concurrent.Volatile
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration
 import kotlin.time.TimeMark
-import kotlin.time.TimeSource
 
 /**
  * Whether a [PikPakStreamReader] is what the user is watching now or is only
@@ -32,9 +31,9 @@ enum class StreamRole { FOREGROUND, BACKGROUND }
  *
  * The cache holds fixed-size blocks, evicted least-recently-used from outside
  * every reader's window, and fetches them over up to `concurrency` range
- * requests at once. One fetch covers a block from a start or a seek and two
- * once the stream has settled, so a cold open spreads over all connections
- * while a settled stream pays half the per-request latency.
+ * requests at once. HTTP ranges grow from observed first-byte cost and body
+ * throughput, independently of block storage. An active reader can consume an
+ * arrived prefix before its full block has been committed.
  *
  * The block a reader is blocked on is requested at a higher priority than
  * read-ahead, so it wins a contended connection slot both against this file's
@@ -180,6 +179,21 @@ class PikPakStreamReader internal constructor(
     val bytesRemaining: Long get() = (size - position).coerceAtLeast(0)
 
     /**
+     * Reports media already buffered by the player, independently of this byte cursor.
+     * Supply the media consumption rate when known; null preserves the cache estimate.
+     * A zero duration denotes an empty playback buffer and an immediate head deadline.
+     */
+    fun reportPlaybackBuffer(bufferedDuration: Duration, mediaBytesPerSecond: Long? = null) {
+        require(bufferedDuration >= Duration.ZERO && bufferedDuration.isFinite()) {
+            "bufferedDuration must be finite and non-negative"
+        }
+        require(mediaBytesPerSecond == null || mediaBytesPerSecond > 0) {
+            "mediaBytesPerSecond must be positive"
+        }
+        cache.reportPlaybackBuffer(cursor, bufferedDuration, mediaBytesPerSecond)
+    }
+
+    /**
      * Moves the read position. Cheap: nothing is fetched here. Fetches no
      * reader and no [prefetch] wants any more are cancelled rather than left
      * to finish — what the reader needs back is the connection.
@@ -188,7 +202,7 @@ class PikPakStreamReader internal constructor(
         require(position >= 0) { "position must be >= 0, got $position" }
         if (position == cursor.position) return
         seekTarget = position
-        seekMark = TimeSource.Monotonic.markNow()
+        seekMark = cache.timeSource.markNow()
         cache.seek(cursor, position)
     }
 
@@ -196,8 +210,9 @@ class PikPakStreamReader internal constructor(
      * Fills [buffer] from the current position and advances it.
      *
      * Returns the number of bytes written, which is at most one block's worth
-     * however large [length] is, or -1 at end of file. Suspends until the block
-     * under the read position is in hand, and throws if it cannot be fetched.
+     * however large [length] is, or -1 at end of file. May return a smaller
+     * arrived prefix without waiting for the rest of its block. Suspends until
+     * bytes at the read position arrive, and throws if they cannot be fetched.
      */
     suspend fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         val pos = cursor.position
@@ -260,11 +275,9 @@ class PikPakStreamReader internal constructor(
     // caller placing its own reads among these needs to name them.
     companion object {
         /**
-         * Cache and fetch granularity. A range request costs roughly 200 ms
-         * before its first byte, which at the ~0.2 MB/s one PikPak connection
-         * sustains is the time it takes to move 40 KiB, so a quarter of a
-         * megabyte keeps the latency a rounding error while still splitting a
-         * cold open across all eight connections.
+         * Cache and persistent-store commit granularity. HTTP request spans
+         * are independent and adapt to observed latency and throughput;
+         * blocking readers can consume an arrived prefix smaller than a block.
          */
         const val DEFAULT_BLOCK_SIZE: Long = 256L * 1024
 

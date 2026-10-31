@@ -1,6 +1,7 @@
 package io.github.nihildigit.pikpak
 
 import io.github.nihildigit.pikpak.internal.ForegroundStreams
+import io.github.nihildigit.pikpak.internal.TransportMemoryBudget
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -43,6 +44,7 @@ class PikPakFileCacheTest {
         foreground: ForegroundStreams? = null,
         foregroundIdle: Duration = BlockCache.FOREGROUND_IDLE,
         memoryCapBytes: Long = 2L * 1024 * 1024,
+        memoryBudget: TransportMemoryBudget? = null,
     ) = BlockCache(
         source = source,
         size = size,
@@ -56,6 +58,7 @@ class PikPakFileCacheTest {
         memoryCapBytes = memoryCapBytes,
         wideBlockThresholdBytes = unit * 2,
         foregroundIdle = foregroundIdle,
+        memoryBudget = memoryBudget,
     )
 
     /** Holds blocks by offset, answers [missing] from them, and can hold a write back or fail it. */
@@ -172,7 +175,8 @@ class PikPakFileCacheTest {
         val stream = files.openStream()
         try {
             val buffer = ByteArray(unit.toInt())
-            assertEquals(buffer.size, stream.read(buffer, 0, buffer.size))
+            readExactly(stream, buffer)
+            assertContentEquals(content.copyOfRange(0, buffer.size), buffer)
             waitUntil("the window is filled") { stream.readAheadDepthForTest() == unit * 4 }
             val fetched = source.requests().map { it.start }.toSet()
             val before = source.requests().size
@@ -196,24 +200,32 @@ class PikPakFileCacheTest {
         store.gate = CompletableDeferred()
         val source = FakeRangeSource(content)
         // The least memory one worker allows, so a seek evicts the window it leaves behind
-        val cache = cache(source, content.size.toLong(), store, concurrency = 1, memoryCapBytes = unit * 7)
+        val budget = TransportMemoryBudget(unit * 7)
+        val cache = cache(source, content.size.toLong(), store, concurrency = 1,
+            memoryCapBytes = unit * 7, memoryBudget = budget)
         val files = PikPakFileCache(cache)
         val stream = files.openStream()
         try {
             val buffer = ByteArray(16)
             assertEquals(buffer.size, stream.read(buffer, 0, buffer.size))
-            waitUntil("the window is filled") { stream.readAheadDepthForTest() == unit * 4 }
+            waitUntil("the first window is published") { cache.deliveredBytes == unit * 5 }
             val played = source.requests().map { it.start / unit }.toSet()
             stream.seekTo(unit * 20)
             assertEquals(buffer.size, stream.read(buffer, 0, buffer.size))
-            // Seven blocks of memory cannot hold both windows, so some of the first are gone
-            waitUntil("the second window is filled") { stream.readAheadDepthForTest() == unit * 4 }
+            // Evicted offers still own their arrays until disk accepts them. Seven credits
+            // cannot hold both windows, so the second window must backpressure here.
+            waitUntil("pending writes exhaust the budget") { budget.usedBytes == unit * 7 }
+            delay(200.milliseconds)
+            assertTrue(stream.readAheadDepthForTest() < unit * 4)
+            assertTrue(budget.peakBytes <= unit * 7)
             val before = source.requests().size
 
             val download = files.download()
             delay(200.milliseconds)
             store.gate.complete(Unit)
             withTimeout(10.seconds) { download.await() }
+            waitUntil("the second window resumes after disk drains") { stream.readAheadDepthForTest() == unit * 4 }
+            assertTrue(budget.peakBytes <= unit * 7)
 
             val again = source.requests().drop(before).filter { it.start / unit in played }
             assertTrue(again.isEmpty(), "blocks queued for the store were fetched again: $again")
@@ -258,11 +270,12 @@ class PikPakFileCacheTest {
         val stream = files.openStream()
         try {
             val buffer = ByteArray(unit.toInt())
-            assertEquals(buffer.size, stream.read(buffer, 0, buffer.size))
+            readExactly(stream, buffer)
+            assertContentEquals(content.copyOfRange(0, buffer.size), buffer)
             withTimeout(10.seconds) { assertFailsWith<PikPakException> { files.download().await() } }
 
             stream.seekTo(unit)
-            assertEquals(buffer.size, stream.read(buffer, 0, buffer.size), "a reader lost a block whose write failed")
+            readExactly(stream, buffer)
             assertContentEquals(content.copyOfRange(unit.toInt(), (unit * 2).toInt()), buffer)
         } finally {
             stream.close()
@@ -379,6 +392,15 @@ class PikPakFileCacheTest {
         } finally {
             stream.close()
             cache.close()
+        }
+    }
+
+    private suspend fun readExactly(stream: PikPakStreamReader, buffer: ByteArray) = withTimeout(10.seconds) {
+        var filled = 0
+        while (filled < buffer.size) {
+            val count = stream.read(buffer, filled, buffer.size - filled)
+            assertTrue(count > 0, "stream ended before ${buffer.size} bytes were read")
+            filled += count
         }
     }
 
