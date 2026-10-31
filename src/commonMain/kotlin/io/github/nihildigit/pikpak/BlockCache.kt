@@ -1186,12 +1186,24 @@ internal class BlockCache(
                 (downloadWant != null && !downloadsThrottled()) ||
                 streamWarm != null)
         }
-        val spanWorkers = if (downloadWant != null) minOf(durableLimit, localLimit) else activeWorkers()
+        val spanWorkers = (if (downloadWant != null) minOf(durableLimit, localLimit) else activeWorkers()).coerceAtLeast(1)
+        val fairShare = when {
+            downloadWant != null -> {
+                val remaining = (downloadWant.slots.size - downloadWant.next).coerceAtLeast(1).toLong()
+                ((remaining + spanWorkers - 1) / spanWorkers).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+            }
+            owner != null -> {
+                val win = windowOf(owner)
+                val winCount = (if (win.isEmpty()) 1 else (win.last - target + 1).coerceAtLeast(1)).toLong()
+                ((winCount + spanWorkers - 1) / spanWorkers).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+            }
+            else -> 2
+        }
         val maxSpan = when {
             tailDonor != null -> tailDonor.endSlot - target
             !mayWiden -> 1
             streamWarm != null -> 2
-            else -> registration?.let { scheduler!!.spanFor(it, spanWorkers, downloadWant != null) } ?: 2
+            else -> minOf(fairShare, registration?.let { scheduler!!.spanFor(it, spanWorkers, downloadWant != null) } ?: 2)
         }
         val windows = live.map(::windowOf)
         val outside = cache.keys.filter { slot -> slot !in persisting && windows.none { slot in it } }
