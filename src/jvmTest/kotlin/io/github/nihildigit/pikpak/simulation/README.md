@@ -1,4 +1,12 @@
-# 确定性传输验收
+# 确定性传输验收（仅限内存状态机回归，不代表真实网络吞吐）
+
+> **实测局限说明（2026-10-31 真实多地域节点验证）**：
+> 本目录的模拟矩阵**不能证明真实跨国链路上的吞吐表现**，对高 RTT 代理节点的速度优化基本没有指导作用：
+> 1. `VirtualNetwork` 假设服务端窗口上限为 `8 MiB`，而真实 PikPak `dl-z01a` 全集群（22 台存活节点，含原 `0053/0054`）均在服务端内核锁死 **`64 KiB` TCP 发送窗口**（相差 128 倍）。高 RTT 下单连接物理上限被 `64 KiB / RTT` 焊死，模拟器中靠扩块在 `RTT=200ms` 跑出 `120+ MB/s` 的结论在真实网络中完全不成立。
+> 2. `degradedEdgeFindsSibling` 手工喂入 `125 MB/s` 同族节点，不符合真实 `FileDetail.medias` 跨簇（`dl-a10b`）及同簇 `43~346 KiB/s` 连续劣化分布。
+> 3. 未覆盖跨洋代理 TLS 冷握手（`1.4~3.2s`）、突发重传抖动触发 `BodySilence` 连环换冷主机、运行中途切换代理节点后的旧样本残留，以及单文件受单签名 URL 8 连接限制而闲置一半账号连接预算的瓶颈。
+>
+> 因此这套测试仅用于回归校验 `BlockCache` / `RangeReader` 的字节拼接完整性、内存上限与 8 连接门禁不越界；性能判断一律以真实多节点联调日志为准。
 
 `TransportSimulationTest`（文件 `TransportSloTest.kt`）将真实 `BlockCache`、账号 `TransferScheduler`、`RangeReader`、`HostHealth` 接到流式 Ktor MockEngine。测试未替换控制器。生产组件与网络、磁盘均使用同一 `TestCoroutineScheduler` 时钟。所有吞吐场景的 SDK 缓冲预算为 16 MiB。
 

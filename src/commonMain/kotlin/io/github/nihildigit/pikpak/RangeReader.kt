@@ -1,5 +1,6 @@
 package io.github.nihildigit.pikpak
 
+import io.github.nihildigit.pikpak.internal.FileReactivationCoordinator
 import io.github.nihildigit.pikpak.internal.HostHealth
 import io.github.nihildigit.pikpak.internal.PriorityGate
 import io.github.nihildigit.pikpak.internal.ReadTelemetry
@@ -29,6 +30,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -143,6 +145,8 @@ class RangeReader internal constructor(
      */
     private val onAttempt: ((RangeAttempt) -> Unit)? = null,
     private val timeSource: TimeSource = client.timeSource,
+    private val coordinator: FileReactivationCoordinator = FileReactivationCoordinator(client),
+    private val onBodyProgress: (suspend (Duration, Long) -> Unit)? = null,
 ) : RangeSource, AutoCloseable {
 
     constructor(
@@ -225,6 +229,7 @@ class RangeReader internal constructor(
                         withTimeoutOrNull(50.milliseconds) { pump.join() }
                     }
                     failure.cause?.let { throw it }
+                    channel.closedCause?.let { throw it }
                     result
                 } catch (t: Throwable) {
                     val cause = failure.cause
@@ -269,6 +274,8 @@ class RangeReader internal constructor(
     private class UnresponsiveHost(val limit: Duration) : Exception("no response headers within $limit")
 
     /** Headers arrived, then the body delivered nothing for [limit] after [afterBytes]. */
+    private class SinkFailure(val original: Throwable) : Exception("consumer channel failed", original)
+
     private class BodySilence(val limit: Duration, val afterBytes: Long) :
         Exception("stream went silent for $limit after $afterBytes bytes")
 
@@ -348,8 +355,9 @@ class RangeReader internal constructor(
         } catch (t: Throwable) {
             // Record before cancelling: the reader wakes up the moment the
             // channel dies and must find the reason already there.
-            if (t !is CancellationException) failure.cause = t
-            sink.cancel(t)
+            if (t is SinkFailure) failure.cause = t.original
+            else if (t !is CancellationException) failure.cause = t
+            sink.cancel(failure.cause ?: t)
             if (t is CancellationException) throw t
         }
     }
@@ -374,13 +382,14 @@ class RangeReader internal constructor(
             // The link is what refreshes and expiry are about; the attempt may go to a sibling
             // host with the same path and signature, see HostHealth.route. Every refresh below
             // is keyed on linkUrl, so a reroute never looks like a changed link.
+            val observedGeneration = coordinator.generation
             val linkUrl = currentUrl()
             val started = telemetry?.let { timeSource.markNow() }
             // A reader parked on the block is not the place to try an unproven host, whether or not
             // its caller called it urgent: a player filling its buffer still stops if that block is late
             val mayExplore = priority < PikPakStreamReader.READ_AHEAD_PRIORITY ||
                 (priority < PikPakStreamReader.STREAMING_PRIORITY && offset >= EXPLORE_MIN_OFFSET_BYTES)
-            val routedUrl = client.hostHealth.route(linkUrl, mayExplore = mayExplore, requestedBytes = remaining ?: HostHealth.MIN_SAMPLE_BYTES)
+            val routedUrl = client.hostHealth.route(linkUrl, mayExplore = mayExplore, requestedBytes = remaining ?: HostHealth.MIN_SAMPLE_BYTES, priority = priority)
             val routedHost = HostHealth.hostOf(routedUrl)
             val attemptUrl = if (routedHost != null && routedHost in failedReroutes) linkUrl else routedUrl
             val rerouted = attemptUrl != linkUrl
@@ -439,12 +448,13 @@ class RangeReader internal constructor(
                         val buffer = ByteArray(READ_CHUNK)
                         var firstByteAt: TimeMark? = null
                         while (true) {
+                            val silenceLimit = tailSilenceDeadline(bodySilence, delivered, announced)
                             val n = try {
-                                withTimeout(bodySilence) {
+                                withTimeout(silenceLimit) {
                                     stream.channel.readAvailable(buffer, 0, buffer.size)
                                 }
                             } catch (e: TimeoutCancellationException) {
-                                throw BodySilence(bodySilence, delivered)
+                                throw BodySilence(silenceLimit, delivered)
                             }
                             if (n == -1) {
                                 client.hostHealth.onSocketReturned(attemptUrl)
@@ -463,14 +473,18 @@ class RangeReader internal constructor(
                                 addBytes(n.toLong())
                                 delivered += n
                                 state.delivered = delivered
-                                if (!sink.isClosedForWrite) {
+                                if (!state.draining) {
                                     val sinkStarted = timeSource.markNow()
                                     try {
+                                        if (sink.isClosedForWrite) throw sink.closedCause
+                                            ?: IllegalStateException("consumer channel closed before draining")
                                         sink.writeFully(buffer, 0, n)
                                         sink.flush()
                                     } catch (e: CancellationException) {
+                                        if (!state.draining && currentCoroutineContext().isActive) throw SinkFailure(e)
                                         throw e
-                                    } catch (_: Throwable) {
+                                    } catch (t: Throwable) {
+                                        if (!state.draining) throw SinkFailure(t)
                                     } finally {
                                         val waited = sinkStarted.elapsedNow()
                                         attempt.recordSinkWait(waited)
@@ -482,7 +496,9 @@ class RangeReader internal constructor(
                                 // healthy sibling is already proven on this cluster.
                                 val expectedRemaining = remaining
                                 val bodyElapsed = (firstByteAt.elapsedNow() - attempt.sinkWait).coerceAtLeast(Duration.ZERO)
-                                if (bodyElapsed >= bodySilence &&
+                                if (announced == null || delivered < announced!!)
+                                    onBodyProgress?.invoke(bodyElapsed, attempt.bodyBytesPerSecond())
+                                if (bodyElapsed >= silenceLimit &&
                                     (expectedRemaining == null || delivered < expectedRemaining) &&
                                     attempt.bodyBytesPerSecond() in 1 until MIN_VIABLE_BODY_BYTES_PER_SEC &&
                                     client.hostHealth.hasHealthySibling(attemptUrl)
@@ -513,8 +529,19 @@ class RangeReader internal constructor(
                     report(attempt, if (whole) RangeAttempt.Outcome.Complete else RangeAttempt.Outcome.Cancelled)
                     throw t
                 }
+                if (t is SinkFailure) {
+                    report(attempt, RangeAttempt.Outcome.Cancelled)
+                    throw t
+                }
                 offset += delivered
                 remaining = remaining?.minus(delivered)
+
+                if (t is FileReactivatingException) {
+                    coordinator.awaitReady(observedGeneration, linkUrl) {
+                        refreshUrl(UrlRequest.Expired(it), it)
+                    }
+                    continue
+                }
 
                 val throttled = t is PikPakException && t.httpStatus == 503
                 if (state.draining) return
@@ -631,8 +658,19 @@ class RangeReader internal constructor(
         }
     }
 
+    private var initialFailure: Pair<Throwable, TimeMark>? = null
+
     private suspend fun currentUrl(): String = urlMutex.withLock {
-        url ?: urlProvider(UrlRequest.Initial).also { url = it }
+        url?.let { return it }
+        initialFailure?.let { (cause, at) ->
+            if (at.elapsedNow() < 2.seconds) throw cause
+        }
+        try {
+            urlProvider(UrlRequest.Initial).also { url = it; initialFailure = null }
+        } catch (t: Throwable) {
+            if (t !is CancellationException) initialFailure = t to timeSource.markNow()
+            throw t
+        }
     }
 
     /**
@@ -788,6 +826,12 @@ class RangeReader internal constructor(
         (THROTTLE_BASE_DELAY_MS * attempt).coerceAtMost(THROTTLE_MAX_DELAY_MS).milliseconds
 
     internal companion object {
+        internal fun tailSilenceDeadline(base: Duration, delivered: Long, announced: Long?): Duration =
+            if (delivered > 0 && announced != null && announced > 0 &&
+                (announced - delivered <= 64 * 1024 || delivered.toDouble() / announced >= 0.8))
+                (base * 2).coerceAtMost(HostHealth.MAX_DEADLINE)
+            else base
+
         const val READ_CHUNK = 64 * 1024
 
         /**

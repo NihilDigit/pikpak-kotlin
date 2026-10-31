@@ -84,6 +84,14 @@ class UrlExpiredException(
     rawBody = rawBody,
 )
 
+/** The CDN is waking a cold archived file. This is not a host or signature failure. */
+class FileReactivatingException(
+    message: String = "file is being reactivated from cold storage",
+    httpStatus: Int? = null,
+    headers: Map<String, List<String>> = emptyMap(),
+    cause: Throwable? = null,
+) : PikPakException(-1, message, httpStatus = httpStatus, headers = headers, cause = cause)
+
 /**
  * [instantCreate] found that PikPak does not hold the content behind [gcid]:
  * the server answered with a [phase] other than complete, waiting for bytes a

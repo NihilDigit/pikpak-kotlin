@@ -23,16 +23,22 @@ internal class SignedUrlGates {
         var users = 0
     }
 
+    companion object {
+        fun identityOf(url: String): String {
+            val pathAndQuery = url.substringAfter("://").substringAfter('/', "").substringBefore('#')
+            val path = pathAndQuery.substringBefore('?')
+            val query = pathAndQuery.substringAfter('?', "").split('&').sorted().joinToString("&")
+            return "$path?$query"
+        }
+    }
+
     private val mutex = Mutex()
     private val entries = mutableMapOf<String, Entry>()
 
     suspend fun <T> withSlot(url: String, block: suspend () -> T): T {
         // Host steering preserves path and signature. Conservatively sharing identical paths
         // and queries across unrelated hosts is safe; host changes must never create quota.
-        val pathAndQuery = url.substringAfter("://").substringAfter('/', "").substringBefore('#')
-        val path = pathAndQuery.substringBefore('?')
-        val query = pathAndQuery.substringAfter('?', "").split('&').sorted().joinToString("&")
-        val identity = "$path?$query"
+        val identity = identityOf(url)
         val entry = mutex.withLock {
             entries.getOrPut(identity) { Entry() }.also { it.users++ }
         }

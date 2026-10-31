@@ -212,7 +212,7 @@ class PikPakStreamReaderTest {
     }
 
     @Test
-    fun `a seek cancels the blocks it left behind and restarts at one block`() = runBlocking<Unit> {
+    fun `a seek cancels the blocks it left behind and restarts at a two-slot head`() = runBlocking<Unit> {
         val content = payload(8 * 1024 * 1024)
         // Long enough that nothing completes on its own during the test, so
         // what the assertions see is the schedule and not a race with it.
@@ -231,7 +231,7 @@ class PikPakStreamReaderTest {
             // the cancellations leaves the reissue racing the assertions —
             // which held on the JVM and did not on Kotlin/Native.
             waitUntil("the abandoned blocks are cancelled and the seek reissued") {
-                source.cancelled().size >= before && source.requests().size > before
+                source.cancelled().size >= before && source.requests().drop(before).any { it.start == target }
             }
 
             assertTrue(
@@ -249,14 +249,14 @@ class PikPakStreamReaderTest {
             // rather than to be the first of them.
             val atTarget = afterSeek.firstOrNull { it.start == target }
             assertTrue(atTarget != null, "the block the reader is blocked on was never requested: $afterSeek")
-            assertEquals(unit, atTarget.length, "a seek falls back to single-block requests")
+            assertEquals(unit * 2, atTarget.length, "a seek restarts with the bounded two-slot head request")
         } finally {
             reader.close()
         }
     }
 
     @Test
-    fun `blocks double in size once the near read-ahead is in hand`() = runBlocking<Unit> {
+    fun `requests widen from two to four slots farther ahead of the read position`() = runBlocking<Unit> {
         val content = payload(2 * 1024 * 1024)
         val source = FakeRangeSource(content)
         // One connection makes the request order deterministic, which is what
@@ -266,20 +266,20 @@ class PikPakStreamReaderTest {
         try {
             val buffer = ByteArray(1)
             reader.read(buffer, 0, 1)
-            waitUntil("enough blocks have been requested") { source.requests().size >= 8 }
+            waitUntil("the head and distance-based read-ahead have been requested") { source.requests().size >= 4 }
 
-            val lengths = source.requests().take(8).map { it.length }
-            // The threshold is four blocks' worth ahead of the read position,
-            // and the read position sits inside the first block, so covering
-            // it takes either four blocks or five. What matters is that the
-            // switch happens after the threshold and never reverts.
-            assertEquals(List(4) { unit }, lengths.take(4), "the first blocks must be single: $lengths")
-            assertEquals(unit * 2, lengths.last(), "blocks never doubled: $lengths")
-            val firstDouble = lengths.indexOfFirst { it == unit * 2 }
-            assertTrue(
-                lengths.drop(firstDouble).all { it == unit * 2 },
-                "a single block reappeared after the switch: $lengths",
+            val issued = source.requests().take(4)
+            // Reading one byte keeps the cursor in slot zero. The head and
+            // distance-two request each cover two slots; distance four widens
+            // to four slots and distance eight keeps that width. Assert offsets
+            // too so gaps or overlapping requests cannot satisfy the size check.
+            assertEquals(listOf(0L, unit * 2, unit * 4, unit * 8), issued.map { it.start })
+            assertEquals(
+                listOf(unit * 2, unit * 2, unit * 4, unit * 4),
+                issued.map { it.length },
+                "requests must widen with distance without reverting: $issued",
             )
+            assertEquals(content[0], buffer[0], "the head returned the wrong byte")
         } finally {
             reader.close()
         }
@@ -291,7 +291,10 @@ class PikPakStreamReaderTest {
         // In production the link refresh happens inside RangeReader, below this
         // class; what is exercised here is that the stream reader gives it the
         // second attempt to do it in.
-        val source = FakeRangeSource(content, failFirstAttemptAt = setOf(unit))
+        // The cold head covers slots zero and one, so fail the next request
+        // boundary rather than an offset now served inside the head request.
+        val failedOffset = unit * 2
+        val source = FakeRangeSource(content, failFirstAttemptAt = setOf(failedOffset))
         val reader = reader(source, content.size.toLong(), concurrency = 1)
 
         try {
@@ -300,14 +303,17 @@ class PikPakStreamReaderTest {
             reader.close()
         }
 
-        assertEquals(2, source.requests().count { it.start == unit }, "the failed block was not retried")
+        assertEquals(2, source.requests().count { it.start == failedOffset }, "the failed block was not retried")
     }
 
     // A dead block used to condemn the whole reader and its cache with it, so callers rebuilt readers and fetched everything again
     @Test
     fun `a block that never succeeds fails its reads and leaves the reader usable`() = runBlocking<Unit> {
         val content = payload((unit * 4).toInt())
-        val source = FakeRangeSource(content, failAlwaysAt = setOf(unit))
+        // Keep the healthy two-slot head separate from the permanently failed
+        // request, so seeking back proves failure did not poison cached data.
+        val failedOffset = unit * 2
+        val source = FakeRangeSource(content, failAlwaysAt = setOf(failedOffset))
         val reader = reader(source, content.size.toLong(), concurrency = 1)
 
         try {
@@ -315,10 +321,12 @@ class PikPakStreamReaderTest {
                 pikPakFailureOf { readAll(reader, chunk = 4096) },
                 "a block that can never be fetched let the read through",
             )
-            val attemptsBefore = source.requests().count { it.start == unit }
+            assertEquals(failedOffset, reader.position, "the read did not stop at the failed range")
+            val attemptsBefore = source.requests().count { it.start == failedOffset }
+            assertTrue(attemptsBefore > 1, "the failing range was not retried before failing the read")
             assertNotNull(pikPakFailureOf { reader.read(ByteArray(16), 0, 16) }, "the dead block read back as data")
             assertTrue(
-                source.requests().count { it.start == unit } > attemptsBefore,
+                source.requests().count { it.start == failedOffset } > attemptsBefore,
                 "a later read of the failed block did not try it again",
             )
 

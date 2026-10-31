@@ -13,6 +13,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -165,10 +166,10 @@ class CaptchaRetryMockTest {
                 path.endsWith("/drive/v1/about") -> {
                     val token = request.headers["X-Captcha-Token"]
                     if (token == "CAPTCHA-1") {
-                        if (firstArrived.isCompleted) bothArrived.complete(Unit) else {
-                            firstArrived.complete(Unit)
-                            bothArrived.await()
-                        }
+                        // complete atomically elects the first arrival; checking isCompleted
+                        // first lets both handlers elect themselves and wait forever.
+                        if (!firstArrived.complete(Unit)) bothArrived.complete(Unit)
+                        bothArrived.await()
                         json("""{"error_code":9,"error":"captcha_required"}""")
                     } else {
                         json("""{"kind":"drive#about","quota":{"limit":"10","usage":"1"}}""")
@@ -189,17 +190,23 @@ class CaptchaRetryMockTest {
             httpClient = HttpClient(engine),
         )
         try {
-            client.login()
-            assertEquals("CAPTCHA-1", client.state.captchaToken)
+            withTimeout(10_000) {
+                client.login()
+                assertEquals("CAPTCHA-1", client.state.captchaToken)
 
-            val results = listOf(async { client.getQuota() }, async { client.getQuota() }).awaitAll()
-            assertTrue(results.all { it.quota.limitBytes == 10L }, "both callers must get the retried response")
+                val results = listOf(async { client.getQuota() }, async { client.getQuota() }).awaitAll()
+                assertTrue(results.all { it.quota.limitBytes == 10L }, "both callers must get the retried response")
 
-            assertEquals(
-                2, log.count { it.endsWith("/v1/shield/captcha/init") },
-                "one init at signin plus one shared refresh — not one refresh per coroutine",
-            )
-            assertEquals("CAPTCHA-2", client.state.captchaToken)
+                assertEquals(
+                    2, log.count { it.endsWith("/v1/shield/captcha/init") },
+                    "one init at signin plus one shared refresh — not one refresh per coroutine",
+                )
+                assertEquals(
+                    4, log.count { it == "GET /drive/v1/about" },
+                    "both stale requests must be rejected and retried exactly once",
+                )
+                assertEquals("CAPTCHA-2", client.state.captchaToken)
+            }
         } finally {
             client.close()
         }

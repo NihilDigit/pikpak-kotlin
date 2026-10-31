@@ -1,5 +1,6 @@
 package io.github.nihildigit.pikpak
 
+import io.github.nihildigit.pikpak.internal.AdaptiveRangeSource
 import io.github.nihildigit.pikpak.internal.ForegroundStreams
 import io.github.nihildigit.pikpak.internal.RequestOrder
 import io.github.nihildigit.pikpak.internal.ReadTelemetry
@@ -21,6 +22,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
@@ -104,7 +106,10 @@ internal class BlockCache(
     @Volatile private var mediaBytesPerSecond: Long? = null,
     internal val timeSource: TimeSource = TimeSource.Monotonic,
     memoryBudget: TransportMemoryBudget? = null,
+    /** Live admission ceiling; [concurrency] remains the pre-created worker hard limit. */
+    private val workerLimit: () -> Int = { concurrency },
 ) {
+    private val adaptiveSource = source as? AdaptiveRangeSource
     private val memoryBudget = memoryBudget ?: TransportMemoryBudget(memoryCapBytes)
     private val owned = HashMap<ByteArray, Long>()
     private val durableWrites = Channel<PersistTask>(1)
@@ -152,6 +157,7 @@ internal class BlockCache(
     private var pendingPersistBytes = 0L
     private var hungry = false
     private var wasAccountHungry = false
+    @Volatile private var hasSpanSample = false
     private val registration by lazy { scheduler?.register(concurrency, blockSize, ::bump) }
 
     /**
@@ -375,6 +381,7 @@ internal class BlockCache(
         // on a revision nobody will bump again.
         scope.coroutineContext.job.invokeOnCompletion {
             closed = true
+            adaptiveSource?.updateConnectionAllowance(0)
             registration?.let { scheduler?.unregister(it) }
             syncForegroundCount()
             bump()
@@ -409,6 +416,16 @@ internal class BlockCache(
                         persist(durableStore(), task)
                     }
                 }
+            }
+        }
+        // Scheduler callbacks only bump revision. Reconcile under the cache lock rather
+        // than re-entering scheduler.update or the lazy registration from its callback.
+        if (adaptiveSource != null) {
+            scope.launch {
+                revision.collect { locked { updateSchedule(liveCursors()) } }
+            }
+            scope.launch {
+                adaptiveSource.connectionLimit.collect { workerLimitChanged() }
             }
         }
         repeat(concurrency) { index -> scope.launch { runWorker(index) } }
@@ -786,6 +803,7 @@ internal class BlockCache(
     fun close() {
         if (closed) return
         closed = true
+        adaptiveSource?.updateConnectionAllowance(0)
         registration?.let { scheduler?.unregister(it) }
         syncForegroundCount()
         scope.cancel()
@@ -872,8 +890,15 @@ internal class BlockCache(
     private fun downloadsThrottled(): Boolean =
         hasForegroundDemand() || (foregroundStreams?.active?.value ?: 0) > 0
 
-    private fun activeWorkers(): Int = registration?.let { scheduler!!.workersFor(it, false) }
-        ?: if (throttled()) minOf(concurrency, PikPakStreamReader.BACKGROUND_WORKERS_WHILE_FOREGROUND) else concurrency
+    /** Wakes parked workers after the caller changes the live limit; active reads drain normally. */
+    fun workerLimitChanged() = bump()
+
+    private fun activeWorkers(): Int {
+        val scheduled = registration?.let { scheduler!!.workersFor(it, false) }
+            ?: if (throttled()) PikPakStreamReader.BACKGROUND_WORKERS_WHILE_FOREGROUND else concurrency
+        return minOf(concurrency, workerLimit().coerceAtLeast(0), scheduled,
+            adaptiveSource?.connectionLimit?.value?.coerceAtLeast(0) ?: concurrency)
+    }
 
     /** Only bytes actually available to the player count as runway. Called under mutex. */
     private fun readyAheadBytes(cursor: Cursor): Long {
@@ -899,11 +924,18 @@ internal class BlockCache(
             cursor.hungry = cursor.urgent || (cursor.reading && slotOf(cursor.position) !in cache) || readyAheadBytes(cursor) < threshold
         }
         hungry = foregroundWarms > 0 || foreground.any { it.hungry }
-        registration?.let { scheduler!!.update(it, hasForegroundDemand(), hungry,
-            activeFetches.any { f -> f.durable } || wants.any { want -> want.durable && nextClaimable(want) != null } ||
-                live.any { cursor -> cursor.role == StreamRole.BACKGROUND && windowOf(cursor).any { slot ->
-                    slot !in cache && slot !in inFlight && slot !in failed && slot !in persisting
-                } }) }
+        val pendingWarm = wants.any { nextClaimable(it) != null } ||
+            activeFetches.any { fetch -> !fetch.cancelled && !fetch.released && fetch.slots.any { it in wanted } }
+        fun pendingCursor(cursor: Cursor): Boolean = cursor.reading || windowOf(cursor).any { slot ->
+            slot !in cache && slot !in offered && slot !in failed && slot !in persisting
+        }
+        val hasDemand = !closed && (pendingWarm || live.any(::pendingCursor))
+        registration?.let { scheduler!!.update(it,
+            hasForegroundDemand() && (adaptiveSource == null || hasDemand), hungry && hasDemand,
+            !closed && (pendingWarm || live.any { it.role == StreamRole.BACKGROUND && pendingCursor(it) })) }
+        adaptiveSource?.updateConnectionAllowance(if (hasDemand) {
+            registration?.let { scheduler!!.connectionAllowanceFor(it) } ?: concurrency
+        } else 0)
         val accountHungry = scheduler?.isAccountHungry() ?: hungry
         if (scheduler != null && accountHungry) {
             for (fetch in activeFetches) if (fetch.durable || !hasForegroundDemand()) {
@@ -1060,7 +1092,7 @@ internal class BlockCache(
                 if (scheduler != null) revision.first { it != seen }
                 else {
                     val foreground = foregroundStreams?.active ?: flowOf(0)
-                    combine(revision, foreground) { r, count -> r != seen || count == 0 }.first { it }
+                    combine(revision, foreground) { r, _ -> r != seen || index < activeWorkers() }.first { it }
                 }
                 continue
             }
@@ -1102,7 +1134,7 @@ internal class BlockCache(
     /**
      * Picks the most urgent slot nobody is fetching: for each cursor the first missing slot
      * of its window, for each warm every missing slot, ranked by priority and then by the age
-     * of the demand. A cursor's pick is widened to two slots once its stream has settled.
+     * of the demand. Playback spans grow in steps away from the blocking head.
      *
      * Must be called under [mutex].
      */
@@ -1199,8 +1231,20 @@ internal class BlockCache(
             }
             else -> 2
         }
+        val playbackSpan = owner?.let { cursor ->
+            val distance = target - slotOf(cursor.position)
+            val learned = registration?.let { scheduler!!.spanFor(it, spanWorkers) } ?: 2
+            when {
+                blocking -> 2
+                distance in 1..2 -> 2
+                distance in 3..6 -> 4
+                !hasSpanSample -> maxOf(4, learned)
+                else -> learned
+            }
+        }
         val maxSpan = when {
             tailDonor != null -> tailDonor.endSlot - target
+            owner != null && !throttled() -> minOf(fairShare, playbackSpan!!)
             !mayWiden -> 1
             streamWarm != null -> 2
             else -> minOf(fairShare, registration?.let { scheduler!!.spanFor(it, spanWorkers, downloadWant != null) } ?: 2)
@@ -1291,8 +1335,8 @@ internal class BlockCache(
 
     /**
      * Whether the stream has enough ahead of the cursor to be worth asking for double-sized
-     * blocks. Everything up to [wideBlockThresholdBytes] past it must already be cached or on
-     * its way, which a start and a seek both undo, so both fall back to single slots.
+     * blocks under the legacy fallback policy. Playback now also widens cold requests in
+     * distance-based steps without waiting for this coverage threshold.
      *
      * Must be called under [mutex].
      */
@@ -1373,8 +1417,13 @@ internal class BlockCache(
                     attempts++
                     if (attempts >= MAX_ATTEMPTS) { fail(fetch, e); return }
                 } finally {
-                    registration?.let { scheduler!!.recordSample(it, telemetry, length,
-                        !completed || retired || fetch.endOffset < offset + length) }
+                    val truncated = !completed || retired || fetch.endOffset < offset + length
+                    val ttfb = telemetry.timeToFirstByte
+                    if (!truncated && telemetry.isClean &&
+                        telemetry.deliveredBytes == length && ttfb != null && telemetry.networkDuration > ttfb) {
+                        hasSpanSample = true
+                    }
+                    registration?.let { scheduler!!.recordSample(it, telemetry, length, truncated) }
                 }
             }
         } catch (e: CancellationException) {

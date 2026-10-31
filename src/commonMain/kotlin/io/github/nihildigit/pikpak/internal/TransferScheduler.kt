@@ -93,11 +93,23 @@ internal class TransferScheduler(
 
     fun isAccountHungry(): Boolean = state.value.caches.values.any { it.hungry }
 
+    /** Potential fair share, independent of a source's current signed-lane capacity. */
+    fun connectionAllowanceFor(reg: Registration): Int = connectionAllowanceFor(state.value, reg)
+
+    private fun connectionAllowanceFor(state: State, reg: Registration): Int {
+        if (reg !in state.caches) return 0
+        val active = state.caches.filterValues { it.foreground || it.background }
+        val owners = if (reg in active) active.keys.toList() else active.keys.toList() + reg
+        val index = owners.indexOf(reg)
+        val share = accountBudget / owners.size + if (index < accountBudget % owners.size) 1 else 0
+        return minOf(reg.connectionBudget, share)
+    }
+
     fun workersFor(reg: Registration, isDurableOnly: Boolean): Int = workersFor(state.value, reg, isDurableOnly)
 
     private fun workersFor(state: State, reg: Registration, durable: Boolean): Int {
         val own = state.caches[reg] ?: return 0
-        if (own.foreground && !durable) return own.workers
+        if (own.foreground && !durable) return minOf(own.workers, connectionAllowanceFor(state, reg))
         val backgrounds = state.caches.filterValues { it.background }
         val count = backgrounds.size.coerceAtLeast(1)
         val hungry = state.caches.values.any { it.hungry }
@@ -109,7 +121,7 @@ internal class TransferScheduler(
             else -> accountBudget
         }
         if (!foreground && !burst && !hungry && count >= 2) {
-            return minOf(own.workers, (accountBudget / count).coerceIn(1, reg.connectionBudget))
+            return minOf(own.workers, connectionAllowanceFor(state, reg))
         }
         // In capped pools distribute the remainder without exceeding the account ceiling.
         val index = backgrounds.keys.indexOf(reg).coerceAtLeast(0)

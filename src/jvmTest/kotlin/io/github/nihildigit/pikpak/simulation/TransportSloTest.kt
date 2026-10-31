@@ -13,7 +13,15 @@ import kotlin.test.*
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.milliseconds
 
-/** Exercises the production controller, not an oracle or a duplicate scheduling policy. */
+/**
+ * Deterministic state-machine regression test (byte integrity, memory cap, 8-slot gate, seek cancellation).
+ *
+ * NOTE: The throughput numbers here have near-zero predictive value on real high-RTT routes.
+ * [VirtualNetwork] lets cwnd grow to 8 MiB and injects synthetic gigabit siblings, whereas live
+ * PikPak `dl-z01a` edges clamp server TCP send windows to ~64 KiB (capping single-stream throughput
+ * to `64 KiB / RTT` regardless of HTTP Range span) and suffer 1.4–3.2 s proxied TLS cold opens.
+ * Always benchmark transport changes against real multi-region proxy nodes.
+ */
 @OptIn(ExperimentalCoroutinesApi::class)
 class TransportSimulationTest {
     @Test fun lowRttGigabit() = runTest(timeout = 5.minutes) {

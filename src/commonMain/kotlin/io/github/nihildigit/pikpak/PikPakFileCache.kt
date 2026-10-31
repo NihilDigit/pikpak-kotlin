@@ -1,6 +1,10 @@
 package io.github.nihildigit.pikpak
 
+import io.github.nihildigit.pikpak.internal.AdaptiveRangeSource
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 
@@ -28,6 +32,8 @@ import kotlin.coroutines.EmptyCoroutineContext
  */
 class PikPakFileCache internal constructor(
     private val cache: BlockCache,
+    /** Whether the remote file is waiting for its cold archive to be reactivated. */
+    val isReactivating: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow(),
 ) : AutoCloseable {
 
     /** Length of the file, in bytes. */
@@ -142,7 +148,9 @@ fun PikPakClient.fileCache(
     BlockCache(
         source = source,
         size = size,
-        concurrency = connectionBudget,
+        concurrency = if (connectionBudget >= this.connectionBudget)
+            (source as? AdaptiveRangeSource)?.maxConnections ?: connectionBudget
+        else connectionBudget,
         parentCoroutineContext = coroutineContext,
         foregroundStreams = foregroundStreams,
         store = blockStore,
@@ -153,4 +161,6 @@ fun PikPakClient.fileCache(
         memoryBudget = transportMemoryBudget,
         timeSource = timeSource,
     ),
+    isReactivating = (source as? PikPakFileHandle)?.isReactivating
+        ?: MutableStateFlow(false).asStateFlow(),
 )

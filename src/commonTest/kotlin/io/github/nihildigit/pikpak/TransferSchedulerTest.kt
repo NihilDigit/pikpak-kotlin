@@ -46,7 +46,7 @@ class TransferSchedulerTest {
         val scheduler = TransferScheduler(16, 8, BandwidthLimiter())
         val downloads = List(3) { scheduler.register(8) {} }
         downloads.forEach { scheduler.update(it, false, false, true) }
-        assertEquals(listOf(5, 5, 5), downloads.map { scheduler.workersFor(it, true) })
+        assertEquals(listOf(6, 5, 5), downloads.map { scheduler.workersFor(it, true) })
     }
 
     @Test
@@ -59,6 +59,23 @@ class TransferSchedulerTest {
         scheduler.onInteractiveActivity()
         assertTrue(downloads.sumOf { scheduler.workersFor(it, true) } <= 4)
         assertTrue(downloads.all { scheduler.workersFor(it, true) <= 2 })
+    }
+
+    @Test
+    fun `potential lanes share sixteen before the second signature exists`() {
+        val scheduler = TransferScheduler(16, 8, BandwidthLimiter())
+        val first = scheduler.register(16) {}
+        scheduler.update(first, false, false, true)
+        assertEquals(16, scheduler.connectionAllowanceFor(first))
+        val second = scheduler.register(16) {}
+        scheduler.update(second, false, false, true)
+        assertEquals(listOf(8, 8), listOf(first, second).map { scheduler.connectionAllowanceFor(it) })
+        val third = scheduler.register(16) {}
+        scheduler.update(third, false, false, true)
+        assertEquals(listOf(6, 5, 5), listOf(first, second, third).map { scheduler.connectionAllowanceFor(it) })
+        scheduler.unregister(second)
+        scheduler.unregister(third)
+        assertEquals(16, scheduler.connectionAllowanceFor(first))
     }
 
     private fun sample(bytes: Long = 15_625_000) = ReadTelemetry().apply {

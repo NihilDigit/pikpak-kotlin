@@ -1,6 +1,19 @@
 package io.github.nihildigit.pikpak
 
+import io.github.nihildigit.pikpak.internal.AdaptiveRangeSource
+import io.github.nihildigit.pikpak.internal.SignedUrlGates
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlin.coroutines.ContinuationInterceptor
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlin.time.TimeMark
+import kotlin.time.Duration.Companion.milliseconds
+import io.github.nihildigit.pikpak.internal.FileReactivationCoordinator
 import io.github.nihildigit.pikpak.internal.PriorityGate
+import kotlinx.coroutines.flow.StateFlow
 import io.ktor.utils.io.ByteReadChannel
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
@@ -13,6 +26,7 @@ import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
 /** A signed CDN link and the moment it stops being accepted. */
@@ -126,7 +140,9 @@ class PikPakFileHandle(
     streamSize: Long? = null,
     /** Metadata of the fixed representation, used to size its playback reserve. */
     @Volatile private var videoInfo: VideoInfo? = null,
-) : RangeSource, AutoCloseable {
+    reactivationPollInterval: Duration = 8.seconds,
+    reactivationTimeout: Duration = 5.minutes,
+) : RangeSource, AdaptiveRangeSource, AutoCloseable {
     /** Upper case whatever the caller passed, so [contentKey] and the stream-size memo agree. */
     val gcid: String = gcid.canonicalGcid()
 
@@ -138,6 +154,10 @@ class PikPakFileHandle(
     val contentKey: String = "${this.gcid}/${mediaId ?: ORIGINAL_KEY}"
 
     private val mutex = Mutex()
+    private val coordinator = FileReactivationCoordinator(client, reactivationPollInterval, reactivationTimeout)
+
+    /** Whether this file is waiting for its archived bytes to become readable. */
+    val isReactivating: StateFlow<Boolean> = coordinator.isReactivating
 
     /** The link [provideUrl] handed out last; reused by a new reader while it stays valid. */
     @Volatile
@@ -171,7 +191,135 @@ class PikPakFileHandle(
     private var unreportedObject: String? = initialFileId
 
     /** Outlives any one reader; see where it is handed to [RangeReader]. */
-    private val fileGate = PriorityGate(connectionBudget)
+    private val fileGate = PriorityGate(minOf(8, connectionBudget))
+    private val secondaryGate = PriorityGate(minOf(8, connectionBudget))
+
+    override val maxConnections: Int = if (!leased && onObjectMinted == null) minOf(8, connectionBudget) * 2 else minOf(8, connectionBudget)
+    private val mutableConnectionLimit = MutableStateFlow(minOf(8, connectionBudget))
+    override val connectionLimit: StateFlow<Int> = mutableConnectionLimit.asStateFlow()
+    private val allowance = MutableStateFlow(maxConnections)
+    @Volatile private var externallyManagedDemand = false
+    private val expanding = MutableStateFlow(false)
+    private val slowSamples = MutableStateFlow(0)
+    private val laneMutex = Mutex()
+    @Volatile private var primaryInFlight = 0
+    @Volatile private var secondaryInFlight = 0
+    private var secondaryGeneration: Any? = null
+    @Volatile private var secondary: RangeReader? = null
+    @Volatile private var secondaryLink: VariantLink? = null
+    private val detailMutex = Mutex()
+    private var lastDetailAt: TimeMark? = initialLink?.let { client.timeSource.markNow() }
+
+    override fun updateConnectionAllowance(allowance: Int) {
+        externallyManagedDemand = true
+        this.allowance.value = allowance.coerceIn(0, maxConnections)
+        publishConnectionLimit()
+        if (slowSamples.value >= 2) considerSecondLane()
+    }
+
+    private fun publishConnectionLimit() {
+        mutableConnectionLimit.value = minOf(allowance.value,
+            if (secondary != null) maxConnections else minOf(8, connectionBudget))
+    }
+
+    private fun observeAttempt(attempt: RangeAttempt) {
+        val firstByte = attempt.timeToFirstByte
+        if (attempt.outcome == RangeAttempt.Outcome.Complete && attempt.retries == 0 &&
+            attempt.delivered > 0 && firstByte != null && attempt.networkDuration > firstByte) {
+            if (attempt.bytesPerSecondAfterFirstByte in 1 until SECOND_LANE_RATE) {
+                slowSamples.update { (it + 1).coerceAtMost(2) }
+            } else slowSamples.value = 0
+        }
+        onRangeAttempt?.invoke(attempt)
+    }
+
+    private suspend fun observeProgress(elapsed: Duration, rate: Long) {
+        if (elapsed >= 2.seconds && rate in 1 until SECOND_LANE_RATE)
+            considerSecondLane(currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext)
+    }
+
+    private fun hasActiveDemand(): Boolean =
+        if (externallyManagedDemand) allowance.value > 0
+        else primaryInFlight > 0 || secondaryInFlight > 0
+
+    private fun considerSecondLane(context: CoroutineContext = EmptyCoroutineContext) {
+        if (!hasActiveDemand() || closed || leased || onObjectMinted != null || fileId == null ||
+            allowance.value <= 8 || secondary != null || !expanding.compareAndSet(false, true)) return
+        client.background.launch(context) {
+            try {
+                val candidate = freeLaneLink(expandingCapacity = true)
+                laneMutex.withLock {
+                    val primary = link
+                    if (!closed && hasActiveDemand() && allowance.value > 8 && primary != null &&
+                        SignedUrlGates.identityOf(candidate.url) != SignedUrlGates.identityOf(primary.url)) {
+                        val generation = Any()
+                        secondaryGeneration = generation
+                        secondaryLink = candidate
+                        secondary = RangeReader(client, { provideSecondaryUrl(generation, it) },
+                            connectionBudget = 8, gate = secondaryGate, onAttempt = ::observeAttempt,
+                            coordinator = coordinator, onBodyProgress = ::observeProgress)
+                        publishConnectionLimit()
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Opportunistic capacity must not fail the working primary lane.
+                slowSamples.value = 0
+            } finally {
+                expanding.value = false
+            }
+        }
+    }
+
+    /** Never rebuild or mint a charged lease merely to obtain parallel capacity. */
+    private suspend fun freeLaneLink(expandingCapacity: Boolean = false): VariantLink = detailMutex.withLock {
+        lastDetailAt?.let { delay((1500.milliseconds - it.elapsedNow()).coerceAtLeast(Duration.ZERO)) }
+        check(!closed && !leased && onObjectMinted == null)
+        check(!expandingCapacity || (allowance.value > 8 && hasActiveDemand()))
+        val id = checkNotNull(fileId)
+        lastDetailAt = client.timeSource.markNow()
+        linkOf(client.getFile(id)) ?: throw PikPakException(-1, "file $id has no readable link")
+    }
+
+    private suspend fun provideSecondaryUrl(generation: Any, request: UrlRequest): String {
+        laneMutex.withLock {
+            if (secondaryGeneration !== generation) return checkNotNull(link).url
+            val existing = secondaryLink
+            if (request == UrlRequest.Initial && existing != null && isUsable(existing)) return existing.url
+        }
+        try {
+            val fresh = freeLaneLink()
+            val refused = when (request) {
+                is UrlRequest.Expired -> request.previous
+                is UrlRequest.Rejected -> request.previous
+                else -> null
+            }
+            check(fresh.url != refused) { "secondary signature was not refreshed" }
+            return laneMutex.withLock {
+                if (secondaryGeneration !== generation) return@withLock checkNotNull(link).url
+                check(link?.let { SignedUrlGates.identityOf(it.url) } != SignedUrlGates.identityOf(fresh.url))
+                secondaryLink = fresh
+                fresh.url
+            }
+        } catch (t: Throwable) {
+            if (t !is CancellationException) {
+                laneMutex.withLock {
+                    if (secondaryGeneration === generation) {
+                        slowSamples.value = 0
+                        secondaryGeneration = null
+                        secondary = null
+                        secondaryLink = null
+                        publishConnectionLimit()
+                    }
+                }
+                // Existing reads may resume on the primary signature; its client-scoped
+                // signed gate still caps all old and new readers together at eight.
+                link?.let { return it.url }
+            }
+            throw t
+        }
+    }
 
     @Volatile
     private var fileId: String? = initialFileId
@@ -214,7 +362,32 @@ class PikPakFileHandle(
         length: Long,
         priority: Int,
         block: suspend (ByteReadChannel) -> T,
-    ): T = currentReader().read(start, length, priority, block)
+    ): T {
+        val primary = currentReader()
+        val chosen = laneMutex.withLock {
+            val extra = secondary?.takeIf { allowance.value > 8 }
+            if (extra != null && secondaryInFlight < primaryInFlight) {
+                secondaryInFlight++
+                extra to true
+            } else {
+                primaryInFlight++
+                primary to false
+            }
+        }
+        try {
+            if (slowSamples.value >= 2)
+                considerSecondLane(currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext)
+            return chosen.first.read(start, length, priority, block)
+        } finally {
+            withContext(NonCancellable) {
+                laneMutex.withLock {
+                    if (chosen.second) secondaryInFlight-- else primaryInFlight--
+                }
+            }
+            if (slowSamples.value >= 2)
+                considerSecondLane(currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext)
+        }
+    }
 
     /** Resolves the link now so the first read does not pay for it. */
     suspend fun prewarm() {
@@ -305,7 +478,12 @@ class PikPakFileHandle(
         if (closed) return
         closed = true
         reader?.close()
+        secondary?.close()
+        secondaryGeneration = null
+        secondaryLink = null
+        secondary = null
         reader = null
+        publishConnectionLimit()
         if (release != null && unreportedObject != null) client.background.launch { reportMinted() }
     }
 
@@ -343,7 +521,9 @@ class PikPakFileHandle(
             // its own gate would let this handle hold up to twice the budget
             // on one signed URL for as long as the old reads take to drain.
             gate = fileGate,
-            onAttempt = onRangeAttempt,
+            onAttempt = ::observeAttempt,
+            coordinator = coordinator,
+            onBodyProgress = ::observeProgress,
         ).also { reader = it }
     }
 
@@ -361,6 +541,14 @@ class PikPakFileHandle(
         val chosen = reusable ?: mintAvoidingBadHosts(request)
         link = chosen
         expiresAt = chosen.expiresAt
+        laneMutex.withLock {
+            if (secondaryLink?.let { SignedUrlGates.identityOf(it.url) } == SignedUrlGates.identityOf(chosen.url)) {
+                secondaryGeneration = null
+                secondary = null
+                secondaryLink = null
+                publishConnectionLimit()
+            }
+        }
         // After the link, never before it: the object still has to answer the
         // lookups that minted it, and a caller that deletes on this signal would
         // pull it out from under them.
@@ -412,18 +600,23 @@ class PikPakFileHandle(
      * heals would make the file id look like the identity again.
      */
     private suspend fun detail(): FileDetail = (try {
-        client.getFile(ensureFileId())
+        lookupDetail(ensureFileId())
     } catch (e: PikPakException) {
         // The id died between calls. A reader cannot report this as a
         // rejection because it never got a URL to have rejected, so without
         // this branch the same failing lookup repeats every time.
         if (!isFileGone(e)) throw e
         rebuild()
-        client.getFile(ensureFileId())
+        lookupDetail(ensureFileId())
     }).also { detail ->
         val variant = if (mediaId == null) detail.medias.firstOrNull { it.isOrigin }
             else detail.medias.firstOrNull { it.mediaId == mediaId }
         videoInfo = variant?.video ?: videoInfo
+    }
+
+    private suspend fun lookupDetail(id: String): FileDetail = detailMutex.withLock {
+        lastDetailAt = client.timeSource.markNow()
+        client.getFile(id)
     }
 
     private fun linkOf(detail: FileDetail): VariantLink? {
@@ -434,6 +627,8 @@ class PikPakFileHandle(
 
     /** The reader a read would use right now, creating it if needed. */
     internal suspend fun readerForTest(): RangeReader = currentReader()
+
+    internal fun secondaryReaderForTest(): RangeReader? = secondary
 
     /** Marks the current signature as due for replacement, without waiting for a clock. */
     internal fun expireForTest() {
@@ -491,6 +686,7 @@ class PikPakFileHandle(
 
         /** Extra links minted when one lands on a host known to be failing; see [mintAvoidingBadHosts]. */
         internal const val MAX_HOST_REMINTS = 2
+        private const val SECOND_LANE_RATE = 550L * 1024
 
         /** What the original is called in [contentKey], where transcodes go by their media id. */
         internal const val ORIGINAL_KEY = "origin"

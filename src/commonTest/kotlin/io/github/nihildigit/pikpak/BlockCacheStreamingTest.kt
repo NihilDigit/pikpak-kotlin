@@ -203,6 +203,7 @@ class BlockCacheStreamingTest {
             wideBlockThresholdBytes = 1, scheduler = scheduler, mediaBytesPerSecond = 16)
         try {
             val cursor = cache.openCursor(StreamRole.FOREGROUND)
+            cache.setReadAhead(cursor, 128) // Two workers each claim one slot in this small window.
             assertEquals(1, withTimeout(1000) { cache.read(cursor, ByteArray(1), 0, 1) })
             withTimeout(1000) { while (cache.inFlightSlotsForTest() == 0) delay(5) }
             // 63 ready bytes are below the 4-second entry cushion; reserved slots do not count.
@@ -748,6 +749,132 @@ class BlockCacheStreamingTest {
             second.close()
             withTimeout(1000) { while (budget.usedBytes != 0L) delay(1) }
         }
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `cold high TTFB startup and seek widen the first wave after head protection`() = runTest {
+        val slotBytes = 256L * 1024
+        val budget = TransportMemoryBudget(16L * 1024 * 1024)
+        val requests = mutableListOf<Pair<Long, Long>>()
+        var cancelled = 0
+        val source = object : RangeSource {
+            override suspend fun <T> read(start: Long, length: Long, priority: Int,
+                                         block: suspend (ByteReadChannel) -> T): T {
+                requests += start to length
+                try { awaitCancellation() } finally { cancelled++ }
+            }
+        }
+        val scheduler = TransferScheduler(4, 4, BandwidthLimiter(), testScheduler.timeSource)
+        val cache = BlockCache(source, 256 * slotBytes, 4, coroutineContext, null,
+            blockSize = slotBytes, readAheadBytes = 64 * slotBytes, memoryCapBytes = 80 * slotBytes,
+            scheduler = scheduler, timeSource = testScheduler.timeSource, memoryBudget = budget)
+        val cursor = cache.openCursor(StreamRole.FOREGROUND)
+        try {
+            for (head in listOf(0L, 128 * slotBytes)) {
+                cache.seek(cursor, head)
+                val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
+                runCurrent()
+                val wave = requests.filter { it.first >= head }
+                assertEquals(listOf(head to 2 * slotBytes), wave)
+                advanceTimeBy(29)
+                runCurrent()
+                assertEquals(1, requests.count { it.first >= head })
+                advanceTimeBy(1)
+                runCurrent()
+                assertEquals(listOf(0L to 2L, 2L to 2L, 4L to 4L, 8L to 4L),
+                    requests.filter { it.first >= head }.map { (start, length) ->
+                        (start - head) / slotBytes to length / slotBytes
+                    })
+                assertFalse(read.isCompleted, "no first byte or completion sample has arrived")
+                assertEquals(4 * slotBytes, budget.usedBytes, "range suffixes reserve no arrays")
+                assertTrue(budget.peakBytes <= 16L * 1024 * 1024)
+                read.cancelAndJoin()
+            }
+            assertEquals(4, cancelled, "seek cancels the entire orphaned first wave")
+        } finally {
+            cache.close()
+            cache.awaitClosedForTest()
+        }
+        assertEquals(8, cancelled)
+        assertEquals(0L, budget.usedBytes)
+    }
+
+    @Test
+    fun `expanded playback ranges stay within shared sixteen MiB ownership budget`() = runTest {
+        val slotBytes = 256L * 1024
+        val budget = TransportMemoryBudget(16L * 1024 * 1024)
+        val source = object : RangeSource {
+            override suspend fun <T> read(start: Long, length: Long, priority: Int,
+                                         block: suspend (ByteReadChannel) -> T): T =
+                block(ByteReadChannel(ByteArray(length.toInt())))
+        }
+        val cache = BlockCache(source, 256 * slotBytes, 4, coroutineContext, null,
+            blockSize = slotBytes, readAheadBytes = 32 * slotBytes, memoryCapBytes = 80 * slotBytes,
+            memoryBudget = budget)
+        try {
+            val cursor = cache.openCursor(StreamRole.FOREGROUND)
+            repeat(128) {
+                assertEquals(slotBytes.toInt(), cache.read(cursor, ByteArray(slotBytes.toInt()), 0, slotBytes.toInt()))
+                assertTrue(budget.usedBytes <= budget.budgetBytes)
+            }
+            assertTrue(cache.deliveredBytes >= 128 * slotBytes)
+            assertTrue(budget.peakBytes <= 16L * 1024 * 1024)
+        } finally {
+            cache.close()
+            cache.awaitClosedForTest()
+        }
+        assertEquals(0L, budget.usedBytes)
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `dynamic worker growth wakes parked workers and shrink drains active reads`() = runTest {
+        var limit = 0
+        val releases = mutableListOf<CompletableDeferred<Unit>>()
+        var cancellations = 0
+        val source = object : RangeSource {
+            override suspend fun <T> read(start: Long, length: Long, priority: Int,
+                                         block: suspend (ByteReadChannel) -> T): T {
+                val release = CompletableDeferred<Unit>()
+                releases += release
+                try {
+                    release.await()
+                    return block(ByteReadChannel(ByteArray(length.toInt())))
+                } catch (e: CancellationException) { cancellations++; throw e }
+            }
+        }
+        val cache = BlockCache(source, 4096, 4, coroutineContext, null,
+            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 2048,
+            workerLimit = { limit })
+        try {
+            cache.warm(listOf(0L..4095L), StreamRole.BACKGROUND, null)
+            runCurrent()
+            assertEquals(0, releases.size)
+            limit = 1
+            cache.workerLimitChanged()
+            runCurrent()
+            assertEquals(1, releases.size)
+            limit = 99
+            cache.workerLimitChanged()
+            runCurrent()
+            assertEquals(4, releases.size, "pre-created worker count is the hard ceiling")
+            limit = 1
+            cache.workerLimitChanged()
+            runCurrent()
+            assertEquals(0, cancellations)
+            releases.take(3).forEach { it.complete(Unit) }
+            runCurrent()
+            assertEquals(4, releases.size, "no replacement while one admitted read remains")
+            releases[3].complete(Unit)
+            runCurrent()
+            assertEquals(5, releases.size)
+            assertEquals(0, cancellations)
+        } finally {
+            cache.close()
+            cache.awaitClosedForTest()
+        }
+        assertEquals(1, cancellations)
     }
 
     @Test

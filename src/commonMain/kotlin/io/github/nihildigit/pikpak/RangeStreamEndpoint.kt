@@ -1,5 +1,6 @@
 package io.github.nihildigit.pikpak
 
+import io.github.nihildigit.pikpak.internal.headerMap
 import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.header
 import io.ktor.client.statement.bodyAsChannel
@@ -121,6 +122,10 @@ public suspend fun <T> PikPakClient.streamRangeFromUrl(
         },
     ) { response ->
         val status = response.status
+        if (status.value in 200..299 && response.headers["X-Xos-Err-Desc"]?.trim() == "5") {
+            response.bodyAsChannel().cancel(null)
+            throw FileReactivatingException(httpStatus = status.value, headers = response.headerMap())
+        }
         when {
             status == HttpStatusCode.OK ->
                 throw PikPakException(

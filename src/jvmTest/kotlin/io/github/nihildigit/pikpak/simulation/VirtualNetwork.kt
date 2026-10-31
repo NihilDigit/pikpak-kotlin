@@ -46,7 +46,10 @@ internal data class NetworkProfile(
  * One shared fluid bottleneck, one millisecond scheduling quantum. ACKs arrive after RTT;
  * cwnd grows by acknowledged bytes in slow start and MSS*acked/cwnd in avoidance.
  * Deterministic packet losses consume wire capacity, then retransmit after one RTT.
- * This is an explanatory Reno-like model, not a kernel TCP emulator.
+ *
+ * WARNING: Not representative of real PikPak CDN throughput. [NetworkProfile.receiveWindow] defaults
+ * to 8 MiB, while real `dl-z01a` edges enforce a ~64 KiB server TCP window (128x smaller), making
+ * real throughput strictly RTT-bound per TCP connection. Useful only for deterministic logic/memory checks.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 internal class VirtualNetwork(private val scope: TestScope, val size: Long, val profile: NetworkProfile) {
