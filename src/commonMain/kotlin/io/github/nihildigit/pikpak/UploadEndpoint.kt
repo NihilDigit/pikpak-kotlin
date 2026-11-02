@@ -180,7 +180,7 @@ suspend fun PikPakClient.startUpload(parentId: String, name: String, size: Long,
             partSize = computeChunkSize(size),
             uploadId = "",
             bucket = param("bucket"),
-            endpoint = param("endpoint"),
+            endpoint = normalizeOssEndpoint(param("endpoint")),
             key = param("key"),
             accessKeyId = param("access_key_id"),
             accessKeySecret = param("access_key_secret"),
@@ -445,26 +445,49 @@ private suspend fun <T> PikPakClient.ossRequest(
         accessKeySecret = oss.accessKeySecret,
     )
     val query = if (unsignedQuery.isEmpty()) rawQuery else "$rawQuery&$unsignedQuery"
-    val url = "https://${oss.endpoint}$ossPath?$query"
-    return http.sendRaw(
-        method = method,
-        url = url,
-        configure = {
-            applyOssHeaders(date, oss.securityToken, auth)
-            if (body != null) setBody(body)
-        },
-    ) { response ->
-        if (!response.status.isSuccess()) {
-            throw PikPakException(
-                errorCode = -1,
-                errorMessage = "OSS ${method.value} $rawQuery failed with HTTP ${response.status.value}",
-                httpStatus = response.status.value,
-                rawBody = response.bodyAsText(),
-            )
+    val endpoint = normalizeOssEndpoint(oss.endpoint)
+    val url = "https://$endpoint$ossPath?$query"
+    return try {
+        http.sendRaw(
+            method = method,
+            url = url,
+            configure = {
+                applyOssHeaders(date, oss.securityToken, auth)
+                if (body != null) setBody(body)
+            },
+        ) { response ->
+            if (!response.status.isSuccess()) {
+                throw PikPakException(
+                    errorCode = -1,
+                    errorMessage = "OSS ${method.value} $rawQuery failed with HTTP ${response.status.value}",
+                    httpStatus = response.status.value,
+                    rawBody = response.bodyAsText(),
+                )
+            }
+            block(response)
         }
-        block(response)
+    } catch (e: kotlinx.io.IOException) {
+        throw kotlinx.io.IOException("OSS ${method.value} $endpoint (${rawQuery.substringBefore('&')}) failed: ${e.message}", e)
     }
 }
+
+/**
+ * PikPak's `api-drive.pikpakdrive.com` gateway mirrors the request root into
+ * `resumable.params.endpoint` (`upload-*.pikpakdrive.com`), but PikPak never
+ * published `upload-*.pikpakdrive.com` in public DNS (NXDOMAIN worldwide,
+ * verified 2026-11-02). The sibling `upload-*.mypikpak.com` CNAMEs point to
+ * the exact same `ap-southeast-1` OSS ingress and OSS v1 signatures do not
+ * cover `Host`, so rewriting the dead `.pikpakdrive.com` suffix restores
+ * uploads (and previously persisted sessions) transparently.
+ */
+internal fun normalizeOssEndpoint(endpoint: String): String =
+    if (endpoint.endsWith(BROKEN_UPLOAD_DOMAIN_SUFFIX, ignoreCase = true)) {
+        endpoint.dropLast(BROKEN_UPLOAD_DOMAIN_SUFFIX.length) + "." + PikPakDomain.MYPIKPAK_COM.root
+    } else {
+        endpoint
+    }
+
+private const val BROKEN_UPLOAD_DOMAIN_SUFFIX = ".pikpakdrive.com"
 
 private fun HttpRequestBuilder.applyOssHeaders(date: String, securityToken: String, authorization: String) {
     headers {

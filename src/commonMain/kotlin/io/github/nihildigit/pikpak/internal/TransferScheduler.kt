@@ -2,6 +2,7 @@ package io.github.nihildigit.pikpak.internal
 
 import io.github.nihildigit.pikpak.BandwidthLimiter
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlin.concurrent.Volatile
 import kotlin.math.ceil
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -14,7 +15,16 @@ internal class TransferScheduler(
     private val connectionBudget: Int,
     private val downloadLimiter: BandwidthLimiter,
     private val timeSource: TimeSource = TimeSource.Monotonic,
+    concurrentAcceleration: Boolean = true,
 ) {
+    @Volatile
+    var concurrentAcceleration: Boolean = concurrentAcceleration
+        set(value) {
+            if (field == value) return
+            field = value
+            state.value.caches.keys.forEach { it.onScheduleChanged() }
+        }
+
     internal class Registration internal constructor(
         internal val connectionBudget: Int,
         internal val blockSize: Long,
@@ -98,6 +108,7 @@ internal class TransferScheduler(
 
     private fun connectionAllowanceFor(state: State, reg: Registration): Int {
         if (reg !in state.caches) return 0
+        if (!concurrentAcceleration) return 1
         val active = state.caches.filterValues { it.foreground || it.background }
         val owners = if (reg in active) active.keys.toList() else active.keys.toList() + reg
         val index = owners.indexOf(reg)
@@ -109,6 +120,7 @@ internal class TransferScheduler(
 
     private fun workersFor(state: State, reg: Registration, durable: Boolean): Int {
         val own = state.caches[reg] ?: return 0
+        if (!concurrentAcceleration) return 1
         if (own.foreground && !durable) return minOf(own.workers, connectionAllowanceFor(state, reg))
         val backgrounds = state.caches.filterValues { it.background }
         val count = backgrounds.size.coerceAtLeast(1)
@@ -133,6 +145,17 @@ internal class TransferScheduler(
     fun spanFor(reg: Registration, workers: Int, durable: Boolean = false): Int {
         val snapshot = state.value
         val own = snapshot.caches[reg] ?: return 1
+        if (!concurrentAcceleration) {
+            val floor = if (durable) SINGLE_STREAM_DURABLE_FLOOR_BLOCKS else SINGLE_STREAM_PLAYBACK_FLOOR_BLOCKS
+            if (!own.spanSettled) return floor
+            val ceiling = if (durable) MAX_DURABLE_RANGE_BYTES else MAX_PLAYBACK_RANGE_BYTES
+            val limitedRate = downloadLimiter.bytesPerSecond?.takeIf { durable }?.toDouble()
+            val rate = limitedRate?.let { minOf(own.bodyRate, it) } ?: own.bodyRate
+            val bytes = rate * own.latency.inWholeNanoseconds / 1e9 * 19.0
+            val maxBlocks = (ceiling / reg.blockSize).toInt().coerceAtLeast(1)
+            return ceil(bytes.coerceIn(0.0, ceiling.toDouble()) / reg.blockSize)
+                .toInt().coerceIn(minOf(floor, maxBlocks), maxBlocks)
+        }
         val hungry = snapshot.caches.values.any { it.hungry }
         if (hungry && (!own.foreground || durable)) return 1
         val ceiling = if (durable) MAX_DURABLE_RANGE_BYTES else MAX_PLAYBACK_RANGE_BYTES
@@ -199,6 +222,7 @@ internal class TransferScheduler(
 
     /** One account-wide worker experiment. Caller must release in NonCancellable finally and on close. */
     fun tryAcquireProbe(reg: Registration): Boolean {
+        if (!concurrentAcceleration) return false
         while (true) {
             val before = state.value
             val own = before.caches[reg] ?: return false
@@ -237,5 +261,7 @@ internal class TransferScheduler(
         const val SLOT_BYTES = 256L * 1024
         const val MAX_DURABLE_RANGE_BYTES = 1024L * 1024 * 1024
         const val MAX_PLAYBACK_RANGE_BYTES = 32L * 1024 * 1024
+        const val SINGLE_STREAM_PLAYBACK_FLOOR_BLOCKS = 16
+        const val SINGLE_STREAM_DURABLE_FLOOR_BLOCKS = 32
     }
 }

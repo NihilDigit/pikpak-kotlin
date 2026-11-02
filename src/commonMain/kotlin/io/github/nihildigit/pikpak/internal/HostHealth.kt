@@ -2,6 +2,7 @@ package io.github.nihildigit.pikpak.internal
 
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
+import kotlin.concurrent.Volatile
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
@@ -55,7 +56,7 @@ internal class HostHealth(
     private val memory: Duration = DEFAULT_MEMORY,
     private val timeSource: TimeSource = TimeSource.Monotonic,
     /** False keeps every attempt on its link's own host; only silence is still remembered. */
-    private val steering: Boolean = true,
+    @Volatile internal var steering: Boolean = true,
     seeds: Collection<String> = emptyList(),
 ) {
     private data class HealthState(

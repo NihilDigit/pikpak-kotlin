@@ -94,8 +94,17 @@ class PikPakClient(
      * arbitrary custom RangeSource allocations are outside this ownership budget.
      */
     transportMemoryBudgetBytes: Long = DEFAULT_TRANSPORT_MEMORY_BUDGET_BYTES,
+    /**
+     * Enables multi-connection range fan-out, dual signed URL lanes and edge-host steering.
+     *
+     * When false, each open file or download uses a single sequential range connection on the
+     * host its link names, matching the network profile of the official PikPak client.
+     */
+    concurrentAcceleration: Boolean = true,
     internal val timeSource: TimeSource = TimeSource.Monotonic,
 ) {
+    private val configuredSteerEdgeHosts = steerEdgeHosts
+
     constructor(
         account: String,
         password: String,
@@ -110,6 +119,7 @@ class PikPakClient(
         steerEdgeHosts: Boolean = true,
         downloadLimiter: BandwidthLimiter = BandwidthLimiter(),
         transportMemoryBudgetBytes: Long = DEFAULT_TRANSPORT_MEMORY_BUDGET_BYTES,
+        concurrentAcceleration: Boolean = true,
         timeSource: TimeSource = TimeSource.Monotonic,
     ) : this(
         account,
@@ -125,6 +135,7 @@ class PikPakClient(
         steerEdgeHosts,
         downloadLimiter,
         transportMemoryBudgetBytes,
+        concurrentAcceleration,
         timeSource,
     )
 
@@ -174,7 +185,13 @@ class PikPakClient(
     internal val accountGate = PriorityGate(accountConnectionBudget)
     internal val signedUrlGates = io.github.nihildigit.pikpak.internal.SignedUrlGates()
 
-    internal val scheduler = TransferScheduler(accountConnectionBudget, connectionBudget, downloadLimiter, timeSource = timeSource)
+    internal val scheduler = TransferScheduler(
+        accountConnectionBudget,
+        connectionBudget,
+        downloadLimiter,
+        timeSource = timeSource,
+        concurrentAcceleration = concurrentAcceleration,
+    )
 
     internal val transportMemoryBudget = TransportMemoryBudget(transportMemoryBudgetBytes)
 
@@ -200,6 +217,19 @@ class PikPakClient(
             downloadLimiter.bytesPerSecond = value
         }
 
+    /**
+     * Multi-connection acceleration toggle for streams and downloads on this client.
+     *
+     * May be toggled at runtime; disabling it clamps each open file to a single sequential range
+     * connection, suppresses dual signed-lane minting, and disables sibling edge-host exploration.
+     */
+    var concurrentAcceleration: Boolean
+        get() = scheduler.concurrentAcceleration
+        set(value) {
+            scheduler.concurrentAcceleration = value
+            hostHealth.steering = value && configuredSteerEdgeHosts
+        }
+
     /** Marks user interaction so background transfers can leave room for interactive work. */
     fun notifyInteractiveActivity() = scheduler.onInteractiveActivity()
 
@@ -212,7 +242,7 @@ class PikPakClient(
     internal val foregroundStreams = ForegroundStreams()
 
     /** Edge hosts that failed or crawled recently, and the siblings reads may move to instead. */
-    internal val hostHealth = HostHealth(steering = steerEdgeHosts, timeSource = timeSource)
+    internal val hostHealth = HostHealth(steering = steerEdgeHosts && concurrentAcceleration, timeSource = timeSource)
 
     // Keyed by content and variant: a transcode's length is only learned by a probe, and it
     // cannot change while the content exists, whichever file object or link reaches it.

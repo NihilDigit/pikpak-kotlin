@@ -936,6 +936,14 @@ internal class BlockCache(
         adaptiveSource?.updateConnectionAllowance(if (hasDemand) {
             registration?.let { scheduler!!.connectionAllowanceFor(it) } ?: concurrency
         } else 0)
+        if (scheduler != null && !scheduler.concurrentAcceleration && activeFetches.size > 1) {
+            val headSlots = live.mapTo(HashSet()) { slotOf(it.position) }
+            for (fetch in activeFetches) {
+                if (fetch.nextSlot !in headSlots && fetch.endSlot > fetch.nextSlot + 1) {
+                    fetch.endSlot = fetch.nextSlot + 1
+                }
+            }
+        }
         val accountHungry = scheduler?.isAccountHungry() ?: hungry
         if (scheduler != null && accountHungry) {
             for (fetch in activeFetches) if (fetch.durable || !hasForegroundDemand()) {
@@ -974,7 +982,7 @@ internal class BlockCache(
                 updateSchedule(liveCursors())
                 inFlight[slot]?.takeIf { slot > it.nextSlot }?.let {
                     // Hand the untouched tail to a head worker without duplicating its prefix.
-                    it.endSlot = slot
+                    it.endSlot = if (activeWorkers() <= 1) it.nextSlot + 1 else slot
                     bump()
                 }
                 inFlight[slot]?.takeIf { it.waitingForLimiter && it.durable }?.let {
@@ -1209,7 +1217,10 @@ internal class BlockCache(
         val blocking = owner != null && target == slotOf(owner.position)
         val downloadWant = targetWant?.takeIf { owner == null && it.durable }
         val streamWarm = targetWant?.takeIf { owner == null && !it.durable }
-        val mayWiden = if (scheduler != null) {
+        val singleStream = scheduler?.concurrentAcceleration == false
+        val mayWiden = if (singleStream) {
+            owner != null || downloadWant != null || streamWarm != null
+        } else if (scheduler != null) {
             (owner != null && !blocking && (!owner.seeking || wide(owner))) ||
                 (downloadWant != null && !wasAccountHungry) ||
                 (streamWarm != null && !wasAccountHungry)
@@ -1235,6 +1246,7 @@ internal class BlockCache(
             val distance = target - slotOf(cursor.position)
             val learned = registration?.let { scheduler!!.spanFor(it, spanWorkers) } ?: 2
             when {
+                singleStream -> learned
                 blocking -> 2
                 distance in 1..2 -> 2
                 distance in 3..6 -> 4

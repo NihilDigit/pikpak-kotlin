@@ -149,4 +149,37 @@ class TransferSchedulerTest {
         scheduler.releaseProbe(second)
         assertEquals(7, scheduler.workersFor(second, true))
     }
+
+    @Test
+    fun `disabling concurrent acceleration clamps workers and allowance to one with continuous spans`() {
+        var scheduleChanges = 0
+        val scheduler = TransferScheduler(16, 8, BandwidthLimiter())
+        val player = scheduler.register(16) { scheduleChanges++ }
+        val download = scheduler.register(8) { scheduleChanges++ }
+        scheduler.update(player, true, true, false)
+        scheduler.update(download, false, false, true)
+        assertEquals(8, scheduler.connectionAllowanceFor(player))
+        assertEquals(8, scheduler.workersFor(player, false))
+
+        scheduler.concurrentAcceleration = false
+        assertTrue(scheduleChanges >= 2)
+        assertEquals(1, scheduler.connectionAllowanceFor(player))
+        assertEquals(1, scheduler.connectionAllowanceFor(download))
+        assertEquals(1, scheduler.workersFor(player, false))
+        assertEquals(1, scheduler.workersFor(download, true))
+        assertEquals(16, scheduler.spanFor(player, 1, durable = false))
+        assertEquals(32, scheduler.spanFor(download, 1, durable = true))
+        assertFalse(scheduler.tryAcquireProbe(download))
+
+        val client = PikPakClient(account = "u@example.com", password = "pw")
+        assertTrue(client.concurrentAcceleration)
+        assertTrue(client.hostHealth.steering)
+        client.concurrentAcceleration = false
+        assertFalse(client.concurrentAcceleration)
+        assertFalse(client.hostHealth.steering)
+        client.concurrentAcceleration = true
+        assertTrue(client.concurrentAcceleration)
+        assertTrue(client.hostHealth.steering)
+        client.close()
+    }
 }

@@ -104,4 +104,36 @@ class UploadCompletionMockTest {
         assertEquals(0, requests.count { it.startsWith("DELETE ") && it.endsWith("/drive/v1/files/F1") }, "the finished file was deleted: $requests")
         client.close()
     }
+
+    @Test
+    fun `pikpakdrive upload endpoint rewrites to canonical mypikpak host`() = runBlocking {
+        assertEquals("upload-a10b.mypikpak.com", normalizeOssEndpoint("upload-a10b.pikpakdrive.com"))
+        assertEquals("upload-a10b.mypikpak.net", normalizeOssEndpoint("upload-a10b.mypikpak.net"))
+        assertEquals("mypikpak-mbr.oss-accelerate.aliyuncs.com", normalizeOssEndpoint("mypikpak-mbr.oss-accelerate.aliyuncs.com"))
+
+        val hosts = mutableListOf<String>()
+        val client = PikPakClient(
+            account = "mock@x",
+            password = "pw",
+            sessionStore = InMemorySessionStore(),
+            httpClient = HttpClient(MockEngine { req ->
+                hosts += req.url.host
+                when (req.method.value) {
+                    "PUT" -> respond("", HttpStatusCode.OK, headersOf(HttpHeaders.ETag, "\"part-etag\""))
+                    "POST" -> respond("<CompleteMultipartUploadResult/>", HttpStatusCode.OK)
+                    else -> error("Unexpected request: $req")
+                }
+            }),
+        )
+        try {
+            client.continueUpload(
+                session.copy(endpoint = "upload-a10b.pikpakdrive.com"),
+                open = { Buffer().apply { write(ByteArray(10)) } },
+                freshSession = true,
+            )
+            assertEquals(listOf("upload-a10b.mypikpak.com", "upload-a10b.mypikpak.com"), hosts)
+        } finally {
+            client.close()
+        }
+    }
 }
