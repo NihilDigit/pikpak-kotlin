@@ -120,7 +120,15 @@ internal class TransferScheduler(
 
     private fun workersFor(state: State, reg: Registration, durable: Boolean): Int {
         val own = state.caches[reg] ?: return 0
-        if (!concurrentAcceleration) return 1
+        if (!concurrentAcceleration) {
+            if (own.foreground && !durable) return 1
+            val foregroundHungry = state.caches.values.any { it.foreground && it.hungry }
+            val burst = origin.elapsedNow() < state.interactiveUntil
+            if (foregroundHungry || burst) return 0
+            val backgrounds = state.caches.filterValues { it.background }
+            val leader = backgrounds.keys.firstOrNull() ?: return 1
+            return if (leader === reg) 1 else 0
+        }
         if (own.foreground && !durable) return minOf(own.workers, connectionAllowanceFor(state, reg))
         val backgrounds = state.caches.filterValues { it.background }
         val count = backgrounds.size.coerceAtLeast(1)
@@ -145,6 +153,8 @@ internal class TransferScheduler(
     fun spanFor(reg: Registration, workers: Int, durable: Boolean = false): Int {
         val snapshot = state.value
         val own = snapshot.caches[reg] ?: return 1
+        val hungry = snapshot.caches.values.any { it.hungry }
+        if (hungry && (!own.foreground || durable)) return 1
         if (!concurrentAcceleration) {
             val floor = if (durable) SINGLE_STREAM_DURABLE_FLOOR_BLOCKS else SINGLE_STREAM_PLAYBACK_FLOOR_BLOCKS
             if (!own.spanSettled) return floor
@@ -156,8 +166,6 @@ internal class TransferScheduler(
             return ceil(bytes.coerceIn(0.0, ceiling.toDouble()) / reg.blockSize)
                 .toInt().coerceIn(minOf(floor, maxBlocks), maxBlocks)
         }
-        val hungry = snapshot.caches.values.any { it.hungry }
-        if (hungry && (!own.foreground || durable)) return 1
         val ceiling = if (durable) MAX_DURABLE_RANGE_BYTES else MAX_PLAYBACK_RANGE_BYTES
         val limitedRate = downloadLimiter.bytesPerSecond?.takeIf { durable }
             ?.toDouble()?.div(workers.coerceAtLeast(1))

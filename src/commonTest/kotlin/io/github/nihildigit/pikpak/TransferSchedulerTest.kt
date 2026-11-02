@@ -166,8 +166,17 @@ class TransferSchedulerTest {
         assertEquals(1, scheduler.connectionAllowanceFor(player))
         assertEquals(1, scheduler.connectionAllowanceFor(download))
         assertEquals(1, scheduler.workersFor(player, false))
-        assertEquals(1, scheduler.workersFor(download, true))
+        // While foreground player is hungry, background download yields completely
+        assertEquals(0, scheduler.workersFor(download, true))
+        assertEquals(1, scheduler.spanFor(download, 1, durable = true))
         assertEquals(16, scheduler.spanFor(player, 1, durable = false))
+
+        // Once foreground player buffer is healthy (!hungry), one background file runs sequentially
+        val secondDownload = scheduler.register(8) { scheduleChanges++ }
+        scheduler.update(secondDownload, false, false, true)
+        scheduler.update(player, true, false, false)
+        assertEquals(1, scheduler.workersFor(download, true))
+        assertEquals(0, scheduler.workersFor(secondDownload, true))
         assertEquals(32, scheduler.spanFor(download, 1, durable = true))
         assertFalse(scheduler.tryAcquireProbe(download))
 

@@ -1219,7 +1219,9 @@ internal class BlockCache(
         val streamWarm = targetWant?.takeIf { owner == null && !it.durable }
         val singleStream = scheduler?.concurrentAcceleration == false
         val mayWiden = if (singleStream) {
-            owner != null || downloadWant != null || streamWarm != null
+            (owner != null && (owner.role == StreamRole.FOREGROUND || !wasAccountHungry)) ||
+                (downloadWant != null && !wasAccountHungry) ||
+                (streamWarm != null && !wasAccountHungry)
         } else if (scheduler != null) {
             (owner != null && !blocking && (!owner.seeking || wide(owner))) ||
                 (downloadWant != null && !wasAccountHungry) ||
