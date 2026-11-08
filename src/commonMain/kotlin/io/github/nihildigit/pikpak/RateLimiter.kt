@@ -15,12 +15,29 @@ import kotlin.time.TimeSource
 
 /** API queue priority. Higher numbers run first; ordinary requests use zero. */
 class ApiRequestPriority(val priority: Int) : AbstractCoroutineContextElement(Key) {
-    companion object Key : CoroutineContext.Key<ApiRequestPriority>
+    companion object Key : CoroutineContext.Key<ApiRequestPriority> {
+        const val INTERACTIVE = 10
+        const val DEFAULT = 0
+        const val BACKGROUND = -10
+    }
 }
 
 /** Applies [priority] to API calls in [block], including their retries. */
 suspend fun <T> withApiPriority(priority: Int, block: suspend () -> T): T =
     withContext(ApiRequestPriority(priority)) { block() }
+
+/** Endpoint defaults never override an explicit caller policy. */
+internal suspend fun <T> withDefaultApiPriority(priority: Int, block: suspend () -> T): T =
+    if (currentCoroutineContext()[ApiRequestPriority] != null) block()
+    else withApiPriority(priority, block)
+
+internal suspend fun <T> PikPakClient.withInteractiveApiPriority(block: suspend () -> T): T =
+    withDefaultApiPriority(ApiRequestPriority.INTERACTIVE) {
+        // Explicit background maintenance must not repeatedly suppress data transfers.
+        if (currentCoroutineContext()[ApiRequestPriority]!!.priority >= ApiRequestPriority.DEFAULT)
+            notifyInteractiveActivity()
+        block()
+    }
 
 /**
  * Coroutine-friendly token bucket shared by a client's API requests.
@@ -32,14 +49,20 @@ suspend fun <T> withApiPriority(priority: Int, block: suspend () -> T): T =
  *
  * The constructor retains its conservative 5/s budget; [default] uses 20/s
  * with a burst of 24. Share an instance to share a budget across clients.
+ * Background requests preserve [backgroundReserve] tokens for subsequent ordinary
+ * and interactive requests. Foreground traffic can spend that reserve; it is not
+ * an unconditional latency guarantee. Buckets smaller than eight reserve nothing.
  */
 class RateLimiter(
     private val capacity: Int = 5,
     private val refillPerSecond: Double = 5.0,
+    private val backgroundReserve: Int = if (capacity >= 8) minOf(8, capacity / 3) else 0,
+    private val timeSource: TimeSource = TimeSource.Monotonic,
 ) {
     init {
         require(capacity > 0) { "capacity must be positive" }
         require(refillPerSecond > 0 && refillPerSecond.isFinite()) { "refillPerSecond must be finite and positive" }
+        require(backgroundReserve in 0 until capacity) { "backgroundReserve must leave room for a request" }
     }
 
     private class Waiter(val priority: Int)
@@ -47,20 +70,21 @@ class RateLimiter(
     // Net balance after deducting every queued reservation. The spendable
     // balance is tokens + waiters.size, never more than capacity.
     private var tokens = capacity.toDouble()
-    private var lastRefill = TimeSource.Monotonic.markNow()
+    private var lastRefill = timeSource.markNow()
     private val waiters = mutableListOf<Waiter>()
     private var changed = CompletableDeferred<Unit>()
 
     /** Retains the original no-argument entry point. */
-    suspend fun acquire() = acquire(0)
+    suspend fun acquire() = acquire(ApiRequestPriority.DEFAULT)
 
     suspend fun acquire(priority: Int) {
         val waiter = Waiter(priority)
+        val required = 1.0 + if (priority <= ApiRequestPriority.BACKGROUND) backgroundReserve else 0
         try {
             mutex.withLock {
                 currentCoroutineContext().ensureActive()
                 refill()
-                if (tokens >= 1.0 && waiters.isEmpty()) {
+                if (tokens >= required && waiters.isEmpty()) {
                     tokens -= 1.0
                     return
                 }
@@ -74,7 +98,7 @@ class RateLimiter(
                     currentCoroutineContext().ensureActive()
                     refill()
                     val available = tokens + waiters.size
-                    if (waiters.first() === waiter && available >= 1.0) {
+                    if (waiters.first() === waiter && available >= required) {
                         waiters.removeAt(0) // reservation was already deducted
                         signalChange()
                         return
@@ -82,7 +106,7 @@ class RateLimiter(
                     // Only the head keeps a timer. A higher-priority arrival or
                     // cancellation wakes it to hand the timer to the new head.
                     changed to if (waiters.first() === waiter) {
-                        ceil((1.0 - available) * 1000.0 / refillPerSecond).toLong().coerceAtLeast(1)
+                        ceil((required - available) * 1000.0 / refillPerSecond).toLong().coerceAtLeast(1)
                     } else null
                 }
                 if (waitMillis == null) signal.await()
@@ -106,10 +130,9 @@ class RateLimiter(
     }
 
     private fun refill() {
-        val now = TimeSource.Monotonic.markNow()
-        val elapsed = (now - lastRefill).inWholeNanoseconds / 1_000_000_000.0
+        val elapsed = lastRefill.elapsedNow().inWholeNanoseconds / 1_000_000_000.0
         tokens = (tokens + elapsed * refillPerSecond).coerceAtMost(capacity.toDouble() - waiters.size)
-        lastRefill = now
+        lastRefill = timeSource.markNow()
     }
 
     companion object {

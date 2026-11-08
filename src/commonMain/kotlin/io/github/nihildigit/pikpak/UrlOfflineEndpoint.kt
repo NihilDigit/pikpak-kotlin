@@ -79,8 +79,9 @@ suspend fun PikPakClient.createUrlFile(parentId: String, url: String): CreateUrl
         ?: return CreateUrlResult.InstantComplete(
             raw = obj,
             file = (obj["file"] as? JsonObject)?.let { json.decodeFromJsonElement(FileStat.serializer(), it) },
-        )
+        ).also { accountState.onOfflineInstantCompleted(it.file) }
     val task = json.decodeFromJsonElement(DriveTask.serializer(), taskNode)
+    accountState.onOfflineTaskQueued(task)
     return CreateUrlResult.Queued(task)
 }
 
@@ -105,6 +106,7 @@ suspend fun PikPakClient.deleteOfflineTasks(taskIds: List<String>, deleteFiles: 
         url = buildUrl(PikPakConstants.DRIVE_BASE, "/drive/v1/tasks", query),
         captchaAction = "DELETE:/drive/v1/tasks",
     )
+    if (deleteFiles) accountState.onStorageMutated()
 }
 
 /**
@@ -132,6 +134,7 @@ suspend fun PikPakClient.clearOfflineTasks(phases: Collection<String>, deleteFil
         url = "${PikPakConstants.DRIVE_BASE}/drive/v1/tasks:clear",
         captchaAction = "POST:/drive/v1/tasks:clear",
     ) { jsonBody(json, body) }
+    if (deleteFiles) accountState.onStorageMutated()
 }
 
 /**
@@ -175,5 +178,7 @@ suspend fun PikPakClient.listOfflineTasks(
         url = buildUrl(PikPakConstants.DRIVE_BASE, "/drive/v1/tasks", query),
         captchaAction = "GET:/drive/v1/tasks",
     )
-    return json.decodeFromJsonElement(TaskListResponse.serializer(), response)
+    return json.decodeFromJsonElement(TaskListResponse.serializer(), response).also {
+        accountState.observeTasks(it.tasks, baseline = pageToken.isNullOrEmpty())
+    }
 }

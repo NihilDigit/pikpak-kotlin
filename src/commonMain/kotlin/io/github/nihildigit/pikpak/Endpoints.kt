@@ -2,6 +2,7 @@ package io.github.nihildigit.pikpak
 
 import io.github.nihildigit.pikpak.internal.buildUrl
 import io.ktor.http.HttpMethod
+import kotlin.time.Duration
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -54,15 +55,26 @@ object FileFilter {
 /**
  * Returns the storage quota and the daily cloud-download count for the
  * authenticated account (`GET /drive/v1/about`).
+ *
+ * Concurrent callers on the same client share a single in-flight request, and
+ * the result updates [PikPakClient.quotaFlow] while preserving any local mutation
+ * deltas that occurred in flight or have not yet settled on `/drive/v1/about`.
  */
-suspend fun PikPakClient.getQuota(): QuotaResponse {
-    val response = http.request(
-        method = HttpMethod.Get,
-        url = "$DRIVE/drive/v1/about",
-        captchaAction = "GET:/drive/v1/about",
-    )
-    return json.decodeFromJsonElement(QuotaResponse.serializer(), response)
-}
+suspend fun PikPakClient.getQuota(): QuotaResponse = getQuota(Duration.ZERO)
+
+/**
+ * Returns the account's storage quota, reusing [PikPakClient.currentQuota] when it was
+ * fetched from the server within [maxAge] and no local storage mutation has dirtied it since.
+ */
+suspend fun PikPakClient.getQuota(maxAge: Duration): QuotaResponse =
+    accountState.getQuota(maxAge) {
+        val response = http.request(
+            method = HttpMethod.Get,
+            url = "$DRIVE/drive/v1/about",
+            captchaAction = "GET:/drive/v1/about",
+        )
+        json.decodeFromJsonElement(QuotaResponse.serializer(), response)
+    }
 
 /**
  * Lists all non-trashed entries directly under [parentId]. Pass an empty
@@ -122,6 +134,7 @@ suspend fun PikPakClient.listFilesPaged(
     )
     val suppressPrefetch = kotlin.coroutines.coroutineContext[SuppressFolderPrefetch.Key] != null
     return json.decodeFromJsonElement(FileListPage.serializer(), response).also {
+        accountState.observeFiles(it.files)
         if (!suppressPrefetch && parentId != "*" && extraFilters.isEmpty() && pageToken.isEmpty()) {
             onFolderListed(it.files, isFirstPage = true)
         }

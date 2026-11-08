@@ -6,14 +6,12 @@ package io.github.nihildigit.pikpak
  * The star is a system tag, not a flag. Observed 2026-09-24: a starred
  * item's listing entry carries `tags` `[{"name":"STAR",...}]` while its
  * `starred` field stays false, and [FileDetail.starred] reads false as well.
- * Read the star from [listStarred], not from those fields.
+ * Read [FileStat.isStarred] or [FileDetail.isStarred], which include tags.
  */
-suspend fun PikPakClient.starFiles(ids: List<String>) =
-    batchOperate(ids, "star")
+suspend fun PikPakClient.starFiles(ids: List<String>) { batchOperate(ids, "star") }
 
 /** Removes the star from [ids] (`POST /drive/v1/files:unstar`). No-op when [ids] is empty. */
-suspend fun PikPakClient.unstarFiles(ids: List<String>) =
-    batchOperate(ids, "unstar")
+suspend fun PikPakClient.unstarFiles(ids: List<String>) { batchOperate(ids, "unstar") }
 
 /**
  * Lists the starred, non-trashed items under [parentId]. The default `*`

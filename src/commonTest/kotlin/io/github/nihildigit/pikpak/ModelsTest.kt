@@ -8,6 +8,32 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class ModelsTest {
+    @Test
+    fun `limited origin remains readable when the download link is absent or blank`() {
+        val limited = DownloadLink("https://cdn/file?x_limited=%31")
+        val origin = MediaVariant(isOrigin = true, link = limited)
+        for (links in listOf(emptyMap(), mapOf(FileDetail.OCTET_STREAM to DownloadLink("  ")))) {
+            val detail = FileDetail(medias = listOf(origin), links = links)
+            assertEquals(limited, detail.originalLink)
+            assertEquals(limited.url, detail.downloadUrl)
+            assertEquals(limited, detail.resolveVariant(VariantPreference.Original).link)
+        }
+        val download = DownloadLink("https://cdn/download")
+        val detail = FileDetail(medias = listOf(origin), links = mapOf(FileDetail.OCTET_STREAM to download))
+        assertEquals(download, detail.originalLink)
+        val unrestricted = DownloadLink("https://cdn/original")
+        assertEquals(unrestricted, detail.copy(medias = listOf(origin,
+            MediaVariant(isOrigin = true, link = unrestricted))).originalLink)
+    }
+
+    @Test
+    fun `limited flag uses decoded parameters and ignores fragments`() {
+        assertTrue(DownloadLink("https://cdn/f?%78_limited=%31").isLimited)
+        assertTrue(DownloadLink("https://cdn/f?x_limited=0&x_limited=1").isLimited)
+        assertFalse(DownloadLink("https://cdn/f?x_limited=0#x_limited=1").isLimited)
+        assertFalse(DownloadLink("https://cdn/f?x_limited=%GG").isLimited)
+        assertFalse(DownloadLink("https://cdn/f?x_limited=1%20").isLimited)
+    }
 
     private val json = Json { ignoreUnknownKeys = true }
 

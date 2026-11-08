@@ -41,8 +41,9 @@ class OfflinePruneMockTest {
                 path.endsWith("/drive/v1/files/ROOT") -> respondJson("""{"kind":"${FileKind.FOLDER}","id":"ROOT","name":"Pack"}""")
                 path.endsWith("/drive/v1/files:batchDelete") -> {
                     deleteBodies += body
-                    respondJson("{}")
+                    respondJson("""{"task_id":"DELETE"}""")
                 }
+                path.endsWith("/drive/v1/tasks") -> respondJson("""{"tasks":[{"id":"DELETE","phase":"PHASE_TYPE_COMPLETE"}]}""")
                 path.endsWith("/drive/v1/files") -> {
                     listed += parentId
                     respondJson("""{"files":[${tree.getValue(parentId).joinToString(",")}],"next_page_token":""}""")

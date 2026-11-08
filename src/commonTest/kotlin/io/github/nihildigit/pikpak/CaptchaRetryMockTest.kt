@@ -163,7 +163,7 @@ class CaptchaRetryMockTest {
                 path.endsWith("/v1/auth/signin") -> json(
                     """{"access_token":"AT-1","refresh_token":"RT-1","sub":"USER","expires_in":3600}""",
                 )
-                path.endsWith("/drive/v1/about") -> {
+                path.endsWith("/drive/v1/files") -> {
                     val token = request.headers["X-Captcha-Token"]
                     if (token == "CAPTCHA-1") {
                         // complete atomically elects the first arrival; checking isCompleted
@@ -172,7 +172,7 @@ class CaptchaRetryMockTest {
                         bothArrived.await()
                         json("""{"error_code":9,"error":"captcha_required"}""")
                     } else {
-                        json("""{"kind":"drive#about","quota":{"limit":"10","usage":"1"}}""")
+                        json("""{"next_page_token":"","files":[{"kind":"drive#file","id":"FID","name":"hello.txt","size":"5"}]}""")
                     }
                 }
                 else -> respond(
@@ -194,15 +194,15 @@ class CaptchaRetryMockTest {
                 client.login()
                 assertEquals("CAPTCHA-1", client.state.captchaToken)
 
-                val results = listOf(async { client.getQuota() }, async { client.getQuota() }).awaitAll()
-                assertTrue(results.all { it.quota.limitBytes == 10L }, "both callers must get the retried response")
+                val results = listOf(async { client.listFiles("folder-a") }, async { client.listFiles("folder-b") }).awaitAll()
+                assertTrue(results.all { it.single().name == "hello.txt" }, "both callers must get the retried response")
 
                 assertEquals(
                     2, log.count { it.endsWith("/v1/shield/captcha/init") },
                     "one init at signin plus one shared refresh — not one refresh per coroutine",
                 )
                 assertEquals(
-                    4, log.count { it == "GET /drive/v1/about" },
+                    4, log.count { it == "GET /drive/v1/files" },
                     "both stale requests must be rejected and retried exactly once",
                 )
                 assertEquals("CAPTCHA-2", client.state.captchaToken)

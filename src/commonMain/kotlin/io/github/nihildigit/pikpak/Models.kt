@@ -54,11 +54,15 @@ data class FileStat(
      * response stayed false on starred items when probed on 2026-09-24.
      */
     val tags: List<FileTag> = emptyList(),
+    val starred: Boolean = false,
+    val revision: String = "",
+    val writable: Boolean = true,
 ) {
     val isFolder: Boolean get() = kind == FileKind.FOLDER
 
     /** Whether the item is starred; see [tags]. */
-    val isStarred: Boolean get() = tags.any { it.name == FileTag.STAR }
+    val isStarred: Boolean get() = starred || tags.any { it.name == FileTag.STAR }
+    val dbModifyTime: String get() = params["db_modify_time"].orEmpty()
     val isFile: Boolean get() = kind == FileKind.FILE
     val sizeBytes: Long get() = size.toLongOrNull() ?: 0L
 
@@ -82,6 +86,9 @@ data class FileTag(
 data class FileListPage(
     @SerialName("next_page_token") val nextPageToken: String = "",
     val files: List<FileStat> = emptyList(),
+    @SerialName("sync_time") val syncTime: String = "",
+    val version: String = "",
+    @SerialName("version_outdated") val versionOutdated: Boolean = false,
 )
 
 @Serializable
@@ -91,6 +98,10 @@ data class DownloadLink(
     /** Raw `expire` field as PikPak sends it. Prefer [expiresAt]. */
     val expire: String = "",
 ) {
+    /** The CDN explicitly marked this signed URL as rate limited. */
+    val isLimited: Boolean
+        get() = io.github.nihildigit.pikpak.internal.signedUrlParameters(url)?.getAll("x_limited")?.contains("1") == true
+
     /**
      * When the signature on [url] stops being accepted, or null when PikPak
      * gave nothing parseable. Past this moment the CDN answers 403 with an
@@ -125,15 +136,8 @@ private fun parseExpiry(raw: String?): Instant? {
     }
 }
 
-private fun String.queryParam(name: String): String? {
-    val q = substringAfter('?', "")
-    if (q.isEmpty()) return null
-    for (pair in q.split('&')) {
-        val eq = pair.indexOf('=')
-        if (eq > 0 && pair.substring(0, eq) == name) return pair.substring(eq + 1)
-    }
-    return null
-}
+private fun String.queryParam(name: String): String? =
+    io.github.nihildigit.pikpak.internal.signedUrlParameters(this)?.get(name)
 
 /**
  * Per-track media metadata for a [MediaVariant]. Populated for video files;
@@ -201,7 +205,7 @@ data class FileDetail(
     val hash: String = "",
     val phase: String = "",
     val revision: String = "",
-    /** Stayed false on starred items when probed on 2026-09-24; read [FileStat.isStarred] from a listing instead. */
+    /** Raw wire flag; use [isStarred], which also includes system tags. */
     val starred: Boolean = false,
     @SerialName("web_content_link") val webContentLink: String = "",
     /**
@@ -218,15 +222,22 @@ data class FileDetail(
      *
      * On a free account the origin entry is listed without a link, while the
      * transcodes keep theirs and [links] still carries the original through
-     * [octetStream] (2026-09-29): read that for the original, not the origin
-     * variant.
+     * [octetStream] (2026-09-29). [originalLink] selects the original-media
+     * link when usable and falls back to that ordinary link otherwise.
      */
     val medias: List<MediaVariant> = emptyList(),
     val trashed: Boolean = false,
     val writable: Boolean = true,
     /** Server-supplied extras; see [FileStat.params]. */
     val params: Map<String, String> = emptyMap(),
+    val tags: List<FileTag> = emptyList(),
+    @SerialName("created_time") val createdTime: String = "",
+    @SerialName("modified_time") val modifiedTime: String = "",
+    @SerialName("delete_time") val deleteTime: String = "",
 ) {
+    val isStarred: Boolean get() = starred || tags.any { it.name == FileTag.STAR }
+    val dbModifyTime: String get() = params["db_modify_time"].orEmpty()
+
     val sizeBytes: Long get() = size.toLongOrNull() ?: 0L
 
     /** Where the item came from: a magnet or a share link, see [FileStat.params]. Null when neither. */
@@ -235,7 +246,16 @@ data class FileDetail(
     /** The `application/octet-stream` link — the raw file — or an empty one. */
     val octetStream: DownloadLink get() = links[OCTET_STREAM] ?: DownloadLink()
 
-    val downloadUrl: String? get() = octetStream.url.takeIf { it.isNotBlank() }
+    /** Premium original-media links serve the same bytes with a different service policy. */
+    val originMediaLink: DownloadLink?
+        get() = medias.firstOrNull { it.isOrigin && it.link.url.isNotBlank() && !it.link.isLimited }?.link
+
+    /** Prefer unrestricted media, then ordinary download, retaining limited media as a last resort. */
+    val originalLink: DownloadLink
+        get() = originMediaLink ?: octetStream.takeIf { it.url.isNotBlank() }
+            ?: medias.firstOrNull { it.isOrigin && it.link.url.isNotBlank() }?.link ?: octetStream
+
+    val downloadUrl: String? get() = originalLink.url.takeIf { it.isNotBlank() }
 
     companion object {
         const val OCTET_STREAM = "application/octet-stream"
@@ -251,6 +271,7 @@ data class QuotaInfo(
 ) {
     val limitBytes: Long get() = limit.toLongOrNull() ?: 0L
     val usageBytes: Long get() = usage.toLongOrNull() ?: 0L
+    val usageInTrashBytes: Long get() = usageInTrash.toLongOrNull() ?: 0L
     val remainingBytes: Long get() = limitBytes - usageBytes
 }
 

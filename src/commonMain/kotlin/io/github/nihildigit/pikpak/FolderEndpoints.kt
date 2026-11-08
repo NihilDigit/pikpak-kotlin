@@ -102,7 +102,7 @@ private suspend fun PikPakClient.walkFolders(
 }
 
 /** Creates a folder under [parentId]. Returns the new folder's id. */
-suspend fun PikPakClient.createFolder(parentId: String, name: String): String {
+suspend fun PikPakClient.createFolder(parentId: String, name: String): String = withInteractiveApiPriority {
     val body = buildJsonObject {
         put("kind", FileKind.FOLDER)
         if (parentId.isNotEmpty()) put("parent_id", parentId)
@@ -114,7 +114,7 @@ suspend fun PikPakClient.createFolder(parentId: String, name: String): String {
         captchaAction = "POST:/drive/v1/files",
     ) { jsonBody(json, body) }
     // as? rather than jsonObject: an explicit "file": null must reach the error below, not throw a cast failure
-    return ((response as? JsonObject)?.get("file") as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull
+    ((response as? JsonObject)?.get("file") as? JsonObject)?.get("id")?.jsonPrimitive?.contentOrNull
         ?: throw PikPakException(-1, "createFolder: response missing file.id", rawBody = response.toString())
 }
 
@@ -129,6 +129,7 @@ suspend fun PikPakClient.deleteFile(fileId: String) {
         url = "$DRIVE$FILES_PATH/$fileId",
         captchaAction = "DELETE:/drive/v1/files",
     )
+    accountState.onFilesDeleted(listOf(fileId))
     folderIds.invalidateAll()
     invalidatePrefetchedDetail()
 }
@@ -140,24 +141,27 @@ suspend fun PikPakClient.deleteFile(fileId: String) {
  * No-op when [ids] is empty. For permanent removal that bypasses the trash, see
  * [batchDelete].
  */
-suspend fun PikPakClient.batchTrash(ids: List<String>) =
-    batchOperate(ids, "batchTrash")
+suspend fun PikPakClient.batchTrash(ids: List<String>, awaitCompletion: Boolean = true) {
+    batchOperate(ids, "batchTrash", awaitCompletion = awaitCompletion)
+}
 
 /**
  * Permanently removes multiple files/folders, bypassing the trash. Items are
  * not recoverable. No-op when [ids] is empty. For a recoverable delete, use
  * [batchTrash].
  */
-suspend fun PikPakClient.batchDelete(ids: List<String>) =
-    batchOperate(ids, "batchDelete")
+suspend fun PikPakClient.batchDelete(ids: List<String>, awaitCompletion: Boolean = true) {
+    batchOperate(ids, "batchDelete", awaitCompletion = awaitCompletion)
+}
 
 /**
  * Restores trashed items back to their original parent folder. Counterpart to
  * [batchTrash]. No-op when [ids] is empty. Ids must reference items currently
  * in the trash; untrashing a non-trashed item is a no-op on PikPak's side.
  */
-suspend fun PikPakClient.batchUntrash(ids: List<String>) =
-    batchOperate(ids, "batchUntrash")
+suspend fun PikPakClient.batchUntrash(ids: List<String>, awaitCompletion: Boolean = true) {
+    batchOperate(ids, "batchUntrash", awaitCompletion = awaitCompletion)
+}
 
 /** Permanently removes every item in the account's trash. */
 suspend fun PikPakClient.emptyTrash() {
@@ -166,6 +170,7 @@ suspend fun PikPakClient.emptyTrash() {
         url = "$DRIVE$FILES_PATH/trash:empty",
         captchaAction = "PATCH:/drive/v1/files/trash:empty",
     )
+    accountState.onTrashEmptied()
     folderIds.invalidateAll()
     invalidatePrefetchedDetail()
 }
@@ -173,39 +178,76 @@ suspend fun PikPakClient.emptyTrash() {
 /**
  * One `files:<op>` call per [BATCH_ID_LIMIT] ids.
  *
- * PikPak caps how many ids one call may name: measured 2026-09-12, 200 are
- * accepted and 1000 answer `operating_file_count_exceeded` (error_code 11).
- * Callers that hand over a whole folder listing cannot know how long it is, so
- * the split happens here rather than at each call site. Chunks are sent in
- * order and a failing one leaves the chunks before it applied — which is why
- * the folder memo is dropped however the loop ends, not only after the last.
+ * The official desktop client submits 500 ids per batch. By default each
+ * returned task is awaited before submitting the next chunk. A failing chunk
+ * leaves earlier chunks applied, so caches are invalidated even on failure.
  */
 internal suspend fun PikPakClient.batchOperate(
     ids: List<String>,
     op: String,
     to: String? = null,
-) {
-    if (ids.isEmpty()) return
+    awaitCompletion: Boolean = true,
+    query: Map<String, String> = emptyMap(),
+    onSubmitted: suspend (FileBatchReceipt) -> Unit = {},
+): List<FileBatchReceipt> = withInteractiveApiPriority {
+    require(ids.all { it.isNotBlank() })
+    val receipts = ArrayList<FileBatchReceipt>()
     try {
-        for (chunk in ids.chunked(BATCH_ID_LIMIT)) {
+        for (chunk in ids.distinct().chunked(if (op.startsWith("batch")) BATCH_ID_LIMIT else 100)) {
             val body = buildJsonObject {
                 putJsonArray("ids") { chunk.forEach { add(it) } }
                 if (to != null) putJsonObject("to") { put("parent_id", to) }
             }
-            http.request(
+            val raw = http.request(
                 method = HttpMethod.Post,
-                url = "$DRIVE$FILES_PATH:$op",
+                url = buildUrl(DRIVE, "$FILES_PATH:$op", query),
                 captchaAction = "POST:/drive/v1/files:$op",
             ) { jsonBody(json, body) }
+            val receipt = json.decodeFromJsonElement(FileBatchReceipt.serializer(), raw)
+            if (op.startsWith("batch") && receipt.taskId.isBlank() && receipt.ids.isEmpty()) {
+                throw PikPakException(-1, "$op: response missing task_id and ids")
+            }
+            receipts += receipt
+            onSubmitted(receipt)
+            folderIds.invalidateAll()
+            invalidatePrefetchedDetail()
+            if (awaitCompletion && receipt.taskId.isNotEmpty()) awaitTasks(listOf(receipt.taskId))
+            when (op) {
+                "batchTrash" -> accountState.onFilesTrashed(chunk)
+                "batchDelete" -> accountState.onFilesDeleted(chunk)
+                "batchUntrash" -> accountState.onFilesUntrashed(chunk)
+                "batchCopy" -> accountState.onStorageMutated()
+            }
         }
+        receipts
     } finally {
         folderIds.invalidateAll()
         invalidatePrefetchedDetail()
     }
 }
 
-/** Half of the smallest count measured to fail, so a future tightening has room. */
-internal const val BATCH_ID_LIMIT = 100
+/** Batch size used by the official desktop client. */
+internal const val BATCH_ID_LIMIT = 500
+
+/** A submission receipt; returned ids are not task identities. */
+@kotlinx.serialization.Serializable
+data class FileBatchReceipt(
+    @kotlinx.serialization.SerialName("task_id") val taskId: String = "",
+    val ids: List<String> = emptyList(),
+)
+
+enum class FileBatchOperation(internal val endpoint: String) {
+    Move("batchMove"), Copy("batchCopy"), Trash("batchTrash"), Restore("batchUntrash"), Delete("batchDelete")
+}
+
+/** Submit without waiting so a caller can persist task ids before polling. */
+suspend fun PikPakClient.submitFileBatch(
+    ids: List<String>, operation: FileBatchOperation, toParentId: String? = null,
+    onSubmitted: suspend (FileBatchReceipt) -> Unit = {},
+): List<FileBatchReceipt> {
+    require(operation !in listOf(FileBatchOperation.Move, FileBatchOperation.Copy) || toParentId != null)
+    return batchOperate(ids, operation.endpoint, toParentId, awaitCompletion = false, onSubmitted = onSubmitted)
+}
 
 /**
  * Relocates [ids] to [toParentId] (empty string for the root drive). The "update"
@@ -213,19 +255,17 @@ internal const val BATCH_ID_LIMIT = 100
  * Split into calls of [BATCH_ID_LIMIT] ids like the other batch operations; one
  * call naming a whole large listing was refused with nothing moved.
  */
-suspend fun PikPakClient.batchMove(ids: List<String>, toParentId: String) =
-    batchOperate(ids, "batchMove", to = toParentId)
+suspend fun PikPakClient.batchMove(ids: List<String>, toParentId: String, awaitCompletion: Boolean = true) {
+    batchOperate(ids, "batchMove", to = toParentId, awaitCompletion = awaitCompletion)
+}
 
 /**
  * Copies [ids] into [toParentId] (empty string for the root drive) and returns
  * the server's task id for each [BATCH_ID_LIMIT]-sized chunk. No-op returning
  * an empty list when [ids] is empty.
  *
- * The copy runs as a server task (`type` `copy`) that [getTask] can read.
- * Observed 2026-09-24 on a folder with one empty subfolder: the task was
- * already `PHASE_TYPE_COMPLETE` and the copy listed in the target when the
- * call returned; nothing was measured for larger trees, so a caller that
- * needs the copy in place should check the task rather than assume it.
+ * The copy runs as a server task, awaited by default. Set [awaitCompletion]
+ * false to return after submission, then call [awaitTasks] explicitly.
  * Copying into the item's own parent or into its own subtree is refused with
  * `file_move_or_copy_to_cur` (error_code 9, same as [batchMove]).
  *
@@ -236,28 +276,16 @@ suspend fun PikPakClient.batchCopy(
     ids: List<String>,
     toParentId: String,
     unzipPassword: String? = null,
+    awaitCompletion: Boolean = true,
 ): List<String> {
     if (ids.isEmpty()) return emptyList()
     val query = if (unzipPassword != null) mapOf("unzip_password" to unzipPassword) else emptyMap()
-    val taskIds = ids.chunked(BATCH_ID_LIMIT).map { chunk ->
-        val body = buildJsonObject {
-            putJsonArray("ids") { chunk.forEach { add(it) } }
-            putJsonObject("to") { put("parent_id", toParentId) }
-        }
-        val response = http.request(
-            method = HttpMethod.Post,
-            url = buildUrl(DRIVE, "$FILES_PATH:batchCopy", query),
-            captchaAction = "POST:/drive/v1/files:batchCopy",
-        ) { jsonBody(json, body) }
-        (response as? JsonObject)?.get("task_id")?.jsonPrimitive?.contentOrNull
-            ?: throw PikPakException(-1, "batchCopy: response missing task_id", rawBody = response.toString())
-    }
-    folderIds.invalidateAll()
-    return taskIds
+    return batchOperate(ids, "batchCopy", toParentId, awaitCompletion, query)
+        .mapNotNull { it.taskId.takeIf(String::isNotEmpty) }
 }
 
 /** Renames [fileId] to [newName]. Empty names are rejected client-side. */
-suspend fun PikPakClient.rename(fileId: String, newName: String) {
+suspend fun PikPakClient.rename(fileId: String, newName: String) = withInteractiveApiPriority {
     require(newName.isNotEmpty()) { "newName must not be empty" }
     val body = buildJsonObject { put("name", newName) }
     http.request(
@@ -281,6 +309,7 @@ internal suspend fun PikPakClient.fetchFileDetailLive(fileId: String): FileDetai
         captchaAction = "GET:/drive/v1/files",
     )
     return json.decodeFromJsonElement(FileDetail.serializer(), response).also { detail ->
+        accountState.observeFile(detail)
         hostHealth.observe(detail)
         if (ownsCdnClient) {
             detail.downloadUrl?.let { warmHostIfCold(it) }
@@ -292,10 +321,10 @@ internal suspend fun PikPakClient.fetchFileDetailLive(fileId: String): FileDetai
  * Returns full file metadata including signed download links. For directory
  * listings prefer [listFiles] — this endpoint is per-id and slower at scale.
  */
-suspend fun PikPakClient.getFile(fileId: String): FileDetail {
+suspend fun PikPakClient.getFile(fileId: String): FileDetail = withDefaultApiPriority(ApiRequestPriority.INTERACTIVE) {
     consumePrefetchedDetail(fileId)?.let { prefetched ->
         try {
-            return prefetched.await()
+            return@withDefaultApiPriority prefetched.await()
         } catch (e: kotlinx.coroutines.CancellationException) {
             kotlinx.coroutines.currentCoroutineContext().let { ctx ->
                 if (ctx[kotlinx.coroutines.Job]?.isActive == false) throw e
@@ -304,5 +333,5 @@ suspend fun PikPakClient.getFile(fileId: String): FileDetail {
             // Fall through to a live request if the background prefetch failed or was cancelled.
         }
     }
-    return fetchFileDetailLive(fileId)
+    fetchFileDetailLive(fileId)
 }

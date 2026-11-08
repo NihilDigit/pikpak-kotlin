@@ -2,6 +2,7 @@ package io.github.nihildigit.pikpak
 
 import io.github.nihildigit.pikpak.internal.buildUrl
 import io.ktor.http.HttpMethod
+import kotlin.time.Duration
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -71,12 +72,22 @@ data class TransferQuota(
  * and an instant copy that leaves `about` untouched still draws on [TransferAllowances.upload].
  * The response carries no reset time; the web client shows the first of the
  * month, 00:00 SGT.
+ *
+ * Concurrent callers on the same client share a single in-flight request, and
+ * the result updates [PikPakClient.transferQuotaFlow] and [PikPakClient.isFreeAccountFlow].
  */
-suspend fun PikPakClient.getTransferQuota(): TransferQuota {
-    val response = http.request(
-        method = HttpMethod.Get,
-        url = buildUrl(PikPakConstants.DRIVE_BASE, "/vip/v1/quantity/list", mapOf("type" to "transfer", "limit" to "200")),
-        captchaAction = "GET:/vip/v1/quantity/list",
-    )
-    return json.decodeFromJsonElement(TransferQuota.serializer(), response)
-}
+suspend fun PikPakClient.getTransferQuota(): TransferQuota = getTransferQuota(Duration.ZERO)
+
+/**
+ * Returns the account's transfer allowances, reusing [PikPakClient.currentTransferQuota]
+ * when it was fetched from the server within [maxAge] and no transfer activity has dirtied it since.
+ */
+suspend fun PikPakClient.getTransferQuota(maxAge: Duration): TransferQuota =
+    accountState.getTransferQuota(maxAge) {
+        val response = http.request(
+            method = HttpMethod.Get,
+            url = buildUrl(PikPakConstants.DRIVE_BASE, "/vip/v1/quantity/list", mapOf("type" to "transfer", "limit" to "200")),
+            captchaAction = "GET:/vip/v1/quantity/list",
+        )
+        json.decodeFromJsonElement(TransferQuota.serializer(), response)
+    }

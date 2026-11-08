@@ -32,10 +32,36 @@ data class Session(
  */
 internal fun Session.isUsable(): Boolean = accessToken.isNotEmpty() && expiresAt > Clock.System.now().epochSeconds
 
+/**
+ * Cached non-secret account state (storage quota, transfer allowances, user profile)
+ * persisted alongside the account's [Session] so a client starts with the last known
+ * state already populated in [PikPakClient.quotaFlow], [PikPakClient.transferQuotaFlow]
+ * and [PikPakClient.userProfileFlow] before the network answers.
+ */
+@Serializable
+data class AccountSnapshot(
+    val quota: QuotaResponse? = null,
+    val transferQuota: TransferQuota? = null,
+    val userProfile: UserProfile? = null,
+    @SerialName("updated_at_epoch_ms") val updatedAtEpochMs: Long = 0L,
+)
+
 interface SessionStore {
     suspend fun load(account: String): Session?
     suspend fun save(account: String, session: Session)
     suspend fun clear(account: String)
+
+    /**
+     * Loads the last persisted [AccountSnapshot] for [account], or null when none is stored.
+     * Default implementation returns null so minimal custom stores only have to implement
+     * the three session methods.
+     */
+    suspend fun loadAccountSnapshot(account: String): AccountSnapshot? = null
+
+    /**
+     * Persists [snapshot] for [account]. Default implementation is a no-op.
+     */
+    suspend fun saveAccountSnapshot(account: String, snapshot: AccountSnapshot) {}
 }
 
 /**
@@ -48,6 +74,7 @@ interface SessionStore {
 class InMemorySessionStore : SessionStore {
     private val mutex = Mutex()
     private val storage = mutableMapOf<String, Session>()
+    private val snapshots = mutableMapOf<String, AccountSnapshot>()
 
     override suspend fun load(account: String): Session? = mutex.withLock { storage[account] }
 
@@ -58,6 +85,16 @@ class InMemorySessionStore : SessionStore {
 
     override suspend fun clear(account: String) = mutex.withLock {
         storage.remove(account)
+        snapshots.remove(account)
+        Unit
+    }
+
+    override suspend fun loadAccountSnapshot(account: String): AccountSnapshot? = mutex.withLock {
+        snapshots[account]
+    }
+
+    override suspend fun saveAccountSnapshot(account: String, snapshot: AccountSnapshot) = mutex.withLock {
+        snapshots[account] = snapshot
         Unit
     }
 }

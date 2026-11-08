@@ -29,7 +29,6 @@ import io.ktor.http.isSuccess
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration
-import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -210,12 +209,14 @@ internal class HttpEngine(
         method: HttpMethod,
         url: String,
         configure: HttpRequestBuilder.() -> Unit = {},
+        retryRequests: Boolean = true,
         block: suspend (HttpResponse) -> T,
     ): T = execute(
         client = cdnClient(),
         method = method,
         url = url,
         rateLimited = false,
+        retryRequests = retryRequests,
         configure = {
             accept(ContentType.Any)
             configure()
@@ -256,6 +257,7 @@ internal class HttpEngine(
         method: HttpMethod,
         url: String,
         rateLimited: Boolean,
+        retryRequests: Boolean = true,
         configure: HttpRequestBuilder.() -> Unit,
         block: suspend (HttpResponse) -> T,
     ): T {
@@ -273,7 +275,7 @@ internal class HttpEngine(
                 }.execute { response ->
                     val status = response.status.value
                     val retryable = status == 429 || status == 503 || (replayable && status >= 500)
-                    if (retryable && attempt < policy.maxAttempts - 1) {
+                    if (retryRequests && retryable && attempt < policy.maxAttempts - 1) {
                         throw RetryableStatus(status, response.retryAfter())
                     }
                     blockEntered = true
@@ -290,7 +292,7 @@ internal class HttpEngine(
                     continue
                 }
                 val retryable = if (replayable) isTransient(t) else t.failedBeforeSending()
-                if (!retryable || attempt >= policy.maxAttempts - 1) throw t
+                if (!retryRequests || !retryable || attempt >= policy.maxAttempts - 1) throw t
                 val waitFor = policy.delayFor(attempt)
                 recordRetry(null, waitFor)
                 delay(waitFor)
@@ -435,18 +437,7 @@ internal fun JsonElement.envelopeError(
 internal fun HttpResponse.headerMap(): Map<String, List<String>> =
     headers.entries().associate { it.key.lowercase() to it.value }
 
-/**
- * Reads `Retry-After`. Only the delta-seconds form is honoured; the HTTP-date
- * form would need a parser and neither PikPak's API nor its CDN has been seen
- * to send one. Absurd values are clamped so a hostile header can't park a
- * coroutine for an hour.
- */
-private fun HttpResponse.retryAfter(): Duration? {
-    val raw = headers[HttpHeaders.RetryAfter]?.trim() ?: return null
-    val seconds = raw.toLongOrNull() ?: return null
-    if (seconds < 0) return null
-    return seconds.coerceAtMost(30L).seconds
-}
+private fun HttpResponse.retryAfter(): Duration? = parseRetryAfter(headers[HttpHeaders.RetryAfter])
 
 internal fun buildUrl(base: String, path: String, query: Map<String, String> = emptyMap()): String =
     buildUrl(base, path, query.toList())

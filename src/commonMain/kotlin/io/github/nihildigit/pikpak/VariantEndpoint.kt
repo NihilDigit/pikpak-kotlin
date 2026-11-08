@@ -9,7 +9,7 @@ package io.github.nihildigit.pikpak
  * and cannot change afterwards.
  */
 sealed interface VariantPreference {
-    /** The unmodified source, via the octet-stream link. */
+    /** The unmodified source, preferring the unrestricted original-media link. */
     data object Original : VariantPreference
 
     /**
@@ -29,7 +29,7 @@ sealed interface VariantPreference {
  */
 data class ResolvedVariant(
     /**
-     * Null for the original file (octet-stream link); otherwise
+     * Null for the original byte stream, regardless of its signed-link class; otherwise
      * [MediaVariant.mediaId].
      */
     val mediaId: String?,
@@ -57,7 +57,7 @@ private val MediaVariant.isPlayableTranscode: Boolean
     get() = !isOrigin && video != null && link.url.isNotBlank()
 
 private fun FileDetail.originalVariant(): ResolvedVariant {
-    val link = octetStream
+    val link = originalLink
     if (link.url.isBlank()) {
         throw PikPakException(-1, "resolveVariant: file $id has no octet-stream link")
     }

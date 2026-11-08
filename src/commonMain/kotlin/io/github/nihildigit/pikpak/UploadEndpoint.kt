@@ -168,7 +168,11 @@ data class UploadSession(
 suspend fun PikPakClient.startUpload(parentId: String, name: String, size: Long, gcid: String): UploadStart {
     val node = createUploadNode(parentId, name, size, gcid)
     val fileId = node.fileId
-    if (node.phase == TaskPhase.COMPLETE) return UploadStart.Instant(fileId)
+    if (node.phase == TaskPhase.COMPLETE) {
+        accountState.onInstantCreated(fileId, size)
+        return UploadStart.Instant(fileId)
+    }
+    accountState.onUploadPending(fileId, size)
 
     try {
         val params = ((node.response["resumable"] as? JsonObject)?.get("params") as? JsonObject)
@@ -388,6 +392,7 @@ private suspend fun PikPakClient.ossUploadPart(
         body = body,
     ) { it.headers[HttpHeaders.ETag] }
         ?: throw PikPakException(-1, "upload: part $partNumber missing ETag")
+    accountState.onUploadBytesSent(body.size.toLong())
     return raw.trim('"')
 }
 
@@ -405,6 +410,7 @@ private suspend fun PikPakClient.ossComplete(session: UploadSession, parts: Map<
         rawQuery = "uploadId=${session.uploadId}",
         body = xml.encodeToByteArray(),
     ) { }
+    accountState.onUploadCompleted(session.fileId, session.size)
 }
 
 /**

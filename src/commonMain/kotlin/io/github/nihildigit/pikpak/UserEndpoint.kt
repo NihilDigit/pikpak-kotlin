@@ -1,6 +1,10 @@
 package io.github.nihildigit.pikpak
 
 import io.ktor.http.HttpMethod
+import kotlin.time.Clock
+import kotlin.time.Duration
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -61,12 +65,38 @@ data class UserProfile(
  * Lives on `user.mypikpak.com` rather than the drive host, which is why the
  * captcha action is a full URL: actions on the user host are signed with one
  * (see the signin flow), while drive actions use the bare path.
+ *
+ * Concurrent callers on the same client share a single in-flight request, and
+ * the result updates [PikPakClient.userProfileFlow].
  */
-suspend fun PikPakClient.getUserProfile(): UserProfile {
-    val response = http.request(
-        method = HttpMethod.Get,
-        url = USER_ME_URL,
-        captchaAction = "GET:$USER_ME_URL",
+suspend fun PikPakClient.getUserProfile(): UserProfile = getUserProfile(Duration.ZERO)
+
+/**
+ * Returns the authenticated account's profile, reusing [PikPakClient.currentUserProfile]
+ * when it was fetched within [maxAge].
+ */
+suspend fun PikPakClient.getUserProfile(maxAge: Duration): UserProfile =
+    accountState.getUserProfile(maxAge) {
+        val response = http.request(
+            method = HttpMethod.Get,
+            url = USER_ME_URL,
+            captchaAction = "GET:$USER_ME_URL",
+        )
+        json.decodeFromJsonElement(UserProfile.serializer(), response)
+    }
+
+/**
+ * Refreshes [getQuota], [getTransferQuota] and [getUserProfile] in parallel (honouring
+ * [maxAge] and single-flight deduplication on each) and returns the combined [AccountSnapshot].
+ */
+suspend fun PikPakClient.refreshAccountState(maxAge: Duration = Duration.ZERO): AccountSnapshot = coroutineScope {
+    val quotaDef = async { getQuota(maxAge) }
+    val transferDef = async { getTransferQuota(maxAge) }
+    val profileDef = async { getUserProfile(maxAge) }
+    AccountSnapshot(
+        quota = quotaDef.await(),
+        transferQuota = transferDef.await(),
+        userProfile = profileDef.await(),
+        updatedAtEpochMs = Clock.System.now().toEpochMilliseconds(),
     )
-    return json.decodeFromJsonElement(UserProfile.serializer(), response)
 }

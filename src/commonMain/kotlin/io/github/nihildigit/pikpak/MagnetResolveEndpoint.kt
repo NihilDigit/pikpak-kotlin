@@ -195,8 +195,10 @@ suspend fun PikPakClient.instantCreate(
         node.fileId.takeIf { it.isNotEmpty() }?.let { runCatching { deleteFile(it) } }
         throw InstantContentUnavailableException(gcid, name, node.phase)
     }
-    return node.fileId.takeIf { it.isNotEmpty() }
+    val fileId = node.fileId.takeIf { it.isNotEmpty() }
         ?: throw PikPakException(-1, "instantCreate: completed response carries no file id for $name")
+    accountState.onInstantCreated(fileId, file.size)
+    return fileId
 }
 
 private fun JsonElement.asObject(): JsonObject? = this as? JsonObject

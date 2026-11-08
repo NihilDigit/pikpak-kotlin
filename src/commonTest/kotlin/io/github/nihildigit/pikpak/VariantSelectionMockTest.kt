@@ -26,6 +26,24 @@ import kotlin.time.Duration.Companion.milliseconds
  * both that it does and that a variant which disappeared fails loudly.
  */
 class VariantSelectionMockTest {
+    @Test
+    fun `original media wins without changing byte identity and limited or blank links fall back`() {
+        val ordinary = DownloadLink("https://cdn/file?ms=5242880")
+        val media = DownloadLink("https://cdn/file?category=original&ms=81600000")
+        val base = FileDetail(size = "1234", links = mapOf(FileDetail.OCTET_STREAM to ordinary),
+            medias = listOf(MediaVariant(isOrigin = true, link = media)))
+        val selected = base.resolveVariant(VariantPreference.Original)
+        assertEquals(media, selected.link)
+        assertEquals(null, selected.mediaId)
+        assertEquals(1234L, selected.sizeBytes)
+        assertEquals(media.url, base.downloadUrl)
+        assertEquals(media, base.variant(null)?.link)
+        for (fallback in listOf(DownloadLink(), media.copy(url = media.url + "&x_limited=1"))) {
+            val detail = base.copy(medias = listOf(MediaVariant(isOrigin = true, link = fallback)))
+            assertEquals(ordinary, detail.resolveVariant(VariantPreference.Original).link)
+        }
+        assertEquals(media, base.copy(links = emptyMap()).resolveVariant(VariantPreference.Original).link)
+    }
 
     private val content = ByteArray(512) { (it % 251).toByte() }
 

@@ -46,6 +46,26 @@ class FileSessionStore(
     override suspend fun clear(account: String) {
         val file = sessionPath(account)
         if (SystemFileSystem.exists(file)) SystemFileSystem.delete(file)
+        val snapshotFile = snapshotPath(account)
+        if (SystemFileSystem.exists(snapshotFile)) SystemFileSystem.delete(snapshotFile)
+    }
+
+    override suspend fun loadAccountSnapshot(account: String): AccountSnapshot? {
+        val file = snapshotPath(account)
+        if (!SystemFileSystem.exists(file)) return null
+        return runCatching {
+            val text = SystemFileSystem.source(file).buffered().use { it.readString() }
+            json.decodeFromString(AccountSnapshot.serializer(), text)
+        }.getOrNull()
+    }
+
+    override suspend fun saveAccountSnapshot(account: String, snapshot: AccountSnapshot) {
+        ensureDir()
+        val file = snapshotPath(account)
+        val temp = Path(dir, "${file.name}.tmp")
+        val text = json.encodeToString(AccountSnapshot.serializer(), snapshot)
+        SystemFileSystem.sink(temp).buffered().use { it.writeString(text) }
+        SystemFileSystem.atomicMove(temp, file)
     }
 
     private fun ensureDir() {
@@ -55,6 +75,11 @@ class FileSessionStore(
     private fun sessionPath(account: String): Path {
         val digest = MD5().digest(account.encodeToByteArray()).toHex()
         return Path(dir, "session_$digest.json")
+    }
+
+    private fun snapshotPath(account: String): Path {
+        val digest = MD5().digest(account.encodeToByteArray()).toHex()
+        return Path(dir, "account_$digest.json")
     }
 
     companion object {

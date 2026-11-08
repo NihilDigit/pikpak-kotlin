@@ -374,6 +374,7 @@ suspend fun PikPakClient.restoreShare(
     if (result.shareStatus.isNotEmpty() && result.shareStatus != ShareStatus.OK) {
         throw ShareUnavailableException(shareId, result.shareStatus, result.shareStatusText)
     }
+    accountState.onStorageMutated()
     return result
 }
 

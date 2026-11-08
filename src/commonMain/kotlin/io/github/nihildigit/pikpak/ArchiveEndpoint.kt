@@ -255,6 +255,7 @@ suspend fun PikPakClient.decompressArchive(
         captchaAction = "POST:$DECOMPRESS/decompress",
     ) { jsonBody(json, body) }
     requireArchiveStatusOk(response)
+    accountState.onStorageMutated()
     return json.decodeFromJsonElement(DecompressTask.serializer(), response)
 }
 
@@ -272,7 +273,9 @@ suspend fun PikPakClient.getDecompressProgress(taskId: String): DecompressProgre
         url = buildUrl(DRIVE, "$DECOMPRESS/progress", mapOf("task_id" to taskId)),
         captchaAction = "GET:$DECOMPRESS/progress",
     )
-    return json.decodeFromJsonElement(DecompressProgress.serializer(), response)
+    return json.decodeFromJsonElement(DecompressProgress.serializer(), response).also {
+        if (it.phase == TaskPhase.COMPLETE) accountState.onStorageMutated()
+    }
 }
 
 /**
