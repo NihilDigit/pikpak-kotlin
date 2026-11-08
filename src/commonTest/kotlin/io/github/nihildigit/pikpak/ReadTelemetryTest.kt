@@ -25,6 +25,18 @@ import kotlin.time.Duration.Companion.milliseconds
 
 class ReadTelemetryTest {
     @Test
+    fun `connection evidence remains unknown until acquired and resets between attempts`() {
+        val telemetry = ReadTelemetry()
+        assertEquals(null, telemetry.connectionReused)
+        telemetry.recordConnectionAcquired(false)
+        assertEquals(false, telemetry.connectionReused)
+        telemetry.recordConnectionAcquired(true)
+        assertEquals(true, telemetry.connectionReused)
+        telemetry.resetConnection()
+        assertEquals(null, telemetry.connectionReused)
+    }
+
+    @Test
     fun `stream progress is monotonic and clean steering remains trainable`() = runBlocking<Unit> {
         val clock = kotlin.time.TestTimeSource()
         val increments = mutableListOf<Long>()
@@ -96,13 +108,13 @@ class ReadTelemetryTest {
     }
 
     @Test
-    fun `internal retry makes a read unclean`() = runBlocking<Unit> {
+    fun `503 is a separate throttled attempt without an internal retry`() = runBlocking<Unit> {
         val client = client(failFirst = HttpStatusCode.ServiceUnavailable)
         try {
             val telemetry = ReadTelemetry()
             withContext(telemetry) { RangeReader(client, { "https://cdn/file" }).readBytes(0, 3) }
-            assertEquals(1, telemetry.attempts)
-            assertEquals(1, telemetry.retries)
+            assertEquals(2, telemetry.attempts)
+            assertEquals(0, telemetry.retries)
             assertEquals(1, telemetry.throttled)
             assertEquals(3L, telemetry.deliveredBytes)
             assertFalse(telemetry.isClean)
@@ -132,16 +144,16 @@ class ReadTelemetryTest {
 
     @Test
     fun `cancelled gate waiter records wait without starting network`() = runBlocking<Unit> {
-        val client = client()
+        val holding = CompletableDeferred<Unit>()
+        val mock = HttpClient(MockEngine {
+            holding.complete(Unit)
+            awaitCancellation()
+        })
+        val client = PikPakClient(account = "mock@x", password = "pw",
+            sessionStore = InMemorySessionStore(), httpClient = mock, cdnHttpClient = mock)
         try {
             val reader = RangeReader(client, { "https://cdn/file" }, connectionBudget = 1)
-            val holding = CompletableDeferred<Unit>()
-            val holder = async {
-                reader.read(0, 3) {
-                    holding.complete(Unit)
-                    awaitCancellation()
-                }
-            }
+            val holder = async { reader.readBytes(0, 3) }
             holding.await()
             val telemetry = ReadTelemetry()
             val entered = CompletableDeferred<Unit>()
@@ -150,6 +162,7 @@ class ReadTelemetryTest {
                 reader.readBytes(0, 3)
             }
             entered.await()
+            repeat(16) { kotlinx.coroutines.yield() }
             waiter.cancel()
             waiter.join()
             holder.cancel()

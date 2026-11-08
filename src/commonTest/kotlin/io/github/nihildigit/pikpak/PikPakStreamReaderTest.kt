@@ -77,6 +77,30 @@ class PikPakStreamReaderTest {
     }
 
     @Test
+    fun `inactive demand retains position and cached bytes without speculative reads`() = runBlocking<Unit> {
+        val content = payload((unit * 8).toInt())
+        val source = FakeRangeSource(content)
+        val reader = reader(source, content.size.toLong(), concurrency = 1)
+        try {
+            reader.read(ByteArray(1), 0, 1)
+            waitUntil("read-ahead cached") { reader.cachedBytesForTest() >= unit * 4 }
+            reader.setDemandActive(false)
+            delay(100.milliseconds)
+            val requests = source.requests().size
+            val position = reader.position
+            val cached = reader.cachedBytesForTest()
+            delay(100.milliseconds)
+            assertEquals(position, reader.position)
+            assertEquals(cached, reader.cachedBytesForTest())
+            assertEquals(requests, source.requests().size)
+            val bytes = ByteArray(1)
+            reader.read(bytes, 0, 1)
+            assertEquals(content[position.toInt()], bytes[0])
+            reader.setDemandActive(true)
+        } finally { reader.close() }
+    }
+
+    @Test
     fun `a sequential read returns the file over several requests at a time`() = runBlocking<Unit> {
         val content = payload(1024 * 1024 + 12345)
         // A latency the workers can overlap inside. With an instant source the
@@ -256,28 +280,27 @@ class PikPakStreamReaderTest {
     }
 
     @Test
-    fun `requests widen from two to four slots farther ahead of the read position`() = runBlocking<Unit> {
+    fun `request spans within the near window follow the service span`() = runBlocking<Unit> {
         val content = payload(2 * 1024 * 1024)
         val source = FakeRangeSource(content)
         // One connection makes the request order deterministic, which is what
         // lets the sizes be asserted positionally.
-        val reader = reader(source, content.size.toLong(), concurrency = 1)
+        val reader = reader(source, content.size.toLong(), concurrency = 1, wideThreshold = content.size.toLong())
 
         try {
             val buffer = ByteArray(1)
             reader.read(buffer, 0, 1)
-            waitUntil("the head and distance-based read-ahead have been requested") { source.requests().size >= 4 }
+            waitUntil("the head and uniform read-ahead have been requested") { source.requests().size >= 4 }
 
             val issued = source.requests().take(4)
-            // Reading one byte keeps the cursor in slot zero. The head and
-            // distance-two request each cover two slots; distance four widens
-            // to four slots and distance eight keeps that width. Assert offsets
-            // too so gaps or overlapping requests cannot satisfy the size check.
-            assertEquals(listOf(0L, unit * 2, unit * 4, unit * 8), issued.map { it.start })
+            // Keep this sample entirely inside the near window; crossing into far
+            // prefetch now deliberately splits a request at its priority boundary.
+            // Assert offsets too so gaps or overlapping ranges cannot pass.
+            assertEquals(listOf(0L, unit * 2, unit * 4, unit * 6), issued.map { it.start })
             assertEquals(
-                listOf(unit * 2, unit * 2, unit * 4, unit * 4),
+                listOf(unit * 2, unit * 2, unit * 2, unit * 2),
                 issued.map { it.length },
-                "requests must widen with distance without reverting: $issued",
+                "distance must not override the service span: $issued",
             )
             assertEquals(content[0], buffer[0], "the head returned the wrong byte")
         } finally {

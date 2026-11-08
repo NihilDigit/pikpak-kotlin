@@ -8,7 +8,6 @@ import kotlin.coroutines.ContinuationInterceptor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
 import kotlin.time.TimeMark
 import kotlin.time.Duration.Companion.milliseconds
 import io.github.nihildigit.pikpak.internal.FileReactivationCoordinator
@@ -200,7 +199,12 @@ class PikPakFileHandle(
     private val allowance = MutableStateFlow(maxConnections)
     @Volatile private var externallyManagedDemand = false
     private val expanding = MutableStateFlow(false)
-    private val slowSamples = MutableStateFlow(0)
+    @Volatile private var positiveScalingGain = false
+    @Volatile private var readContext: CoroutineContext = EmptyCoroutineContext
+
+    override fun updateCapacityEvidence(positiveScalingGain: Boolean) {
+        this.positiveScalingGain = positiveScalingGain
+    }
     private val laneMutex = Mutex()
     @Volatile private var primaryInFlight = 0
     @Volatile private var secondaryInFlight = 0
@@ -214,7 +218,7 @@ class PikPakFileHandle(
         externallyManagedDemand = true
         this.allowance.value = allowance.coerceIn(0, maxConnections)
         publishConnectionLimit()
-        if (slowSamples.value >= 2) considerSecondLane()
+        considerSecondLane()
     }
 
     private fun publishConnectionLimit() {
@@ -223,18 +227,12 @@ class PikPakFileHandle(
     }
 
     private fun observeAttempt(attempt: RangeAttempt) {
-        val firstByte = attempt.timeToFirstByte
-        if (attempt.outcome == RangeAttempt.Outcome.Complete && attempt.retries == 0 &&
-            attempt.delivered > 0 && firstByte != null && attempt.networkDuration > firstByte) {
-            if (attempt.bytesPerSecondAfterFirstByte in 1 until SECOND_LANE_RATE) {
-                slowSamples.update { (it + 1).coerceAtMost(2) }
-            } else slowSamples.value = 0
-        }
+        considerSecondLane()
         onRangeAttempt?.invoke(attempt)
     }
 
     private suspend fun observeProgress(elapsed: Duration, rate: Long) {
-        if (elapsed >= 2.seconds && rate in 1 until SECOND_LANE_RATE)
+        if (elapsed >= 2.seconds && rate > 0)
             considerSecondLane(currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext)
     }
 
@@ -242,15 +240,18 @@ class PikPakFileHandle(
         if (externallyManagedDemand) allowance.value > 0
         else primaryInFlight > 0 || secondaryInFlight > 0
 
-    private fun considerSecondLane(context: CoroutineContext = EmptyCoroutineContext) {
-        if (!hasActiveDemand() || closed || leased || onObjectMinted != null || fileId == null ||
+    private fun considerSecondLane(context: CoroutineContext = readContext) {
+        if (!client.concurrentAcceleration || !positiveScalingGain || fileGate.inUse < 8 ||
+            !hasActiveDemand() || closed || leased || onObjectMinted != null || fileId == null ||
             allowance.value <= 8 || secondary != null || !expanding.compareAndSet(false, true)) return
         client.background.launch(context) {
             try {
                 val candidate = freeLaneLink(expandingCapacity = true)
                 laneMutex.withLock {
                     val primary = link
-                    if (!closed && hasActiveDemand() && allowance.value > 8 && primary != null &&
+                    if (!closed && client.concurrentAcceleration && positiveScalingGain &&
+                        hasActiveDemand() && allowance.value > 8 && primary != null &&
+                        sameServicePool(primary.url, candidate.url) &&
                         SignedUrlGates.identityOf(candidate.url) != SignedUrlGates.identityOf(primary.url)) {
                         val generation = Any()
                         secondaryGeneration = generation
@@ -265,7 +266,6 @@ class PikPakFileHandle(
                 throw e
             } catch (_: Exception) {
                 // Opportunistic capacity must not fail the working primary lane.
-                slowSamples.value = 0
             } finally {
                 expanding.value = false
             }
@@ -279,7 +279,12 @@ class PikPakFileHandle(
         check(!expandingCapacity || (allowance.value > 8 && hasActiveDemand()))
         val id = checkNotNull(fileId)
         lastDetailAt = client.timeSource.markNow()
-        linkOf(client.getFile(id)) ?: throw PikPakException(-1, "file $id has no readable link")
+        val candidate = linkOf(client.getFile(id)) ?: throw PikPakException(-1, "file $id has no readable link")
+        // A second signature is useful only within the current service pool. Combining
+        // a fast original-media lane with a capped download lane can stall ordered reads.
+        val primary = link
+        check(primary == null || sameServicePool(primary.url, candidate.url)) { "Secondary link changed service pool" }
+        candidate
     }
 
     private suspend fun provideSecondaryUrl(generation: Any, request: UrlRequest): String {
@@ -299,6 +304,7 @@ class PikPakFileHandle(
             return laneMutex.withLock {
                 if (secondaryGeneration !== generation) return@withLock checkNotNull(link).url
                 check(link?.let { SignedUrlGates.identityOf(it.url) } != SignedUrlGates.identityOf(fresh.url))
+                check(link?.let { sameServicePool(it.url, fresh.url) } == true)
                 secondaryLink = fresh
                 fresh.url
             }
@@ -306,7 +312,6 @@ class PikPakFileHandle(
             if (t !is CancellationException) {
                 laneMutex.withLock {
                     if (secondaryGeneration === generation) {
-                        slowSamples.value = 0
                         secondaryGeneration = null
                         secondary = null
                         secondaryLink = null
@@ -363,6 +368,7 @@ class PikPakFileHandle(
         priority: Int,
         block: suspend (ByteReadChannel) -> T,
     ): T {
+        readContext = currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext
         val primary = currentReader()
         val chosen = laneMutex.withLock {
             val extra = secondary?.takeIf { allowance.value > 8 }
@@ -375,8 +381,7 @@ class PikPakFileHandle(
             }
         }
         try {
-            if (slowSamples.value >= 2)
-                considerSecondLane(currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext)
+            considerSecondLane(currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext)
             return chosen.first.read(start, length, priority, block)
         } finally {
             withContext(NonCancellable) {
@@ -384,8 +389,7 @@ class PikPakFileHandle(
                     if (chosen.second) secondaryInFlight-- else primaryInFlight--
                 }
             }
-            if (slowSamples.value >= 2)
-                considerSecondLane(currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext)
+            considerSecondLane(currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext)
         }
     }
 
@@ -542,7 +546,10 @@ class PikPakFileHandle(
         link = chosen
         expiresAt = chosen.expiresAt
         laneMutex.withLock {
-            if (secondaryLink?.let { SignedUrlGates.identityOf(it.url) } == SignedUrlGates.identityOf(chosen.url)) {
+            if (secondaryLink?.let {
+                SignedUrlGates.identityOf(it.url) == SignedUrlGates.identityOf(chosen.url) ||
+                    !sameServicePool(it.url, chosen.url)
+            } == true) {
                 secondaryGeneration = null
                 secondary = null
                 secondaryLink = null
@@ -560,6 +567,11 @@ class PikPakFileHandle(
         val expiry = candidate.expiresAt
         if (expiry != null && expiry - clock.now() <= refreshMargin) return false
         return !client.hostHealth.isBad(candidate.url)
+    }
+
+    private fun sameServicePool(first: String, second: String): Boolean {
+        val pool = io.github.nihildigit.pikpak.internal.HostHealth.poolOf(first) ?: return false
+        return pool == io.github.nihildigit.pikpak.internal.HostHealth.poolOf(second)
     }
 
     /**
@@ -609,6 +621,7 @@ class PikPakFileHandle(
         rebuild()
         lookupDetail(ensureFileId())
     }).also { detail ->
+        client.hostHealth.observe(detail)
         val variant = if (mediaId == null) detail.medias.firstOrNull { it.isOrigin }
             else detail.medias.firstOrNull { it.mediaId == mediaId }
         videoInfo = variant?.video ?: videoInfo
@@ -620,6 +633,17 @@ class PikPakFileHandle(
     }
 
     private fun linkOf(detail: FileDetail): VariantLink? {
+        if (mediaId == null) {
+            val candidates = listOfNotNull(
+                detail.originMediaLink,
+                detail.octetStream.takeIf { it.url.isNotBlank() },
+                detail.webContentLink.takeIf { it.isNotBlank() }?.let { DownloadLink(url = it) },
+                detail.medias.firstOrNull { it.isOrigin && it.link.url.isNotBlank() }?.link,
+            )
+            val chosen = candidates.firstOrNull { !client.hostHealth.isBad(it.url) } ?: candidates.firstOrNull()
+                ?: return null
+            return VariantLink(chosen.url, chosen.expiresAt)
+        }
         val variant = detail.variant(mediaId) ?: return null
         val url = variant.link.url.takeIf { it.isNotBlank() } ?: return null
         return VariantLink(url, variant.link.expiresAt)
@@ -686,7 +710,6 @@ class PikPakFileHandle(
 
         /** Extra links minted when one lands on a host known to be failing; see [mintAvoidingBadHosts]. */
         internal const val MAX_HOST_REMINTS = 2
-        private const val SECOND_LANE_RATE = 550L * 1024
 
         /** What the original is called in [contentKey], where transcodes go by their media id. */
         internal const val ORIGINAL_KEY = "origin"
@@ -714,8 +737,18 @@ fun PikPakClient.fileHandle(
     // link, and a missing link here only means the handle mints the first one itself
     val variant = if (mediaId == null) detail.medias.firstOrNull { it.isOrigin }
         else detail.medias.firstOrNull { it.mediaId == mediaId }
-    val link = if (mediaId == null) detail.octetStream else variant?.link
     hostHealth.observe(detail)
+    val link = if (mediaId == null) {
+        val candidates = listOfNotNull(
+            detail.originMediaLink,
+            detail.octetStream.takeIf { it.url.isNotBlank() },
+            detail.webContentLink.takeIf { it.isNotBlank() }?.let { DownloadLink(url = it) },
+            detail.medias.firstOrNull { it.isOrigin && it.link.url.isNotBlank() }?.link,
+        )
+        candidates.firstOrNull { !hostHealth.isBad(it.url) } ?: candidates.firstOrNull()
+    } else {
+        variant?.link
+    }
     return PikPakFileHandle(
         client = this,
         gcid = detail.hash,

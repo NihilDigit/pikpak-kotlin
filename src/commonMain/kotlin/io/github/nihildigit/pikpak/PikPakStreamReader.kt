@@ -176,6 +176,12 @@ class PikPakStreamReader internal constructor(
     /** Current read position, in bytes from the start of the file. */
     val position: Long get() = cursor.position
 
+    /**
+     * Withdraws speculative read-ahead while retaining this cursor's position and cached
+     * bytes for reuse. An ongoing read remains demand until it finishes. Active by default.
+     */
+    fun setDemandActive(active: Boolean) = cache.setDemandActive(cursor, active)
+
     val bytesRemaining: Long get() = (size - position).coerceAtLeast(0)
 
     /**
@@ -334,6 +340,12 @@ class PikPakStreamReader internal constructor(
          * [STREAMING_PRIORITY].
          */
         const val READ_AHEAD_PRIORITY = 10
+
+        /** Small direct range probes outrank speculative prefetch, but not playback reads. */
+        const val MICRO_PROBE_PRIORITY = 12
+
+        /** Published near-buffer coverage lets next-file warming precede distant prefetch. */
+        const val FAR_READ_AHEAD_PRIORITY = 6
 
         /**
          * What a foreground [prefetch] asks at by default: behind everything

@@ -91,8 +91,8 @@ class RangeReaderMockTest {
         client.close()
     }
 
-    // The HTTP layer retries a 503 before the body is handed over, and with Retry-After that can
-    // outlast the first-response deadline; the host did answer, so it must not be dropped
+    // Every 503 ends an attempt. Backoff may outlast the first-response deadline,
+    // but a busy host did answer and must not be dropped.
     @Test
     fun `a host answering 503 past the deadline is not taken for a silent one`() = runBlocking {
         var attempts = 0
@@ -353,7 +353,7 @@ class RangeReaderMockTest {
     }
 
     /**
-     * Two reads overlap, one of them retried twice below the pump.
+     * Two reads overlap, one of them retries twice in the pump.
      *
      * The clean read is held open for exactly as long as the other one is
      * retrying — its handler waits for the second 5xx, and the retrying handler
@@ -363,7 +363,7 @@ class RangeReaderMockTest {
      * only a per-request counter can say the clean one retried nothing.
      */
     @Test
-    fun `an internal retry is attributed to the request that caused it`() = runBlocking {
+    fun `range retries are separate attempts and do not contaminate concurrent reads`() = runBlocking {
         val cleanStarted = CompletableDeferred<Unit>()
         val retriesDone = CompletableDeferred<Unit>()
         var served = 0
@@ -396,11 +396,10 @@ class RangeReaderMockTest {
             async { cleanReader.readBytes(0, 64) },
         ).awaitAll()
 
-        // One attempt each: the 5xx never reached the pump, which is the whole
-        // reason these counters exist.
-        assertEquals(RangeAttempt.Outcome.Complete, retried.single().outcome)
-        assertEquals(2, retried.single().retriedServerErrors, "both 5xx belong to the read that got them")
-        assertTrue(retried.single().retryBackoff > Duration.ZERO, "the backoff is latency this read paid")
+        assertEquals(listOf(RangeAttempt.Outcome.Failed, RangeAttempt.Outcome.Failed,
+            RangeAttempt.Outcome.Complete), retried.map { it.outcome })
+        assertTrue(retried.all { it.retries == 0 }, "HTTP must not hide retries inside range attempts")
+        assertTrue(retried.all { it.retryBackoff == Duration.ZERO }, "backoff is outside network attempts")
         assertEquals(0, clean.single().retries, "the concurrent read retried nothing and must report nothing")
         client.close()
     }
@@ -508,6 +507,31 @@ class RangeReaderMockTest {
         }
     }
 
+    @Test
+    fun `throttle backoff releases file and account slots for urgent reads`() = runBlocking<Unit> {
+        val throttled = CompletableDeferred<Unit>()
+        val starts = mutableListOf<Long>()
+        val client = clientWith(accountBudget = 1) { req ->
+            val (start, _) = parseRange(req.headers[HttpHeaders.Range]!!)
+            starts += start
+            if (starts.size == 1) respond(ByteReadChannel(ByteArray(0)), HttpStatusCode.ServiceUnavailable)
+            else partial(req, content)
+        }
+        val reader = RangeReader(client, { "https://cdn/file" }, connectionBudget = 1,
+            onAttempt = { if (it.outcome == RangeAttempt.Outcome.Throttled) throttled.complete(Unit) })
+        try {
+            val ahead = async { reader.readBytes(0, 64, priority = 10) }
+            throttled.await()
+            // Same-file priority demand needs the file permit; another reader needs the
+            // account permit. Both must run before the sleeping request retries.
+            reader.readBytes(64, 64, priority = 100)
+            RangeReader(client, { "https://cdn/other" }).readBytes(128, 64, priority = 100)
+            ahead.await()
+            assertEquals(listOf(0L, 64L, 128L, 0L), starts)
+            assertEquals(1, reader.stats.value.throttled)
+        } finally { client.close() }
+    }
+
     // --- helpers ---
 
     /** Serves like a real CDN: clips the range at EOF and answers 416 past it. */
@@ -550,6 +574,7 @@ class RangeReaderMockTest {
 
     private fun clientWith(
         retryPolicy: RetryPolicy = RetryPolicy(maxAttempts = 2, initialDelay = 1.milliseconds, maxDelay = 2.milliseconds),
+        accountBudget: Int = 16,
         cdnHandler: suspend MockRequestHandleScope.(HttpRequestData) -> HttpResponseData,
     ): PikPakClient {
         val engine = MockEngine { req ->
@@ -578,6 +603,7 @@ class RangeReaderMockTest {
             password = "pw",
             sessionStore = InMemorySessionStore(),
             retryPolicy = retryPolicy,
+            accountConnectionBudget = accountBudget,
             httpClient = mock,
             cdnHttpClient = mock,
         )

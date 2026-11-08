@@ -33,12 +33,68 @@ import kotlin.time.Duration.Companion.milliseconds
 
 /** Regression coverage for publication before the enclosing multi-slot request finishes. */
 class BlockCacheStreamingTest {
+    @Test
+    fun `blockwise missing reports collapse into one ordered run`() {
+        val slots = BlockCache.SlotRanges(List(8192) { it..it })
+        assertEquals(listOf(0..8191), slots.ranges)
+        assertEquals(8192, slots.size)
+        for (index in 0 until slots.size) assertEquals(index, slots[index])
+    }
+
+    @Test
+    fun `range compaction preserves first occurrence order across overlapping requests`() {
+        val input = listOf(10..20, 0..5, 6..15, 30..35, 25..32, 0..40)
+        val expected = input.flatMap { it.toList() }.distinct()
+        val slots = BlockCache.SlotRanges(input)
+        assertEquals(expected, slots.toList())
+        assertEquals(expected, (0 until slots.size).map { slots[it] })
+        assertEquals(expected.size, slots.size)
+    }
     private fun cache(source: RangeSource, store: BlockStore? = null,
                       timeSource: kotlin.time.TimeSource = kotlin.time.TimeSource.Monotonic) = BlockCache(
         source, size = 256, concurrency = 1, parentCoroutineContext = EmptyCoroutineContext,
         foregroundStreams = null, store = store, blockSize = 64, readAheadBytes = 192,
         memoryCapBytes = 512, wideBlockThresholdBytes = 1, timeSource = timeSource,
     )
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `streaming chunks and cache hits never sweep buffer ownership`() = runTest {
+        val channel = ByteChannel(autoFlush = true)
+        val budget = TransportMemoryBudget(64)
+        val source = object : RangeSource {
+            override suspend fun <T> read(start: Long, length: Long, priority: Int,
+                                         block: suspend (ByteReadChannel) -> T): T = block(channel)
+        }
+        val cache = BlockCache(source, 64, 1, coroutineContext, null,
+            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512,
+            memoryBudget = budget)
+        val cursor = cache.openCursor(StreamRole.BACKGROUND)
+        cache.setReadAhead(cursor, 0)
+        try {
+            repeat(32) {
+                val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
+                runCurrent()
+                channel.writeFully(byteArrayOf(it.toByte()))
+                runCurrent()
+                assertEquals(1, read.await())
+                assertEquals(0L, cache.ownershipSweepsForTest(), "partial chunks retain the same owner")
+            }
+            channel.writeFully(ByteArray(32))
+            channel.close()
+            runCurrent()
+            val sweeps = cache.ownershipSweepsForTest()
+            repeat(32) {
+                assertEquals(1, cache.read(cursor, ByteArray(1), 0, 1))
+                assertEquals(sweeps, cache.ownershipSweepsForTest(), "LRU hits do not drop ownership")
+            }
+            assertEquals(64L, budget.usedBytes)
+        } finally {
+            cache.close()
+            cache.awaitClosedForTest()
+        }
+        assertEquals(0L, budget.usedBytes)
+    }
 
     @Test
     fun `a leading slot wakes its reader before the suffix arrives`() = runBlocking<Unit> {
@@ -78,7 +134,7 @@ class BlockCacheStreamingTest {
     @Test
     fun `zero readahead fetches only the slot being read`() = runBlocking<Unit> {
         val source = FakeRangeSource(ByteArray(256))
-        val scheduler = TransferScheduler(16, 8, BandwidthLimiter())
+        val scheduler = TransferScheduler(16, 8, BandwidthLimiter(), concurrencyMode = ConcurrencyMode.Fixed(8))
         val bg = scheduler.register(8) {}
         scheduler.update(bg, false, false, true)
         val cache = BlockCache(
@@ -142,7 +198,8 @@ class BlockCacheStreamingTest {
             blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512,
             wideBlockThresholdBytes = 1, scheduler = scheduler)
         try {
-            val download = cache.warm(listOf(0L..1023L), StreamRole.BACKGROUND, null, durable = true)
+            cache.warm(listOf(0L..63L), StreamRole.BACKGROUND, null, durable = true).await()
+            val download = cache.warm(listOf(64L..1023L), StreamRole.BACKGROUND, null, durable = true)
             assertTrue(withTimeout(3000) { requested.await() } >= 128L)
             withTimeout(1000) { while (cache.deliveredBytes < 128) delay(5) }
             val cursor = cache.openCursor(StreamRole.FOREGROUND)
@@ -184,10 +241,103 @@ class BlockCacheStreamingTest {
         } finally { cache.close() }
     }
 
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `promotion releases a mid range limiter wait without replacing the transport`() = runTest {
+        val limiter = BandwidthLimiter(64, testScheduler.timeSource)
+        var requests = 0
+        val store = object : DurableBlockStore {
+            override suspend fun read(file: String, offset: Long, length: Int): ByteArray? = null
+            override suspend fun write(file: String, offset: Long, bytes: ByteArray) = Unit
+            override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
+        }
+        val source = object : RangeSource {
+            override suspend fun <T> read(start: Long, length: Long, priority: Int,
+                                         block: suspend (ByteReadChannel) -> T): T {
+                requests++
+                return block(ByteReadChannel(ByteArray(length.toInt())))
+            }
+        }
+        val cache = BlockCache(source, 256, 1, coroutineContext, null, store,
+            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512,
+            downloadLimiter = limiter, timeSource = testScheduler.timeSource)
+        try {
+            val download = cache.warm(listOf(0L..127L), StreamRole.BACKGROUND, null, durable = true)
+            runCurrent()
+            assertEquals(64L, cache.deliveredBytes)
+            assertFalse(download.isCompleted)
+            val cursor = cache.openCursor(StreamRole.FOREGROUND)
+            cache.setReadAhead(cursor, 63)
+            cache.seek(cursor, 64)
+            val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
+            runCurrent()
+            assertTrue(read.isCompleted, "promotion must bypass tokens without advancing time")
+            assertEquals(1, read.await())
+            download.await()
+            assertEquals(1, requests, "the original multi-block transport remains owned")
+            assertEquals(0L, testScheduler.currentTime)
+        } finally {
+            cache.close()
+            cache.awaitClosedForTest()
+        }
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `mid range limiter time is excluded from service samples without double counting sink wait`() = runTest {
+        for (sinkWait in listOf(0.milliseconds, 400.milliseconds)) {
+            val limiter = BandwidthLimiter(64, testScheduler.timeSource)
+            var observed: ReadTelemetry? = null
+            val store = object : DurableBlockStore {
+                override suspend fun read(file: String, offset: Long, length: Int): ByteArray? = null
+                override suspend fun write(file: String, offset: Long, bytes: ByteArray) = Unit
+                override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
+            }
+            val source = object : RangeSource {
+                override suspend fun <T> read(start: Long, length: Long, priority: Int,
+                                             block: suspend (ByteReadChannel) -> T): T {
+                    val telemetry = currentCoroutineContext()[ReadTelemetry]!!
+                    observed = telemetry
+                    val started = testScheduler.timeSource.markNow()
+                    delay(10)
+                    try {
+                        return coroutineScope {
+                            // Model an actual pump wait overlapping the block's token wait;
+                            // a cumulative sinkWait alone establishes no interval overlap.
+                            val sink = launch {
+                                telemetry.beginSinkWait()
+                                try { delay(sinkWait) } finally { telemetry.endSinkWait() }
+                            }
+                            try { block(ByteReadChannel(ByteArray(length.toInt()))) }
+                            finally { sink.cancelAndJoin() }
+                        }
+                    } finally {
+                        telemetry.attempts = 1
+                        telemetry.deliveredBytes = length
+                        telemetry.timeToFirstByte = 5.milliseconds
+                        telemetry.sinkWait = sinkWait
+                        telemetry.networkDuration = started.elapsedNow() - sinkWait
+                    }
+                }
+            }
+            val cache = BlockCache(source, 256, 1, coroutineContext, null, store,
+                blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512,
+                downloadLimiter = limiter, timeSource = testScheduler.timeSource)
+            try {
+                cache.warm(listOf(0L..127L), StreamRole.BACKGROUND, null, durable = true).await()
+                runCurrent()
+                assertEquals(10.milliseconds, observed!!.networkDuration)
+            } finally {
+                cache.close()
+                cache.awaitClosedForTest()
+            }
+        }
+    }
+
     @Test
     fun `only cached contiguous bytes make the foreground buffer comfortable`() = runBlocking<Unit> {
         val limiter = BandwidthLimiter()
-        val scheduler = TransferScheduler(16, 8, limiter)
+        val scheduler = TransferScheduler(16, 8, limiter, concurrencyMode = ConcurrencyMode.Fixed(8))
         val background = scheduler.register(8) {}
         scheduler.update(background, false, false, true)
         val release = CompletableDeferred<Unit>()
@@ -776,16 +926,20 @@ class BlockCacheStreamingTest {
                 val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
                 runCurrent()
                 val wave = requests.filter { it.first >= head }
-                assertEquals(listOf(head to 2 * slotBytes), wave)
-                advanceTimeBy(29)
+                assertEquals(1, wave.size)
+                assertEquals(head, wave.single().first)
+                assertEquals(1L, wave.single().second / slotBytes,
+                    "blocking head uses a single slot so CDN burst edges finish head immediately")
+                advanceTimeBy(249)
                 runCurrent()
-                assertEquals(1, requests.count { it.first >= head })
+                assertEquals(1, requests.count { it.first >= head }, "zero-byte head retains startup protection for 250 ms")
                 advanceTimeBy(1)
                 runCurrent()
-                assertEquals(listOf(0L to 2L, 2L to 2L, 4L to 4L, 8L to 4L),
-                    requests.filter { it.first >= head }.map { (start, length) ->
-                        (start - head) / slotBytes to length / slotBytes
-                    })
+                val spans = requests.filter { it.first >= head }
+                assertEquals(4, spans.size)
+                assertEquals(listOf(1L, 2L, 4L, 4L), spans.map { it.second / slotBytes })
+                assertTrue(spans.zipWithNext().all { (left, right) -> left.first + left.second == right.first },
+                    "head and read-ahead ramp contiguously along distance steps")
                 assertFalse(read.isCompleted, "no first byte or completion sample has arrived")
                 assertEquals(4 * slotBytes, budget.usedBytes, "range suffixes reserve no arrays")
                 assertTrue(budget.peakBytes <= 16L * 1024 * 1024)
@@ -798,6 +952,44 @@ class BlockCacheStreamingTest {
         }
         assertEquals(8, cancelled)
         assertEquals(0L, budget.usedBytes)
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `inactive cursor withdraws in-flight speculation but retains cached head and position`() = runTest {
+        var requests = 0
+        var cancellations = 0
+        val source = object : RangeSource {
+            override suspend fun <T> read(start: Long, length: Long, priority: Int,
+                                         block: suspend (ByteReadChannel) -> T): T {
+                requests++
+                if (start > 0) {
+                    try { awaitCancellation() } finally { cancellations++ }
+                }
+                return block(ByteReadChannel(ByteArray(length.toInt()) { 7 }))
+            }
+        }
+        val cache = BlockCache(source, 4096, 1, coroutineContext, null,
+            blockSize = 64, readAheadBytes = 512, memoryCapBytes = 1024)
+        val cursor = cache.openCursor(StreamRole.FOREGROUND)
+        try {
+            val first = async { cache.read(cursor, ByteArray(1), 0, 1) }
+            runCurrent()
+            assertEquals(1, first.await())
+            assertEquals(2, requests)
+            val position = cursor.position
+            val cached = cache.cachedBytesForTest()
+            cache.setDemandActive(cursor, false)
+            runCurrent()
+            assertEquals(1, cancellations)
+            assertEquals(0, cache.inFlightSlotsForTest())
+            assertEquals(position, cursor.position)
+            assertEquals(cached, cache.cachedBytesForTest())
+            assertEquals(2, requests)
+            cache.setDemandActive(cursor, true)
+            runCurrent()
+            assertEquals(3, requests)
+        } finally { cache.close(); cache.awaitClosedForTest() }
     }
 
     @Test

@@ -29,11 +29,46 @@ import kotlin.test.assertSame
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class DualSignedLanesTest {
+    @Test
+    fun `primary uses original media and secondary never falls into download pool`() = runTest {
+        val f = Fixture(this)
+        val original = "https://cdn/file?sign=a&category=original"
+        val detail = FileDetail(id = "f1", hash = "A3C62CB153B61CF265298986AD97EA07A85112DF",
+            size = "32768", links = mapOf(FileDetail.OCTET_STREAM to DownloadLink("https://cdn/file?sign=slow")),
+            medias = listOf(MediaVariant(isOrigin = true, link = DownloadLink(original))))
+        f.detailReply = {
+            """{"id":"f1","size":"32768","links":{"application/octet-stream":{"url":"https://cdn/file?sign=slow"}},"medias":[{"is_origin":true,"link":{"url":"$original"}}]}"""
+        }
+        val handle = f.client.fileHandle(detail)
+        try {
+            establishLane(handle)
+            assertEquals(setOf("a"), f.peaks.keys)
+            assertEquals(8, handle.connectionLimit.value, "a duplicate original signature must not open the slow lane")
+            f.detailReply = {
+                """{"id":"f1","size":"32768","links":{"application/octet-stream":{"url":"https://cdn/file?sign=slow"}},"medias":[{"is_origin":true,"link":{"url":"https://cdn/file?sign=b&category=original"}}]}"""
+            }
+            establishLane(handle)
+            assertEquals(16, handle.connectionLimit.value)
+            f.hold = true
+            val reads = List(16) { async { handle.readBytes(0, 32768) } }
+            runCurrent()
+            assertEquals(setOf("a", "b"), f.active.filterValues { it > 0 }.keys)
+            f.release.complete(Unit)
+            reads.awaitAll()
+            f.detailReply = {
+                """{"id":"f1","size":"32768","links":{"application/octet-stream":{"url":"https://cdn/file?sign=slow"}}}"""
+            }
+            assertEquals("https://cdn/file?sign=slow", handle.provideUrl(UrlRequest.Expired(original)))
+            assertEquals(null, handle.secondaryReaderForTest())
+            assertEquals(8, handle.connectionLimit.value)
+        } finally { f.release.complete(Unit); handle.close(); f.client.close() }
+    }
     private class Fixture(val scope: TestScope, val sameIdentity: Boolean = false, val failDetail: Boolean = false) {
         var details = 0
         val detailTimes = mutableListOf<Long>()
         var hold = false
-        var bodyDelay = 100L
+        // Progress must cross two seconds before the final chunk (which cannot expand a lane).
+        var bodyDelay = 2_100L
         var rejectSecondary = false
         var detailReply: (suspend (Int) -> String)? = null
         val release = CompletableDeferred<Unit>()
@@ -89,17 +124,21 @@ class DualSignedLanesTest {
             initialFileId = "f1", initialLink = VariantLink("https://cdn/file?sign=a", null), leased = leased)
     }
 
+    private suspend fun TestScope.establishLane(handle: PikPakFileHandle) {
+        handle.updateCapacityEvidence(true)
+        handle.updateConnectionAllowance(16)
+        List(8) { async { handle.readBytes(0, 32768) } }.awaitAll()
+        advanceUntilIdle()
+    }
+
     @Test
-    fun `two slow samples with persistent demand mint and balance eight slots per signature`() = runTest {
+    fun `measured scaling gain with full primary capacity mints and balances signed lanes`() = runTest {
         val f = Fixture(this)
         val handle = f.handle()
         try {
             handle.updateConnectionAllowance(16)
             assertEquals(8, handle.connectionLimit.value)
-            handle.readBytes(0, 32768)
-            assertEquals(0, f.details)
-            handle.readBytes(0, 32768)
-            advanceUntilIdle()
+            establishLane(handle)
             assertEquals(1, f.details)
             assertTrue(f.detailTimes.single() >= 1500)
             assertEquals(16, handle.connectionLimit.value)
@@ -149,9 +188,7 @@ class DualSignedLanesTest {
             val f = Fixture(this, sameIdentity = true, failDetail = failed)
             val handle = f.handle()
             try {
-                handle.updateConnectionAllowance(16)
-                repeat(2) { handle.readBytes(0, 32768) }
-                advanceUntilIdle()
+                establishLane(handle)
                 assertEquals(1, f.details)
                 assertEquals(8, handle.connectionLimit.value)
             } finally { handle.close(); f.client.close() }
@@ -176,9 +213,7 @@ class DualSignedLanesTest {
         val f = Fixture(this)
         val handle = f.handle()
         try {
-            handle.updateConnectionAllowance(16)
-            repeat(2) { handle.readBytes(0, 32768) }
-            advanceUntilIdle()
+            establishLane(handle)
             f.rejectSecondary = true
             val results = List(2) { async { runCatching { handle.readBytes(0, 32768) } } }.awaitAll()
             assertEquals(2, results.count { it.isSuccess })
@@ -189,15 +224,15 @@ class DualSignedLanesTest {
     }
 
     @Test
-    fun `one sustained direct transfer can enable the second lane`() = runTest {
+    fun `a slow sustained direct transfer without scaling evidence never mints a second lane`() = runTest {
         val f = Fixture(this)
         f.bodyDelay = 2100
         val handle = f.handle()
         try {
             handle.readBytes(0, 32768)
             advanceUntilIdle()
-            assertEquals(1, f.details)
-            assertEquals(16, handle.connectionLimit.value)
+            assertEquals(0, f.details)
+            assertEquals(8, handle.connectionLimit.value)
         } finally { handle.close(); f.client.close() }
     }
 
@@ -244,9 +279,7 @@ class DualSignedLanesTest {
             }
         }
         try {
-            handle.updateConnectionAllowance(16)
-            repeat(2) { handle.readBytes(0, 32768) }
-            advanceUntilIdle()
+            establishLane(handle)
             val old = assertNotNull(handle.secondaryReaderForTest())
             old.prewarm()
             // The primary owns detailMutex while the old secondary starts refreshing.
@@ -262,8 +295,10 @@ class DualSignedLanesTest {
             assertEquals(8, handle.connectionLimit.value)
             // The refresh entered on the old generation but returns after its retirement.
             f.rejectSecondary = false
-            handle.readBytes(0, 32768)
+            val renewedDemand = List(8) { async { handle.readBytes(0, 32768) } }
+            runCurrent()
             oldReply.complete(Unit)
+            renewedDemand.awaitAll()
             staleRead.await()
             advanceUntilIdle()
             val successor = assertNotNull(handle.secondaryReaderForTest())

@@ -1,6 +1,11 @@
 package io.github.nihildigit.pikpak
 
 import io.github.nihildigit.pikpak.internal.headerMap
+import io.github.nihildigit.pikpak.internal.RangeAdmission
+import io.github.nihildigit.pikpak.internal.isThrottlePressure
+import io.github.nihildigit.pikpak.internal.retryAfter
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.header
 import io.ktor.client.statement.bodyAsChannel
@@ -55,8 +60,9 @@ data class RangeStream(
  *
  * Pipeline reuse:
  *  - Goes through `PikPakClient.http.sendRaw`, so transport-level retries
- *    (5xx, 429, transient I/O) follow the configured [RetryPolicy], and the
- *    request does NOT consume a rate-limiter token.
+ *    are disabled here: [RangeReader] owns its retries. Direct callers retry
+ *    429/503 before entering [block], using [PikPakClient.retryPolicy]. Both
+ *    paths release admission before backoff and consume no rate-limiter token.
  *  - Does NOT add PikPak's `Authorization` / `X-Device-Id` headers. The URL is
  *    expected to be a signed CDN/transcode link, which rejects them.
  *
@@ -109,69 +115,104 @@ public suspend fun <T> PikPakClient.streamRangeFromUrl(
         "bytes=$start-${start + length - 1}"
     }
 
-    return signedUrlGates.withSlot(url) {
-        http.sendRaw(
-        method = HttpMethod.Get,
-        url = url,
-        configure = {
-            // set, not append: an injected client that already carries a
-            // User-Agent would otherwise send two of them.
-            headers[HttpHeaders.UserAgent] = PikPakConstants.USER_AGENT
-            headers[HttpHeaders.Range] = rangeHeader
-            configure()
-        },
-    ) { response ->
-        val status = response.status
-        if (status.value in 200..299 && response.headers["X-Xos-Err-Desc"]?.trim() == "5") {
-            response.bodyAsChannel().cancel(null)
-            throw FileReactivatingException(httpStatus = status.value, headers = response.headerMap())
+    val apiPriority = kotlinx.coroutines.currentCoroutineContext()[ApiRequestPriority]?.priority
+    val priority = kotlinx.coroutines.currentCoroutineContext()[io.github.nihildigit.pikpak.internal.SignedRequestPriority]?.value
+        ?: when {
+            apiPriority != null && apiPriority <= ApiRequestPriority.BACKGROUND -> 0
+            length != null && length <= 64 * 1024L -> PikPakStreamReader.MICRO_PROBE_PRIORITY
+            else -> 0
         }
-        when {
-            status == HttpStatusCode.OK ->
-                throw PikPakException(
-                    -1,
-                    "streamRangeFromUrl: server returned 200 instead of 206 — Range header was ignored, " +
-                        "streaming the full file would violate the range contract",
-                    httpStatus = 200,
-                )
-            status == HttpStatusCode.RequestedRangeNotSatisfiable ->
-                throw PikPakException(
-                    -1,
-                    "streamRangeFromUrl: server returned 416 Range Not Satisfiable (start=$start may exceed file size)",
-                    httpStatus = 416,
-                )
-            status != HttpStatusCode.PartialContent ->
-                throw PikPakException(
-                    -1,
-                    "streamRangeFromUrl: unexpected HTTP status ${status.value}",
-                    httpStatus = status.value,
-                )
-        }
+    val order = kotlinx.coroutines.currentCoroutineContext()[io.github.nihildigit.pikpak.internal.RequestOrder]?.value ?: 0L
+    val readerOwnsRetries = currentCoroutineContext()[RangeAdmission] != null
+    val needsAccountSlot = !readerOwnsRetries && priority < PikPakStreamReader.BLOCKING_PRIORITY
+    var attempts = 0
+    var blockEntered = false
+    while (true) {
+        try {
+            val requestOrder = order.takeIf { it != 0L }
+                ?: currentCoroutineContext()[io.github.nihildigit.pikpak.internal.RequestOrder]?.value
+                ?: io.github.nihildigit.pikpak.internal.RequestOrder.Sequence.next()
+            if (needsAccountSlot) accountGate.acquire(priority, requestOrder)
+            return try {
+                signedUrlGates.withSlot(url, priority, requestOrder) {
+                http.sendRaw(
+                    method = HttpMethod.Get,
+                    url = url,
+                    retryRequests = false,
+                    configure = {
+                        // set, not append: an injected client that already carries a
+                        // User-Agent would otherwise send two of them.
+                        headers[HttpHeaders.UserAgent] = PikPakConstants.USER_AGENT
+                        headers[HttpHeaders.Range] = rangeHeader
+                        configure()
+                    },
+                ) { response ->
+                    val status = response.status
+                    if (status.value in 200..299 && response.headers["X-Xos-Err-Desc"]?.trim() == "5") {
+                        response.bodyAsChannel().cancel(null)
+                        throw FileReactivatingException(httpStatus = status.value, headers = response.headerMap())
+                    }
+                    when {
+                        status == HttpStatusCode.OK ->
+                            throw PikPakException(
+                                -1,
+                                "streamRangeFromUrl: server returned 200 instead of 206 — Range header was ignored, " +
+                                    "streaming the full file would violate the range contract",
+                                httpStatus = 200,
+                            )
+                        status == HttpStatusCode.RequestedRangeNotSatisfiable ->
+                            throw PikPakException(
+                                -1,
+                                "streamRangeFromUrl: server returned 416 Range Not Satisfiable (start=$start may exceed file size)",
+                                httpStatus = 416,
+                            )
+                        status != HttpStatusCode.PartialContent ->
+                            throw PikPakException(
+                                -1,
+                                "streamRangeFromUrl: unexpected HTTP status ${status.value}",
+                                httpStatus = status.value,
+                                headers = response.headerMap(),
+                            )
+                    }
 
-        val parsed = parseContentRange(response.headers[HttpHeaders.ContentRange])
-            ?: throw PikPakException(-1, "streamRangeFromUrl: missing or invalid Content-Range")
-        val derivedLength = parsed.endInclusive - parsed.start + 1L
-        val contentLengthHeader = response.headers[HttpHeaders.ContentLength]
-        val rawContentLength = contentLengthHeader?.toLongOrNull()
-        val requestedEnd = length?.let { start + it - 1 }
-        if (parsed.start != start ||
-            (requestedEnd != null && parsed.endInclusive > requestedEnd) ||
-            (requestedEnd != null && parsed.endInclusive < requestedEnd &&
-                parsed.totalSize != parsed.endInclusive + 1) ||
-            (contentLengthHeader != null && rawContentLength != derivedLength)
-        ) {
-            throw PikPakException(-1, "streamRangeFromUrl: response does not match requested range")
-        }
+                    val parsed = parseContentRange(response.headers[HttpHeaders.ContentRange])
+                        ?: throw PikPakException(-1, "streamRangeFromUrl: missing or invalid Content-Range")
+                    val derivedLength = parsed.endInclusive - parsed.start + 1L
+                    val contentLengthHeader = response.headers[HttpHeaders.ContentLength]
+                    val rawContentLength = contentLengthHeader?.toLongOrNull()
+                    val requestedEnd = length?.let { start + it - 1 }
+                    if (parsed.start != start ||
+                        (requestedEnd != null && parsed.endInclusive > requestedEnd) ||
+                        (requestedEnd != null && parsed.endInclusive < requestedEnd &&
+                            parsed.totalSize != parsed.endInclusive + 1) ||
+                        (contentLengthHeader != null && rawContentLength != derivedLength)
+                    ) {
+                        throw PikPakException(-1, "streamRangeFromUrl: response does not match requested range")
+                    }
 
-        block(
-            RangeStream(
-                channel = response.bodyAsChannel(),
-                contentLength = rawContentLength ?: derivedLength,
-                totalSize = parsed.totalSize,
-                rangeStart = parsed.start,
-                rangeEndInclusive = parsed.endInclusive,
-            ),
-        )
+                    blockEntered = true
+                    val streamBytes = (rawContentLength ?: derivedLength).coerceAtLeast(0L)
+                    val result = block(
+                        RangeStream(
+                            channel = response.bodyAsChannel(),
+                            contentLength = rawContentLength ?: derivedLength,
+                            totalSize = parsed.totalSize,
+                            rangeStart = parsed.start,
+                            rangeEndInclusive = parsed.endInclusive,
+                        ),
+                    )
+                    if (!readerOwnsRetries && streamBytes > 0L) {
+                        accountState.onDownstreamBytesRead(streamBytes, flush = true)
+                    }
+                    result
+                }
+                }
+            } finally {
+                if (needsAccountSlot) accountGate.release()
+            }
+        } catch (e: PikPakException) {
+            if (readerOwnsRetries || blockEntered || !e.isThrottlePressure || ++attempts >= retryPolicy.maxAttempts) throw e
+            delay(e.retryAfter() ?: retryPolicy.delayFor(attempts - 1))
         }
     }
 }

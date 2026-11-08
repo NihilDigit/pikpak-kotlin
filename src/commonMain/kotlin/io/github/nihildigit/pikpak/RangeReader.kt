@@ -5,6 +5,8 @@ import io.github.nihildigit.pikpak.internal.HostHealth
 import io.github.nihildigit.pikpak.internal.PriorityGate
 import io.github.nihildigit.pikpak.internal.ReadTelemetry
 import io.github.nihildigit.pikpak.internal.RequestOrder
+import io.github.nihildigit.pikpak.internal.isThrottlePressure
+import io.github.nihildigit.pikpak.internal.retryAfter
 import io.ktor.utils.io.ByteChannel
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
@@ -216,8 +218,7 @@ class RangeReader internal constructor(
         require(length == null || length >= 1) { "length must be >= 1 when non-null, got $length" }
         check(!closed) { "RangeReader is closed" }
 
-        return withSlot(priority) {
-            coroutineScope {
+        return coroutineScope {
                 val channel = ByteChannel(autoFlush = true)
                 val failure = PumpFailure()
                 val pump = launchPump(this, channel, failure, start, length, priority)
@@ -240,7 +241,7 @@ class RangeReader internal constructor(
                         failure.draining = true
                         channel.cancel(CancellationException("read block finished"))
                         val remaining = failure.remainingBytes()
-                        if (!completed && remaining in 1L..DRAIN_SOCKET_MAX_BYTES && client.hostHealth.tryAcquireDrain()) {
+                        if (remaining in 1L..DRAIN_SOCKET_MAX_BYTES && client.hostHealth.tryAcquireDrain()) {
                             try {
                                 withTimeoutOrNull(DRAIN_SOCKET_GRACE) { pump.join() }
                             } finally {
@@ -251,7 +252,6 @@ class RangeReader internal constructor(
                         withTimeoutOrNull(50.milliseconds) { pump.join() }
                     }
                 }
-            }
         }
     }
 
@@ -316,19 +316,12 @@ class RangeReader internal constructor(
     private suspend fun <T> withSlot(priority: Int, body: suspend () -> T): T {
         // A read nobody ordered is ordered by now, which keeps the old arrival order among such reads
         val order = currentCoroutineContext()[RequestOrder]?.value ?: RequestOrder.Sequence.next()
-        val telemetry = currentCoroutineContext()[ReadTelemetry]
-        suspend fun acquire(gate: PriorityGate) {
-            val started = telemetry?.let { timeSource.markNow() }
-            try {
-                gate.acquire(priority, order)
-            } finally {
-                if (telemetry != null && started != null) telemetry.gateWait += started.elapsedNow()
-            }
-        }
-        acquire(gate)
+        // RangeAdmission measures the whole file/account/signed admission interval.
+        // Counting these gates separately would double-count their wait in telemetry.
+        gate.acquire(priority, order)
         updateStats()
         try {
-            acquire(client.accountGate)
+            client.accountGate.acquire(priority, order)
             try {
                 return body()
             } finally {
@@ -387,16 +380,11 @@ class RangeReader internal constructor(
             val started = telemetry?.let { timeSource.markNow() }
             // A reader parked on the block is not the place to try an unproven host, whether or not
             // its caller called it urgent: a player filling its buffer still stops if that block is late
-            val mayExplore = priority < PikPakStreamReader.READ_AHEAD_PRIORITY ||
-                (priority < PikPakStreamReader.STREAMING_PRIORITY && offset >= EXPLORE_MIN_OFFSET_BYTES)
+            val mayExplore = priority < PikPakStreamReader.READ_AHEAD_PRIORITY
             val routedUrl = client.hostHealth.route(linkUrl, mayExplore = mayExplore, requestedBytes = remaining ?: HostHealth.MIN_SAMPLE_BYTES, priority = priority)
             val routedHost = HostHealth.hostOf(routedUrl)
             val attemptUrl = if (routedHost != null && routedHost in failedReroutes) linkUrl else routedUrl
             val rerouted = attemptUrl != linkUrl
-            if (telemetry != null) {
-                telemetry.attempts++
-                if (rerouted) telemetry.rerouted = true
-            }
             var delivered = 0L
             var announced: Long? = null
             var clippedAtEof = false
@@ -406,12 +394,19 @@ class RangeReader internal constructor(
             // nothing reads costs one allocation per request.
             val attempt = RangeAttemptRecorder(offset, remaining, gate.inUse, gate.queued, priority, HostHealth.hostOf(attemptUrl), timeSource)
 
+            val connectionTelemetry = telemetry ?: ReadTelemetry(timeSource)
+            connectionTelemetry.resetConnection()
             try {
                 // Only an extra context element, so the block below still runs
                 // on this coroutine and this dispatcher; what it buys is that
                 // the retries HttpEngine performs under this one request are
                 // counted against this attempt and no other.
-                withContext(attempt.retries + attempt.admission) {
+                withSlot(priority) {
+                if (telemetry != null) {
+                    telemetry.attempts++
+                    if (rerouted) telemetry.rerouted = true
+                }
+                withContext(attempt.retries + attempt.admission + io.github.nihildigit.pikpak.internal.SignedRequestPriority(priority) + connectionTelemetry) {
                   coroutineScope {
                     // The request is past both gates here. What sits below them is the HTTP
                     // layer's own retries of a 5xx or 429, which are the host answering, only
@@ -419,7 +414,8 @@ class RangeReader internal constructor(
                     // is left is a host that said nothing at all.
                     // Throwing from the child fails the scope and cancels the request with it.
                     val answered = CompletableDeferred<Unit>()
-                    val limit = client.hostHealth.firstResponseDeadline(attemptUrl)
+                    val claimedWarm = client.hostHealth.onRequestStarted(attemptUrl)
+                    val limit = client.hostHealth.firstResponseDeadline(attemptUrl, claimedWarm)
                     val bodySilence = client.hostHealth.bodySilenceDeadline(priority)
                     val deadline = launch {
                         attempt.admission.granted.await()
@@ -432,7 +428,6 @@ class RangeReader internal constructor(
                             statusesSeen = statuses
                         }
                     }
-                    client.hostHealth.onRequestStarted(attemptUrl)
                     client.streamRangeFromUrl(attemptUrl, offset, remaining) { stream ->
                         validateTotal(stream.totalSize)
                         answered.complete(Unit)
@@ -440,7 +435,11 @@ class RangeReader internal constructor(
                         val waited = attempt.headersReceived()
                         // A wait that spans a retry below measures the retry policy, not the line
                         val clean = attempt.retries.statuses == 0 && attempt.retries.transport == 0
-                        client.hostHealth.answered(attemptUrl, waited.takeIf { clean })
+                        client.hostHealth.answered(
+                            attemptUrl,
+                            waited.takeIf { clean },
+                            connectionReused = connectionTelemetry.connectionReused,
+                        )
                         announced = stream.contentLength
                         state.announced = announced ?: -1L
                         state.delivered = 0L
@@ -449,6 +448,7 @@ class RangeReader internal constructor(
                         var firstByteAt: TimeMark? = null
                         while (true) {
                             val silenceLimit = tailSilenceDeadline(bodySilence, delivered, announced)
+                            val readStarted = timeSource.markNow()
                             val n = try {
                                 withTimeout(silenceLimit) {
                                     stream.channel.readAvailable(buffer, 0, buffer.size)
@@ -457,10 +457,13 @@ class RangeReader internal constructor(
                                 throw BodySilence(silenceLimit, delivered)
                             }
                             if (n == -1) {
-                                client.hostHealth.onSocketReturned(attemptUrl)
+                                if (announced == null || delivered >= announced!!) {
+                                    client.hostHealth.onSocketReturned(attemptUrl)
+                                }
                                 break
                             }
                             if (n > 0) {
+                                val readElapsed = readStarted.elapsedNow()
                                 if (firstByteAt == null) firstByteAt = timeSource.markNow()
                                 if (announced != null && n.toLong() > announced!! - delivered) {
                                     throw PikPakException(-1, "RangeReader: body exceeds Content-Range")
@@ -475,6 +478,7 @@ class RangeReader internal constructor(
                                 state.delivered = delivered
                                 if (!state.draining) {
                                     val sinkStarted = timeSource.markNow()
+                                    telemetry?.beginSinkWait()
                                     try {
                                         if (sink.isClosedForWrite) throw sink.closedCause
                                             ?: IllegalStateException("consumer channel closed before draining")
@@ -486,34 +490,39 @@ class RangeReader internal constructor(
                                     } catch (t: Throwable) {
                                         if (!state.draining) throw SinkFailure(t)
                                     } finally {
+                                        telemetry?.endSinkWait()
                                         val waited = sinkStarted.elapsedNow()
                                         attempt.recordSinkWait(waited)
                                         if (telemetry != null) telemetry.sinkWait += waited
                                     }
                                 }
                                 // A throttled "drip" edge sending a few KiB every 1–2 s resets per-read
-                                // bodySilence forever and drags a 256 KiB block to 9+ s. Cut over once a
-                                // healthy sibling is already proven on this cluster.
-                                val expectedRemaining = remaining
+                                // bodySilence forever and drags a 256 KiB block to 9+ s. Cut over once
+                                // bodySilence has elapsed below viable rate on an unproven host.
                                 val bodyElapsed = (firstByteAt.elapsedNow() - attempt.sinkWait).coerceAtLeast(Duration.ZERO)
-                                if (announced == null || delivered < announced!!)
-                                    onBodyProgress?.invoke(bodyElapsed, attempt.bodyBytesPerSecond())
-                                if (bodyElapsed >= silenceLimit &&
-                                    (expectedRemaining == null || delivered < expectedRemaining) &&
-                                    attempt.bodyBytesPerSecond() in 1 until MIN_VIABLE_BODY_BYTES_PER_SEC &&
-                                    client.hostHealth.hasHealthySibling(attemptUrl)
-                                ) {
-                                    throw BodySilence(bodyElapsed, delivered)
+                                if (announced == null || delivered < announced!!) {
+                                    val bodyRate = attempt.bodyBytesPerSecond()
+                                    onBodyProgress?.invoke(bodyElapsed, bodyRate)
+                                    if (bodyElapsed >= bodySilence &&
+                                        tailSilenceDeadline(bodySilence, delivered, announced) == bodySilence &&
+                                        bodyRate < MIN_VIABLE_BODY_BYTES_PER_SEC &&
+                                        !client.hostHealth.hasGoodHistory(attemptUrl)
+                                    ) {
+                                        throw BodySilence(bodySilence, delivered)
+                                    }
                                 }
                             }
                         }
                     }
                   }
                 }
+                }
             } catch (t: Throwable) {
                 if (telemetry != null && started != null) {
                     telemetry.gateWait += attempt.gateWait
-                    telemetry.networkDuration += (started.elapsedNow() - attempt.sinkWait - attempt.gateWait).coerceAtLeast(Duration.ZERO)
+                    if (attempt.admission.granted.isCompleted) {
+                        telemetry.networkDuration += (started.elapsedNow() - attempt.sinkWait - attempt.gateWait).coerceAtLeast(Duration.ZERO)
+                    }
                 }
                 if (t is CancellationException) {
                     // An attempt is reported when it stops delivering, and that can be the
@@ -526,11 +535,11 @@ class RangeReader internal constructor(
                     // is Cancelled, not Failed: nothing went wrong on the wire, and calling it
                     // a failure made every seek look like a flaky host.
                     val whole = announced != null && delivered >= announced!!
-                    report(attempt, if (whole) RangeAttempt.Outcome.Complete else RangeAttempt.Outcome.Cancelled)
+                    report(attempt, attemptUrl, if (whole) RangeAttempt.Outcome.Complete else RangeAttempt.Outcome.Cancelled)
                     throw t
                 }
                 if (t is SinkFailure) {
-                    report(attempt, RangeAttempt.Outcome.Cancelled)
+                    report(attempt, attemptUrl, RangeAttempt.Outcome.Cancelled)
                     throw t
                 }
                 offset += delivered
@@ -543,75 +552,100 @@ class RangeReader internal constructor(
                     continue
                 }
 
-                val throttled = t is PikPakException && t.httpStatus == 503
+                val throttled = t is PikPakException && t.isThrottlePressure
                 if (state.draining) return
                 if (rerouted && !throttled) {
                     // The sibling failed, not the link: an expiry, a 404 or a refused handshake
                     // there says nothing about the link's own host. So no refresh and no failure
-                    // counted; the next attempt goes back to the link as it is.
+                    // counted up to MAX_FREE_REROUTES; once multiple siblings fail on the same
+                    // read, count further failures so a dead cluster cannot spin through learned hosts.
                     routedHost?.let { failedReroutes += it }
                     val rejected = t is UrlExpiredException || (t is PikPakException && t.httpStatus in 400..499)
-                    report(attempt, if (rejected) RangeAttempt.Outcome.Rejected else RangeAttempt.Outcome.Failed)
+                    report(attempt, attemptUrl, if (rejected) RangeAttempt.Outcome.Rejected else RangeAttempt.Outcome.Failed)
                     if (t is BodySilence) {
                         client.hostHealth.stalled(attemptUrl, attempt.delivered, attempt.bodyBytesPerSecond(), t.limit)
+                    } else if (t is UnresponsiveHost) {
+                        client.hostHealth.markSilent(attemptUrl, t.limit)
                     }
-                    if (rejected || t is BodySilence || (delivered == 0L && !client.hostHealth.isAnswering(attemptUrl))) {
+                    if (rejected || (t !is BodySilence && t !is UnresponsiveHost && delivered == 0L)) {
                         client.hostHealth.refused(attemptUrl)
                     }
-                    continue
+                    if (failedReroutes.size <= MAX_FREE_REROUTES) {
+                        continue
+                    }
                 }
 
                 when {
                     t is UrlExpiredException -> {
-                        report(attempt, RangeAttempt.Outcome.Expired)
+                        report(attempt, attemptUrl, RangeAttempt.Outcome.Expired)
                         if (telemetry != null) telemetry.refreshed = true
                         refreshUrl(UrlRequest.Expired(linkUrl), linkUrl)
                     }
-                    t is PikPakException && t.httpStatus == 503 -> {
-                        report(attempt, RangeAttempt.Outcome.Throttled)
+                    t is PikPakException && t.isThrottlePressure -> {
+                        report(attempt, attemptUrl, RangeAttempt.Outcome.Throttled)
                         // Over the URL's connection cap. Somebody else's read
                         // will finish; this is a queue, not a failure.
                         throttles++
                         if (throttles > MAX_THROTTLE_WAITS) throw t
                         bumpThrottled()
-                        delay(throttleBackoff(throttles))
+                        delay(t.retryAfter() ?: throttleBackoff(throttles))
                     }
                     t is PikPakException && t.httpStatus in 400..499 -> {
-                        report(attempt, RangeAttempt.Outcome.Rejected)
+                        report(attempt, attemptUrl, RangeAttempt.Outcome.Rejected)
                         if (rejectionRefreshed) throw t
                         rejectionRefreshed = true
                         if (telemetry != null) telemetry.refreshed = true
                         refreshUrl(UrlRequest.Rejected(linkUrl, t.httpStatus!!), linkUrl)
                     }
                     t is UnresponsiveHost -> {
-                        report(attempt, RangeAttempt.Outcome.Failed)
+                        report(attempt, attemptUrl, RangeAttempt.Outcome.Failed)
                         failures++
                         if (failures >= maxAttempts) throw PikPakException(-1, "RangeReader: no host answered at offset $offset", cause = t)
                         bumpRetries()
-                        // No backoff: nothing is wrong with the network, only with that host
-                        switchHost(linkUrl, silentFor = t.limit)
+                        // Playback opens multiple sockets to PikPak's issued host; a single slow
+                        // socket on an answering host retries in place rather than poisoning HostHealth.
+                        val canSwitch = rerouted ||
+                            priority < PikPakStreamReader.READ_AHEAD_PRIORITY ||
+                            !client.hostHealth.isAnswering(attemptUrl) ||
+                            failures >= 2
+                        if (canSwitch) {
+                            switchHost(linkUrl, silentFor = t.limit)
+                        }
                     }
                     t is BodySilence -> {
-                        report(attempt, RangeAttempt.Outcome.Failed)
-                        client.hostHealth.stalled(attemptUrl, attempt.delivered, attempt.bodyBytesPerSecond(), t.limit)
+                        report(attempt, attemptUrl, RangeAttempt.Outcome.Failed)
                         bodyStalls++
-                        if (delivered == 0L || bodyStalls >= maxAttempts * 2) {
+                        val canSwitch = rerouted ||
+                            priority < PikPakStreamReader.READ_AHEAD_PRIORITY ||
+                            !client.hostHealth.hasGoodHistory(attemptUrl) ||
+                            bodyStalls >= 2
+                        if (canSwitch) {
+                            client.hostHealth.stalled(attemptUrl, attempt.delivered, attempt.bodyBytesPerSecond(), t.limit)
+                        }
+                        if (delivered < MIN_VIABLE_BODY_BYTES_PER_SEC || bodyStalls >= maxAttempts) {
                             failures++
-                            if (failures >= maxAttempts || bodyStalls >= maxAttempts * 2) {
+                            if (failures >= maxAttempts || bodyStalls >= maxAttempts) {
                                 throw PikPakException(-1, "RangeReader: body silent at offset $offset", cause = t)
                             }
                         }
                         bumpRetries()
-                        // No backoff: bytes before the stall were kept, steer off the stalled host immediately
-                        switchHost(linkUrl, silentFor = t.limit)
+                        if (canSwitch) {
+                            switchHost(linkUrl, silentFor = t.limit)
+                        }
                     }
                     else -> {
-                        report(attempt, RangeAttempt.Outcome.Failed)
+                        report(attempt, attemptUrl, RangeAttempt.Outcome.Failed)
                         failures++
                         if (failures >= maxAttempts) throw t
                         bumpRetries()
                         delay(client.retryPolicy.delayFor(failures - 1))
-                        switchHost(linkUrl)
+                        val canSwitch = rerouted ||
+                            priority < PikPakStreamReader.READ_AHEAD_PRIORITY ||
+                            !client.hostHealth.hasGoodHistory(attemptUrl) ||
+                            failures >= 2
+                        if (canSwitch) {
+                            switchHost(linkUrl)
+                        }
                     }
                 }
                 continue
@@ -624,7 +658,7 @@ class RangeReader internal constructor(
                 telemetry.gateWait += attempt.gateWait
                 telemetry.networkDuration += (started.elapsedNow() - attempt.sinkWait - attempt.gateWait).coerceAtLeast(Duration.ZERO)
             }
-            report(attempt, outcomeFor(announced, delivered))
+            report(attempt, attemptUrl, outcomeFor(announced, delivered))
 
             offset += delivered
             remaining = remaining?.minus(delivered)
@@ -774,7 +808,7 @@ class RangeReader internal constructor(
      * does not apply, because the caller supplied the code that threw and it is
      * not on the path the bytes take.
      */
-    private suspend fun report(recorder: RangeAttemptRecorder, outcome: RangeAttempt.Outcome) {
+    private suspend fun report(recorder: RangeAttemptRecorder, url: String, outcome: RangeAttempt.Outcome) {
         currentCoroutineContext()[ReadTelemetry]?.let { telemetry ->
             telemetry.retries += recorder.retries.serverErrors + recorder.retries.rateLimited + recorder.retries.transport
             telemetry.throttled += recorder.retries.serverErrors + recorder.retries.rateLimited
@@ -784,8 +818,9 @@ class RangeReader internal constructor(
         // Only completed attempts reflect the host's steady throughput; cancelled partial reads
         // on seek or close are often cut off mid-slow-start and would overwrite clean figures.
         if (outcome == RangeAttempt.Outcome.Complete) {
-            client.hostHealth.delivered(recorder.host, recorder.delivered, recorder.bodyBytesPerSecond())
+            client.hostHealth.delivered(recorder.host, recorder.delivered, recorder.bodyBytesPerSecond(), url)
         }
+        client.accountState.flushDownstreamBytes()
         val observer = onAttempt ?: return
         try {
             observer(recorder.finish(outcome))
@@ -798,6 +833,7 @@ class RangeReader internal constructor(
     private fun addBytes(count: Long) {
         if (count <= 0) return
         _stats.update { it.copy(bytesRead = it.bytesRead + count) }
+        client.accountState.onDownstreamBytesRead(count)
     }
 
     private suspend fun bumpRetries() {
@@ -829,7 +865,7 @@ class RangeReader internal constructor(
         internal fun tailSilenceDeadline(base: Duration, delivered: Long, announced: Long?): Duration =
             if (delivered > 0 && announced != null && announced > 0 &&
                 (announced - delivered <= 64 * 1024 || delivered.toDouble() / announced >= 0.8))
-                (base * 2).coerceAtMost(HostHealth.MAX_DEADLINE)
+                (base * 2).coerceAtMost(10.seconds)
             else base
 
         const val READ_CHUNK = 64 * 1024
@@ -866,6 +902,7 @@ class RangeReader internal constructor(
          * instead of hanging.
          */
         const val MAX_THROTTLE_WAITS = 30
+        const val MAX_FREE_REROUTES = 2
         const val THROTTLE_BASE_DELAY_MS = 200L
         const val THROTTLE_MAX_DELAY_MS = 2_000L
     }

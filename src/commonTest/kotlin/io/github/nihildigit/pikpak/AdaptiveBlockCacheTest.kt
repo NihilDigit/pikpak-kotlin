@@ -90,7 +90,8 @@ class AdaptiveBlockCacheTest {
 
     @Test
     fun `account allowance retreats to eight each then six five five`() = runTest {
-        val scheduler = TransferScheduler(16, 16, BandwidthLimiter(), testScheduler.timeSource)
+        val scheduler = TransferScheduler(16, 16, BandwidthLimiter(), testScheduler.timeSource,
+            concurrencyMode = ConcurrencyMode.Fixed(16))
         val sources = List(3) { AdaptiveSource() }
         val caches = sources.map { cache(it, scheduler) }
         try {
@@ -166,7 +167,8 @@ class AdaptiveBlockCacheTest {
 
     @Test
     fun `durable demand expands and withdrawing it releases allowance`() = runTest {
-        val scheduler = TransferScheduler(16, 16, BandwidthLimiter(), testScheduler.timeSource)
+        val scheduler = TransferScheduler(16, 16, BandwidthLimiter(), testScheduler.timeSource,
+            concurrencyMode = ConcurrencyMode.Fixed(16))
         val source = AdaptiveSource()
         val store = object : DurableBlockStore {
             override suspend fun read(file: String, offset: Long, length: Int): ByteArray? = null
@@ -190,6 +192,22 @@ class AdaptiveBlockCacheTest {
             cache.close()
             cache.awaitClosedForTest()
         }
+    }
+
+    @Test
+    fun `new adaptive cache starts four workers even when sixteen signed slots are available`() = runTest {
+        val scheduler = TransferScheduler(16, 16, BandwidthLimiter(), testScheduler.timeSource)
+        val source = AdaptiveSource()
+        val cache = cache(source, scheduler)
+        try {
+            cache.warm(listOf(0L..65535L), StreamRole.BACKGROUND, null)
+            runCurrent()
+            assertEquals(16, source.allowance)
+            assertEquals(4, source.active)
+            source.finishSecondSignature()
+            runCurrent()
+            assertEquals(4, source.active, "extra signatures do not constitute throughput evidence")
+        } finally { cache.close(); cache.awaitClosedForTest() }
     }
 
     @Test

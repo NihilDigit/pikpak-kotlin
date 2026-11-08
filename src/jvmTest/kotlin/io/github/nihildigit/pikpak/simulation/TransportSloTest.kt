@@ -18,8 +18,9 @@ import kotlin.time.Duration.Companion.milliseconds
  *
  * NOTE: The throughput numbers here have near-zero predictive value on real high-RTT routes.
  * [VirtualNetwork] lets cwnd grow to 8 MiB and injects synthetic gigabit siblings, whereas live
- * PikPak `dl-z01a` edges clamp server TCP send windows to ~64 KiB (capping single-stream throughput
- * to `64 KiB / RTT` regardless of HTTP Range span) and suffer 1.4–3.2 s proxied TLS cold opens.
+ * ordinary PikPak download-pool links have exhibited ~64 KiB server send windows;
+ * original-media links in the same family can use a different frontend policy.
+ * Proxy TLS cold opens can also dominate latency. These costs are not modeled here.
  * Always benchmark transport changes against real multi-region proxy nodes.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -45,7 +46,8 @@ class TransportSimulationTest {
 
     @Test fun degradedWithoutSiblingAmortizesFirstByteCost() = runTest(timeout = 5.minutes) {
         val profile = NetworkProfile(ttfbMs = 1350, degradedHost = HOST)
-        val result = download(profile, size = 256 * MIB)
+        // Isolate span efficiency from the separately tested adaptive capacity search.
+        val result = download(profile, size = 256 * MIB, concurrencyMode = ConcurrencyMode.Fixed(8))
         // An optimistic old-policy upper bound: eight warm sockets with no loss,
         // no slow start, no disk overhead, but each 1 MiB request pays its TTFB.
         val oldRangeBytes = MIB.toDouble()
@@ -64,12 +66,14 @@ class TransportSimulationTest {
         minimumUtilization: Double? = null,
         size: Long = 2 * 1024 * MIB,
         steering: Boolean = false,
+        concurrencyMode: ConcurrencyMode = ConcurrencyMode.Adaptive(),
     ): Result {
         val network = VirtualNetwork(this, size, profile)
         val http = HttpClient(network.engine)
         val client = PikPakClient("simulation", { "unused" }, sessionStore = InMemorySessionStore(),
             retryPolicy = RetryPolicy.None, httpClient = http, steerEdgeHosts = steering,
             transportMemoryBudgetBytes = 16 * MIB, timeSource = testScheduler.timeSource)
+        client.concurrencyMode = concurrencyMode
         if (steering) client.hostHealth.observe(FileDetail(
             webContentLink = "https://$HOST/file?signature=same",
             medias = listOf(

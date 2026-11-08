@@ -50,6 +50,12 @@ class PikPakFileCache internal constructor(
     val deliveredBytes: Long get() = cache.deliveredBytes
 
     /**
+     * Chunk-level bytes received from the network on this cache, monotonic, including bytes
+     * buffered inside in-flight blocks before block completion.
+     */
+    val receivedBytes: Long get() = cache.receivedBytes
+
+    /**
      * Bytes fetched into memory and evicted before anyone read them. A read that waits says
      * read-ahead was too shallow; this is the only signal that it was too deep.
      */

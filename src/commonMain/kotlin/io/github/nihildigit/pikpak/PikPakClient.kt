@@ -1,5 +1,6 @@
 package io.github.nihildigit.pikpak
 
+import io.github.nihildigit.pikpak.internal.AccountState
 import io.github.nihildigit.pikpak.internal.AuthApi
 import io.github.nihildigit.pikpak.internal.FolderIdCache
 import io.github.nihildigit.pikpak.internal.ForegroundStreams
@@ -95,16 +96,15 @@ class PikPakClient(
      */
     transportMemoryBudgetBytes: Long = DEFAULT_TRANSPORT_MEMORY_BUDGET_BYTES,
     /**
-     * Enables multi-connection range fan-out, dual signed URL lanes and edge-host steering.
+     * Enables automatic range fan-out and dual signed URL lanes by default.
+     * Adaptive caches start at up to four workers and expand only on measured gain.
      *
-     * When false, each open file or download uses a single sequential range connection on the
-     * host its link names, matching the network profile of the official PikPak client.
+     * When false, each open file or download uses one range connection. Importance,
+     * bandwidth shaping and edge-host health steering remain unchanged.
      */
     concurrentAcceleration: Boolean = true,
     internal val timeSource: TimeSource = TimeSource.Monotonic,
 ) {
-    private val configuredSteerEdgeHosts = steerEdgeHosts
-
     constructor(
         account: String,
         password: String,
@@ -221,14 +221,18 @@ class PikPakClient(
      * Multi-connection acceleration toggle for streams and downloads on this client.
      *
      * May be toggled at runtime; disabling it clamps each open file to a single sequential range
-     * connection, suppresses dual signed-lane minting, and disables sibling edge-host exploration.
+     * connection and suppresses dual signed-lane minting. Route health remains independent.
      */
     var concurrentAcceleration: Boolean
         get() = scheduler.concurrentAcceleration
         set(value) {
             scheduler.concurrentAcceleration = value
-            hostHealth.steering = value && configuredSteerEdgeHosts
         }
+
+    /** Changes only request capacity, preserving importance, byte budgets and routing. */
+    var concurrencyMode: ConcurrencyMode
+        get() = scheduler.concurrencyMode
+        set(value) { scheduler.concurrencyMode = value }
 
     /** Marks user interaction so background transfers can leave room for interactive work. */
     fun notifyInteractiveActivity() = scheduler.onInteractiveActivity()
@@ -242,7 +246,11 @@ class PikPakClient(
     internal val foregroundStreams = ForegroundStreams()
 
     /** Edge hosts that failed or crawled recently, and the siblings reads may move to instead. */
-    internal val hostHealth = HostHealth(steering = steerEdgeHosts && concurrentAcceleration, timeSource = timeSource)
+    internal val hostHealth = HostHealth(
+        steering = steerEdgeHosts,
+        timeSource = timeSource,
+        foregroundHungry = { scheduler.foregroundHungry() },
+    )
 
     // Keyed by content and variant: a transcode's length is only learned by a probe, and it
     // cannot change while the content exists, whichever file object or link reaches it.
@@ -340,7 +348,7 @@ class PikPakClient(
                 folderWarmJob = background.launch {
                     delay(debounce)
                     val detailDef = background.async {
-                        withApiPriority(-10) { fetchFileDetailLive(candidate.id) }
+                        withApiPriority(ApiRequestPriority.BACKGROUND) { fetchFileDetailLive(candidate.id) }
                     }
                     val entry = PrefetchedDetail(candidate.id, timeSource.markNow(), detailDef)
                     prefetchedDetail.value = entry
@@ -363,6 +371,89 @@ class PikPakClient(
      */
     @Volatile
     var leaseBudget: LeaseBudget? = null
+
+    /**
+     * Automatically sets [leaseBudget] to 90 % of the account's remaining storage
+     * the first time [getQuota] reports a positive storage limit while [leaseBudget] is null.
+     */
+    @Volatile
+    var autoLeaseBudget: Boolean = true
+
+    /**
+     * Reconciles [quotaFlow] and [transferQuotaFlow] in the background after mutations
+     * and transfers once the corresponding flow has been observed or seeded.
+     */
+    @Volatile
+    var reconcileAccountStateInBackground: Boolean = ownsHttpClient
+
+    internal val accountState = AccountState(this)
+
+    /** Latest known storage and daily cloud-download quota, including local mutation projections. */
+    val quotaFlow: StateFlow<QuotaResponse?> get() = accountState.quotaFlow
+
+    /** Read-only snapshot of [quotaFlow]. */
+    val currentQuota: QuotaResponse? get() = quotaFlow.value
+
+    /** Latest known monthly and daily transfer allowances, including live byte projections. */
+    val transferQuotaFlow: StateFlow<TransferQuota?> get() = accountState.transferQuotaFlow
+
+    /** Read-only snapshot of [transferQuotaFlow]. */
+    val currentTransferQuota: TransferQuota? get() = transferQuotaFlow.value
+
+    /** Latest known user profile (`GET /v1/user/me`). */
+    val userProfileFlow: StateFlow<UserProfile?> get() = accountState.userProfileFlow
+
+    /** Read-only snapshot of [userProfileFlow]. */
+    val currentUserProfile: UserProfile? get() = userProfileFlow.value
+
+    /**
+     * Whether the account is on the free tier (`false` for premium, `true` for free,
+     * `null` before either [getTransferQuota] or [getQuota] has reported a tier).
+     */
+    val isFreeAccountFlow: StateFlow<Boolean?> get() = accountState.isFreeAccountFlow
+
+    /** Read-only snapshot of [isFreeAccountFlow]. */
+    val isFreeAccount: Boolean? get() = isFreeAccountFlow.value
+
+    /**
+     * Pre-populates [quotaFlow], [transferQuotaFlow] and [userProfileFlow] from cached
+     * state without overwriting values already fetched from the network.
+     */
+    fun seedAccountState(
+        quota: QuotaResponse? = null,
+        transferQuota: TransferQuota? = null,
+        userProfile: UserProfile? = null,
+    ) = accountState.seed(quota = quota, transferQuota = transferQuota, userProfile = userProfile)
+
+    /** Records file metadata so subsequent trash, restore and delete calls project exact byte deltas. */
+    fun observeFiles(files: Iterable<FileStat>) = accountState.observeFiles(files)
+
+    /** Records a folder's known physical subtree byte size so folder trash/delete/restore projects exact deltas. */
+    fun observeFolderSubtree(folderId: String, physicalBytes: Long, trashed: Boolean = false) =
+        accountState.observeFolderSubtree(folderId, physicalBytes, trashed)
+
+    /** Optimistically projects moving [ids] to the trash (idempotent with the subsequent [batchTrash] call). */
+    fun noteFilesTrashed(ids: Collection<String>, reconcile: Boolean = false) =
+        accountState.onFilesTrashed(ids, reconcile = reconcile)
+
+    /** Optimistically projects restoring [ids] from the trash (idempotent with [batchUntrash]). */
+    fun noteFilesUntrashed(ids: Collection<String>, reconcile: Boolean = false) =
+        accountState.onFilesUntrashed(ids, reconcile = reconcile)
+
+    /** Optimistically projects permanently deleting [ids] (idempotent with [batchDelete] / [deleteFile]). */
+    fun noteFilesDeleted(ids: Collection<String>, reconcile: Boolean = false) =
+        accountState.onFilesDeleted(ids, reconcile = reconcile)
+
+    /** Reverts optimistic transitions on [snapshots] back to their pre-operation states. */
+    fun revertFiles(snapshots: Iterable<FileStat>) = accountState.revertFiles(snapshots)
+
+    /** Projects an authoritative local storage usage figure onto [quotaFlow]. */
+    fun noteStorageUsage(usageBytes: Long, reconcile: Boolean = false) =
+        accountState.noteStorageUsage(usageBytes, reconcile = reconcile)
+
+    /** Adjusts [quotaFlow] by an explicit storage and trash byte delta. */
+    fun adjustStorageUsage(usageDeltaBytes: Long, trashDeltaBytes: Long = 0L, reconcile: Boolean = true) =
+        accountState.adjustStorageUsage(usageDeltaBytes, trashDeltaBytes, reconcile)
 
     /**
      * Drops the memoized path-to-folder-id map. The SDK clears it after every
@@ -396,6 +487,7 @@ class PikPakClient(
         // The captcha token is bound to the signed-out user id; keeping it
         // would send the next account's requests with the previous one's token.
         state.captchaToken = ""
+        accountState.clearOnLogout()
         sessionStore.clear(account)
     }
 
