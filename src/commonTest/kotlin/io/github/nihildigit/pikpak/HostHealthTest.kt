@@ -44,7 +44,7 @@ class HostHealthTest {
         val health = HostHealth()
         health.observe(FileDetail(webContentLink = "https://dl-z01a-0002.example/f?category=original"))
         val url = "https://dl-z01a-0001.example/f?category=%6Friginal&sign=a%2Bb%2Fc#t=1"
-        assertEquals(url.replace("0001", "0002"), health.route(url, true))
+        assertEquals(url, health.route(url, true))
         for (invalid in listOf(
             "ftp://dl-z01a-0001.example/f?t=0", "https://user@dl-z01a-0001.example/f?t=0",
             "https://dl-z01a-0001.example:443/f?t=0", "https://dl-z01a-0001.example/f?category=orig inal",
@@ -66,7 +66,7 @@ class HostHealthTest {
         }
         val sibling = original.replace("0202", "0404")
         health.observe(FileDetail(medias = listOf(MediaVariant(isOrigin = true, link = DownloadLink(sibling)))))
-        assertEquals(sibling, health.route(original, true))
+        assertEquals(original, health.route(original, true))
         assertEquals(download, health.route(download, true))
     }
 
@@ -84,19 +84,10 @@ class HostHealthTest {
         assertEquals(original, health.route(original, false))
         health.refused(downloadSibling)
         repeat(2) { health.delivered(HostHealth.hostOf(sibling), HostHealth.MIN_SAMPLE_BYTES, 10_000_000, sibling) }
+        health.refused(original)
         assertEquals(sibling, health.route(original, false))
     }
 
-    @Test
-    fun `unknown demand does not declare slow window limited routes sufficient`() {
-        for (rate in listOf(180L, 300L, 820L)) {
-            val health = HostHealth()
-            val sibling = link.replace("0001", "0002")
-            health.observe(FileDetail(webContentLink = sibling))
-            health.measure(HostHealth.hostOf(link)!!, rate * 1024)
-            assertEquals(sibling, health.route(link, true))
-        }
-    }
     // A dropped Wi-Fi silences every request at once; marking those hosts would blacklist the pool
     @Test
     fun `a silence with no other host answering is not held against the host`() {
@@ -149,18 +140,6 @@ class HostHealthTest {
         repeat(HostHealth.MIN_SAMPLES) { delivered(host, HostHealth.MIN_SAMPLE_BYTES, bytesPerSecond) }
 
     @Test
-    fun `measured completion benefit selects the faster sibling`() {
-        val health = HostHealth(seeds = listOf("dl-z01a-0002", "dl-z01a-0003"))
-        health.measure("dl-z01a-0001.mypikpak.com", 170_000)
-        health.measure("dl-z01a-0002.mypikpak.com", 5_000_000)
-        health.measure("dl-z01a-0003.mypikpak.com", 2_500_000)
-
-        assertEquals("https://dl-z01a-0002.mypikpak.com/download/?fid=F&sign=S", health.route(link, mayExplore = false))
-        val halfAsFast = "https://dl-z01a-0003.mypikpak.com/download/?fid=F&sign=S"
-        assertEquals(link.replace("0001", "0002"), health.route(halfAsFast, mayExplore = false))
-    }
-
-    @Test
     fun `a sibling that refused a link is not a destination however fast`() {
         val health = HostHealth(seeds = listOf("dl-z01a-0002", "dl-z01a-0003"))
         health.measure("dl-z01a-0001.mypikpak.com", 170_000)
@@ -168,50 +147,15 @@ class HostHealthTest {
         health.measure("dl-z01a-0003.mypikpak.com", 2_500_000)
         health.refused("https://dl-z01a-0002.mypikpak.com/other")
 
+        health.refused(link)
         assertEquals("https://dl-z01a-0003.mypikpak.com/download/?fid=F&sign=S", health.route(link, mayExplore = false))
     }
 
     // Exploring is what finds a slow host at all, but an unmeasured sibling may be one of the slow
     // ones, so it is kept off blocking reads, rationed, and within the link's family and root
-    @Test
-    fun `only background reads explore and only one per interval within the family and root`() {
-        val time = TestTimeSource()
-        val health = HostHealth(timeSource = time, seeds = listOf("dl-a10b-0005", "dl-z01a-0002", "dl-z01a-0003"))
-        val onOtherRoot = "https://dl-z01a-0001.pikpak.me/download/?fid=F&sign=S"
-
-        assertEquals(onOtherRoot, health.route(onOtherRoot, mayExplore = false))
-        assertEquals("https://dl-z01a-0002.pikpak.me/download/?fid=F&sign=S", health.route(onOtherRoot, mayExplore = true))
-        assertEquals(onOtherRoot, health.route(onOtherRoot, mayExplore = true))
-
-        time += HostHealth.EXPLORE_INTERVAL
-        // 0002 has not delivered yet, so it is still the one being measured
-        assertEquals("https://dl-z01a-0002.pikpak.me/download/?fid=F&sign=S", health.route(onOtherRoot, mayExplore = true))
-    }
 
     @Test
-    fun `exploring stops once enough of the family has figures`() {
-        val health = HostHealth(seeds = listOf("dl-z01a-0002", "dl-z01a-0003", "dl-z01a-0004"))
-        health.measure("dl-z01a-0001.mypikpak.com", 3_000_000)
-        health.measure("dl-z01a-0002.mypikpak.com", 3_000_000)
-        health.measure("dl-z01a-0003.mypikpak.com", 3_000_000)
-
-        assertEquals(link, health.route(link, mayExplore = true))
-    }
-
-    @Test
-    fun `steady viable throughput does not explore unknown siblings`() {
-        val time = TestTimeSource()
-        val health = HostHealth(timeSource = time, seeds = listOf("dl-z01a-0002"))
-        health.measure("dl-z01a-0001.mypikpak.com", 350 * 1024)
-        health.answered(link, 1350.milliseconds)
-        assertEquals(link, health.route(link, true, demandBytesPerSecond = 175L * 1024))
-        assertEquals(link, health.route(link, true, demandBytesPerSecond = 175L * 1024))
-        time += 1.seconds
-        assertEquals(link, health.route(link, true, demandBytesPerSecond = 175L * 1024))
-    }
-
-    @Test
-    fun `small requests prefer latency while large requests prefer body rate`() {
+    fun `healthy issued routes are not replaced based on request length`() {
         val time = TestTimeSource()
         val health = HostHealth(timeSource = time, seeds = listOf("dl-z01a-0002"))
         val sibling = link.replace("0001", "0002")
@@ -223,7 +167,7 @@ class HostHealthTest {
         }
         assertEquals(link, health.route(link, false, 64 * 1024))
         time += HostHealth.ROUTE_LEASE
-        assertEquals(sibling, health.route(link, false, 64 * 1024 * 1024))
+        assertEquals(link, health.route(link, false, 64 * 1024 * 1024))
     }
 
     @Test
@@ -255,26 +199,6 @@ class HostHealthTest {
     }
 
     @Test
-    fun `unmeasured sibling links reuse sticky preferred host until its samples age out`() {
-        val time = TestTimeSource()
-        val health = HostHealth(timeSource = time)
-        health.observe(
-            FileDetail(
-                webContentLink = "https://dl-z01a-0002.mypikpak.com/download/?fid=F",
-                medias = listOf(MediaVariant(link = DownloadLink(url = "https://dl-z01a-0003.mypikpak.com/download/?fid=F"))),
-            ),
-        )
-        health.measure("dl-z01a-0002.mypikpak.com", 1_200_000)
-
-        assertEquals(
-            "https://dl-z01a-0002.mypikpak.com/download/?fid=F&sign=S",
-            health.route(link, mayExplore = false),
-        )
-        time += HostHealth.DEFAULT_MEMORY
-        assertEquals(link, health.route(link, mayExplore = false))
-    }
-
-    @Test
     fun `cold host gets handshake headroom while warm pooled host keeps tight deadline`() {
         val time = TestTimeSource()
         val health = HostHealth(timeSource = time)
@@ -294,45 +218,6 @@ class HostHealthTest {
         )
         assertEquals(HostHealth.URGENT_BODY_SILENCE, health.bodySilenceDeadline(PikPakStreamReader.BLOCKING_PRIORITY))
         assertEquals(HostHealth.BODY_SILENCE, health.bodySilenceDeadline(PikPakStreamReader.READ_AHEAD_PRIORITY))
-    }
-
-    @Test
-    fun `route epoch resets speed preferences silences and refusals but keeps learned hosts`() {
-        val time = TestTimeSource()
-        val health = HostHealth(timeSource = time)
-        val sibling = link.replace("0001", "0002")
-        val silent = link.replace("0001", "0003")
-        health.observe(FileDetail(webContentLink = sibling))
-        repeat(8) { health.warmAnswer(link, 100.milliseconds) }
-        health.measure("dl-z01a-0001.mypikpak.com", 200_000)
-        health.measure("dl-z01a-0002.mypikpak.com", 2_000_000)
-        assertEquals(sibling, health.route(link, false))
-        health.refused(sibling)
-        health.markSilent(silent, 2.seconds)
-        assertTrue(health.isBad(silent))
-
-        repeat(3) { health.warmAnswer(link, 1.seconds) }
-
-        assertFalse(health.isBad(silent))
-        assertFalse(health.hasHealthySibling(link))
-        assertEquals(link, health.route(link, false))
-        assertEquals(sibling, health.route(link, true))
-        // The old timeout and fast samples no longer contribute to the response deadline.
-        repeat(5) { health.answered(link, 1.seconds) }
-        assertEquals(2.seconds, health.firstResponseDeadline())
-    }
-
-    @Test
-    fun `route epoch also detects a faster route and discards old host latency`() {
-        val health = HostHealth(timeSource = TestTimeSource(), seeds = listOf("dl-z01a-0002"))
-        val sibling = link.replace("0001", "0002")
-        repeat(8) { health.warmAnswer(sibling, 2.seconds) }
-        health.measure("dl-z01a-0001.mypikpak.com", 200_000)
-        repeat(3) { health.warmAnswer(link, 100.milliseconds) }
-        // Relearn only rates. The sibling's old two-second setup cost must be gone.
-        health.measure("dl-z01a-0001.mypikpak.com", 200_000)
-        health.measure("dl-z01a-0002.mypikpak.com", 2_000_000)
-        assertEquals(sibling, health.route(link, false))
     }
 
     @Test
@@ -386,49 +271,6 @@ class HostHealthTest {
     }
 
     @Test
-    fun `high latency foreground suppresses cold exploration at the viable rate boundary`() {
-        for (priority in listOf(PikPakStreamReader.READ_AHEAD_PRIORITY, PikPakStreamReader.BLOCKING_PRIORITY)) {
-            val health = HostHealth(timeSource = TestTimeSource(), seeds = listOf("dl-z01a-0002"))
-            repeat(3) { health.warmAnswer(link, 900.milliseconds) }
-            health.measure("dl-z01a-0001.mypikpak.com", 175L * 1024)
-            assertEquals(link, health.route(link, true, priority = priority, demandBytesPerSecond = 175L * 1024))
-            assertEquals(link, health.route(link, true, priority = 0, demandBytesPerSecond = 175L * 1024))
-        }
-    }
-
-    @Test
-    fun `foreground explores below viable rate regardless of latency`() {
-        for ((latency, rate, expired) in listOf(
-            Triple(899, 175L * 1024 - 1, false),
-            Triple(900, 175L * 1024 - 1, false),
-            Triple(900, 175L * 1024 - 1, true),
-        )) {
-            val time = TestTimeSource()
-            val health = HostHealth(timeSource = time, seeds = listOf("dl-z01a-0002"))
-            repeat(3) { health.warmAnswer(link, latency.milliseconds) }
-            health.measure("dl-z01a-0001.mypikpak.com", rate)
-            if (expired) time += HostHealth.LATENCY_MEMORY
-            assertEquals(
-                link.replace("0001", "0002"),
-                health.route(link, true, priority = PikPakStreamReader.READ_AHEAD_PRIORITY),
-            )
-        }
-    }
-
-    @Test
-    fun `viable foreground skips even warm exploration but accepts measured improvement`() {
-        val health = HostHealth(timeSource = TestTimeSource(), seeds = listOf("dl-z01a-0002"))
-        val sibling = link.replace("0001", "0002")
-        repeat(3) { health.warmAnswer(link, 1.seconds) }
-        health.measure("dl-z01a-0001.mypikpak.com", 175L * 1024)
-        health.onSocketReturned(sibling)
-        assertEquals(link, health.route(link, true, priority = PikPakStreamReader.READ_AHEAD_PRIORITY, demandBytesPerSecond = 175L * 1024))
-        health.onRequestStarted(sibling)
-        health.measure("dl-z01a-0002.mypikpak.com", 2_000_000)
-        assertEquals(sibling, health.route(link, true, priority = PikPakStreamReader.READ_AHEAD_PRIORITY))
-    }
-
-    @Test
     fun `cold and unknown connection waits never reset warm route evidence`() {
         for (reused in listOf(false, null)) {
             val health = HostHealth(seeds = listOf("dl-z01a-0002"))
@@ -441,40 +283,6 @@ class HostHealthTest {
             repeat(3) { health.warmAnswer(link, 1.seconds) }
             assertFalse(health.hasHealthySibling(link))
         }
-    }
-
-    @Test
-    fun `healthy viable preferred host stays leased for thirty seconds`() {
-        val time = TestTimeSource()
-        val health = HostHealth(timeSource = time, seeds = listOf("dl-z01a-0002", "dl-z01a-0003"))
-        val sibling = link.replace("0001", "0002")
-        health.measure("dl-z01a-0001.mypikpak.com", 100_000)
-        health.measure("dl-z01a-0002.mypikpak.com", 1_000_000)
-        assertEquals(sibling, health.route(link, false))
-        health.measure("dl-z01a-0003.mypikpak.com", 10_000_000)
-        time += 29.seconds
-        assertEquals(sibling, health.route(link, false))
-        time += 1.seconds
-        assertEquals(link.replace("0001", "0003"), health.route(link, false))
-    }
-
-    @Test
-    fun `refusal breaks the preferred lease immediately`() {
-        val health = HostHealth(seeds = listOf("dl-z01a-0002", "dl-z01a-0003"))
-        val sibling = link.replace("0001", "0002")
-        health.measure("dl-z01a-0002.mypikpak.com", 1_000_000)
-        assertEquals(sibling, health.route(link, false))
-        health.refused(sibling)
-        assertEquals(link, health.route(link, false))
-    }
-
-    @Test
-    fun `hungry foreground suppresses exploration without spending its slot`() {
-        var hungry = true
-        val health = HostHealth(seeds = listOf("dl-z01a-0002"), foregroundHungry = { hungry })
-        assertEquals(link, health.route(link, true))
-        hungry = false
-        assertEquals(link.replace("0001", "0002"), health.route(link, true))
     }
 
     // elapsedNow is a deterministic interleaving point inside evidence reads, without threads
@@ -497,56 +305,6 @@ class HostHealthTest {
     }
 
     @Test
-    fun `route keeps one evidence snapshot and cannot overwrite a newer epoch preference`() {
-        val time = InterleavingTimeSource()
-        val health = HostHealth(timeSource = time, seeds = listOf("dl-z01a-0002", "dl-z01a-0003"))
-        val second = link.replace("0001", "0002")
-        val third = link.replace("0001", "0003")
-        repeat(8) { health.warmAnswer(link, 100.milliseconds) }
-        health.measure("dl-z01a-0002.mypikpak.com", 2_000_000)
-
-        time.onElapsed = {
-            repeat(3) { health.warmAnswer(link, 1.seconds) }
-            health.measure("dl-z01a-0003.mypikpak.com", 2_000_000)
-            assertEquals(third, health.route(link, false))
-        }
-        // The in-flight decision is valid for its original snapshot, including preferred cost.
-        assertEquals(second, health.route(link, false))
-        // Make the old preferred host eligible again. Only the new epoch's sticky choice wins.
-        health.measure("dl-z01a-0002.mypikpak.com", 2_000_000)
-        assertEquals(third, health.route(link, false))
-    }
-
-    @Test
-    fun `preferred completion cost survives an epoch reset during route evidence reads`() {
-        val time = InterleavingTimeSource()
-        val health = HostHealth(timeSource = time, seeds = listOf("dl-z01a-0002"))
-        val sibling = link.replace("0001", "0002")
-        repeat(8) { health.warmAnswer(link, 100.milliseconds) }
-        health.measure("dl-z01a-0002.mypikpak.com", 2_000_000)
-        assertEquals(sibling, health.route(link, false))
-        time.onElapsed = { repeat(3) { health.warmAnswer(link, 1.seconds) } }
-        assertEquals(sibling, health.route(link, false))
-        assertEquals(link, health.route(link, false))
-    }
-
-    @Test
-    fun `clean latency CAS retry preserves observations already published in the new epoch`() {
-        val time = InterleavingTimeSource()
-        val health = HostHealth(timeSource = time, seeds = listOf("dl-z01a-0002"))
-        repeat(8) { health.warmAnswer(link, 100.milliseconds) }
-        time.onElapsed = {
-            repeat(3) { health.warmAnswer(link, 1.seconds) }
-            health.measure("dl-z01a-0002.mypikpak.com", 2_000_000)
-        }
-        health.warmAnswer(link, 1.seconds)
-        assertTrue(health.hasHealthySibling(link))
-        assertEquals(link.replace("0001", "0002"), health.route(link, false))
-        repeat(4) { health.answered(link, 1.seconds) }
-        assertEquals(2.seconds, health.firstResponseDeadline())
-    }
-
-    @Test
     fun `epoch boundary uses the median of three rather than requiring three changed waits`() {
         val health = HostHealth(timeSource = TestTimeSource(), seeds = listOf("dl-z01a-0002"))
         repeat(8) { health.warmAnswer(link, 100.milliseconds) }
@@ -564,6 +322,7 @@ class HostHealthTest {
         val goodSibling = "https://dl-z01a-0002.mypikpak.com/download/?fid=F&sign=S"
         health.observe(FileDetail(webContentLink = goodSibling))
         health.answered(goodSibling, 250.milliseconds)
+        health.delivered(HostHealth.hostOf(goodSibling), HostHealth.MIN_SAMPLE_BYTES, 1_000_000, goodSibling)
 
         // 0001 answered promptly, sent only 100 KiB (< MIN_SAMPLE_BYTES), then stalled for 3 s
         health.answered(link, 200.milliseconds)
@@ -578,28 +337,43 @@ class HostHealthTest {
         assertTrue(health.isBad(link))
         assertEquals(goodSibling, health.route(link, mayExplore = false))
 
-        // Only a completed transfer at a viable rate clears the mid-body stall penalty
+        // A short successful burst does not erase the preceding body stall
         health.delivered(HostHealth.hostOf(link), HostHealth.MIN_SAMPLE_BYTES, HostHealth.GOOD_RATE_BYTES_PER_SEC, link)
-        assertFalse(health.isBad(link))
+        assertTrue(health.isBad(link))
     }
 
     @Test
-    fun `cluster wide stall advances through usable siblings before returning to primary`() {
+    fun `fast burst followed by mid-body silence still penalizes stalled host and does not hijack faster link`() {
         val time = TestTimeSource()
-        val health = HostHealth(timeSource = time, seeds = listOf("dl-z01a-0002", "dl-z01a-0003"))
-        val second = link.replace("0001", "0002")
-        val third = link.replace("0001", "0003")
-
-        // First stalled host fails over to the first usable sibling
-        health.stalled(link, deliveredBytes = 64 * 1024L, bodyBytesPerSecond = 20 * 1024L, silenceDuration = 3.seconds)
-        assertEquals(second, health.route(link, mayExplore = false))
-
-        // If the first sibling also stalls, advance to the next usable sibling rather than returning to stalled 0001
-        health.stalled(second, deliveredBytes = 0L, bodyBytesPerSecond = 0L, silenceDuration = 3.seconds)
-        assertEquals(third, health.route(link, mayExplore = false))
-
-        // Once all siblings are stalled, fall back to the primary link
-        health.stalled(third, deliveredBytes = 0L, bodyBytesPerSecond = 0L, silenceDuration = 3.seconds)
-        assertEquals(link, health.route(link, mayExplore = false))
+        val health = HostHealth(timeSource = time)
+        val fastPrimary = "https://dl-z01a-0063.mypikpak.com/download/?fid=F&sign=S"
+        val flakySibling = "https://dl-z01a-0027.mypikpak.com/download/?fid=F&sign=S"
+        health.observe(
+            FileDetail(
+                webContentLink = fastPrimary,
+                medias = listOf(MediaVariant(link = DownloadLink(url = flakySibling))),
+            ),
+        )
+        // Primary link 0063 has a strong measured throughput (6 MiB/s)
+        health.measure("dl-z01a-0063.mypikpak.com", 6_000_000)
+        // Flaky sibling 0027 had one decent 1.5 MiB/s sample, then delivered 1.1 MiB at 2.5 MiB/s burst before hanging 6.5 s
+        health.measure("dl-z01a-0027.mypikpak.com", 1_500_000)
+        health.stalled(
+            flakySibling,
+            deliveredBytes = 1_100 * 1024L,
+            bodyBytesPerSecond = 2_500_000L,
+            silenceDuration = 6500.milliseconds,
+        )
+        // Even on the first mid-body hang (suspects), primary link 0063 must remain on 0063 and never be hijacked onto 0027
+        assertEquals(fastPrimary, health.route(fastPrimary, mayExplore = false))
+        // A second mid-body hang escalates 0027 from suspect to stalled (isBad)
+        health.stalled(
+            flakySibling,
+            deliveredBytes = 1_100 * 1024L,
+            bodyBytesPerSecond = 2_500_000L,
+            silenceDuration = 6500.milliseconds,
+        )
+        assertTrue(health.isBad(flakySibling))
+        assertEquals(fastPrimary, health.route(fastPrimary, mayExplore = false))
     }
 }

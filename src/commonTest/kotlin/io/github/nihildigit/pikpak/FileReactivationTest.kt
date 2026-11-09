@@ -43,7 +43,7 @@ import kotlin.time.Duration.Companion.milliseconds
 class FileReactivationTest {
     @Test
     fun `cold header precedes status and content range validation`() = runTest {
-        for (status in listOf(HttpStatusCode.OK, HttpStatusCode.PartialContent)) {
+        for (status in listOf(HttpStatusCode.OK, HttpStatusCode.PartialContent, HttpStatusCode.Forbidden, HttpStatusCode.ServiceUnavailable)) {
             fixture { cold(status) }.use { fixture ->
                 var entered = false
                 val error = assertFailsWith<FileReactivatingException> {
@@ -53,6 +53,38 @@ class FileReactivationTest {
                 assertFalse(entered, "cold response must not expose its placeholder body")
                 assertEquals(1, fixture.requests.size, "cold state must not spend HTTP retries")
             }
+        }
+    }
+
+    @Test
+    fun `storage class archive and named thaw error codes also trigger cold reactivation`() = runTest {
+        val headersList = listOf(
+            Headers.build { append("X-Xos-Storage-Class", "archive") },
+            Headers.build { append("X-Xos-Err-Desc", "netdiscfilearchived") },
+            Headers.build { append("X-Xos-Err-Desc", "netdiscfilethawtime") },
+        )
+        for (headers in headersList) {
+            fixture {
+                respond(ByteReadChannel("archived"), HttpStatusCode.Forbidden, headers)
+            }.use { fixture ->
+                val error = assertFailsWith<FileReactivatingException> {
+                    fixture.client.streamRangeFromUrl(URL, 0, 1) { error("body exposed") }
+                }
+                assertEquals(403, error.httpStatus)
+                assertEquals(1, fixture.requests.size)
+            }
+        }
+    }
+
+    @Test
+    fun `default poll interval uses stepped 10 to 60 second backoff`() = runTest {
+        fixture { ready() }.use { fixture ->
+            val coordinator = FileReactivationCoordinator(fixture.client)
+            assertEquals(10_000L, coordinator.pollDelayForAttempt(0).inWholeMilliseconds)
+            assertEquals(20_000L, coordinator.pollDelayForAttempt(1).inWholeMilliseconds)
+            assertEquals(30_000L, coordinator.pollDelayForAttempt(2).inWholeMilliseconds)
+            assertEquals(60_000L, coordinator.pollDelayForAttempt(5).inWholeMilliseconds)
+            assertEquals(60_000L, coordinator.pollDelayForAttempt(9).inWholeMilliseconds)
         }
     }
 

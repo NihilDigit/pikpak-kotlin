@@ -88,48 +88,7 @@ class AdaptiveBlockCacheTest {
         assertEquals(0, source.connectionLimit.subscriptionCount.value)
     }
 
-    @Test
-    fun `account allowance retreats to eight each then six five five`() = runTest {
-        val scheduler = TransferScheduler(16, 16, BandwidthLimiter(), testScheduler.timeSource,
-            concurrencyMode = ConcurrencyMode.Fixed(16))
-        val sources = List(3) { AdaptiveSource() }
-        val caches = sources.map { cache(it, scheduler) }
-        try {
-            caches[0].warm(listOf(0L..65535L), StreamRole.BACKGROUND, null)
-            runCurrent()
-            assertEquals(listOf(16, 0, 0), sources.map { it.allowance })
-            assertEquals(8, sources[0].active)
-            sources[0].finishSecondSignature()
-            runCurrent()
-            assertEquals(16, sources[0].active)
 
-            caches[1].warm(listOf(0L..65535L), StreamRole.BACKGROUND, null)
-            runCurrent()
-            assertEquals(listOf(8, 8, 0), sources.map { it.allowance })
-            assertEquals(16, sources[0].active, "shrink drains existing reads rather than cancelling them")
-            sources[0].finishCurrentReads()
-            runCurrent()
-            assertEquals(listOf(8, 8, 0), sources.map { it.active })
-
-            caches[2].warm(listOf(0L..65535L), StreamRole.BACKGROUND, null)
-            runCurrent()
-            assertEquals(listOf(6, 5, 5), sources.map { it.allowance })
-            sources.forEach { it.finishCurrentReads() }
-            runCurrent()
-            assertEquals(listOf(6, 5, 5), sources.map { it.active })
-            assertTrue(sources.all { it.cancelled == 0 })
-
-            caches[2].close()
-            caches[2].awaitClosedForTest()
-            runCurrent()
-            assertEquals(listOf(8, 8, 0), sources.map { it.allowance })
-            assertEquals(listOf(8, 8, 0), sources.map { it.active })
-        } finally {
-            caches.forEach { it.close() }
-            caches.forEach { it.awaitClosedForTest() }
-        }
-        assertTrue(sources.all { it.active == 0 && it.connectionLimit.subscriptionCount.value == 0 })
-    }
 
     @Test
     fun `unused cursor and withdrawn warm have no expansion allowance`() = runTest {
@@ -195,7 +154,7 @@ class AdaptiveBlockCacheTest {
     }
 
     @Test
-    fun `new adaptive cache starts four workers even when sixteen signed slots are available`() = runTest {
+    fun `adaptive capacity follows available demand without a throughput experiment`() = runTest {
         val scheduler = TransferScheduler(16, 16, BandwidthLimiter(), testScheduler.timeSource)
         val source = AdaptiveSource()
         val cache = cache(source, scheduler)
@@ -203,10 +162,10 @@ class AdaptiveBlockCacheTest {
             cache.warm(listOf(0L..65535L), StreamRole.BACKGROUND, null)
             runCurrent()
             assertEquals(16, source.allowance)
-            assertEquals(4, source.active)
+            assertEquals(8, source.active)
             source.finishSecondSignature()
             runCurrent()
-            assertEquals(4, source.active, "extra signatures do not constitute throughput evidence")
+            assertEquals(16, source.active, "producer capacity follows available capacity")
         } finally { cache.close(); cache.awaitClosedForTest() }
     }
 

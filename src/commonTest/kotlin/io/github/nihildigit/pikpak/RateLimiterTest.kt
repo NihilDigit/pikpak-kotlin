@@ -22,6 +22,39 @@ import kotlin.time.TimeSource
 class RateLimiterTest {
 
     @Test
+    fun queuedHttpRequestFollowsDemandPromotion() = kotlinx.coroutines.test.runTest {
+        val limiter = RateLimiter(capacity = 1, refillPerSecond = 1.0, timeSource = testScheduler.timeSource)
+        val paths = mutableListOf<String>()
+        val http = HttpClient(MockEngine { request -> paths += request.url.encodedPath; respond("{}") })
+        val client = PikPakClient("mock", "pw", sessionStore = InMemorySessionStore(), rateLimiter = limiter, httpClient = http)
+        val owner = TransferDemand(PikPakStreamReader.WARM_PRIORITY)
+        try {
+            limiter.acquire()
+            val prepared = async(owner, start = CoroutineStart.UNDISPATCHED) {
+                withApiPriority(ApiRequestPriority.BACKGROUND) { client.http.requestRaw(HttpMethod.Get, "https://api.test/prepared") }
+            }
+            val normal = async(start = CoroutineStart.UNDISPATCHED) { client.http.requestRaw(HttpMethod.Get, "https://api.test/normal") }
+            owner.updatePriority(PikPakStreamReader.BLOCKING_PRIORITY)
+            prepared.await(); normal.await()
+            assertEquals(listOf("/prepared", "/normal"), paths)
+        } finally { owner.close(); client.close(); http.close() }
+    }
+
+    @Test
+    fun closedDemandRefundsQueuedApiReservation() = kotlinx.coroutines.test.runTest {
+        val limiter = RateLimiter(capacity = 1, refillPerSecond = 1.0, timeSource = testScheduler.timeSource)
+        limiter.acquire()
+        val owner = TransferDemand(PikPakStreamReader.WARM_PRIORITY)
+        val cancelled = async(start = CoroutineStart.UNDISPATCHED) { limiter.acquire(0, owner) }
+        testScheduler.runCurrent()
+        owner.close()
+        cancelled.join()
+        assertTrue(cancelled.isCancelled)
+        limiter.acquire()
+        assertEquals(1000L, testScheduler.currentTime)
+    }
+
+    @Test
     fun `queued requests use descending priority and FIFO ties`() = runBlocking<Unit> {
         val limiter = RateLimiter(capacity = 1, refillPerSecond = 10.0)
         limiter.acquire()

@@ -93,6 +93,13 @@ class PikPakStreamReader internal constructor(
 
     private val cursor = cache.openCursor(initialRole)
 
+    /** Optional account-bound owner shared with preparation; updates promote already queued reads. */
+    var demand: TransferDemand?
+        get() = cursor.demand
+        set(value) = cache.setDemand(cursor, value)
+
+    fun reportPlaybackBuffer(feedback: PlaybackBufferSnapshot) = cache.reportPlaybackBuffer(cursor, feedback)
+
     /** Length of the remote file. */
     val size: Long get() = cache.size
 
@@ -132,8 +139,7 @@ class PikPakStreamReader internal constructor(
      * What the user is watching now, or a file warmed for later. See the class
      * documentation for what a background reader gives up.
      *
-     * Changing it keeps the cache and takes effect from the next request:
-     * requests already queued keep the priority they were issued at.
+     * Changing it keeps the cache and updates the live demand, including queued reads.
      */
     var role: StreamRole
         get() = cursor.role
@@ -153,8 +159,7 @@ class PikPakStreamReader internal constructor(
      * seek, as the newest demand, lost every tie to them. The caller knows, so
      * the caller says; clear it once the wait is over.
      *
-     * Only for a [StreamRole.FOREGROUND] reader. Requests already queued keep
-     * the priority they were issued at.
+     * Only for a [StreamRole.FOREGROUND] reader. Urgent demand suppresses speculative suffixes.
      */
     var urgent: Boolean
         get() = cursor.urgent

@@ -77,6 +77,15 @@ class PikPakFileCache internal constructor(
     fun openStream(role: StreamRole = StreamRole.FOREGROUND): PikPakStreamReader =
         PikPakStreamReader(cache, ownsCache = false, initialRole = role)
 
+    fun openStream(demand: TransferDemand, role: StreamRole = StreamRole.FOREGROUND): PikPakStreamReader =
+        openStream(role).also { it.demand = demand }
+
+    /** Preparation bytes share the owner's live priority, without masquerading as speculative warming. */
+    fun prefetch(
+        ranges: List<LongRange>, demand: TransferDemand,
+        role: StreamRole = StreamRole.FOREGROUND, priority: Int? = null,
+    ): Deferred<Unit> = cache.warm(ranges, role, priority, demand = demand)
+
     /**
      * Fetches [ranges] into memory without opening a stream, for bytes a stream will ask for
      * next and cannot predict: the head of the file the user will play next, a container index
@@ -111,10 +120,8 @@ class PikPakFileCache internal constructor(
      * fetched (after the retries every read carries) or cannot be written, and retrying is the
      * caller's: call again. Cancelling it withdraws what it had not fetched yet.
      *
-     * By default a background download: priority [PikPakStreamReader.BACKGROUND_READ_AHEAD_PRIORITY],
-     * throttled to at most [PikPakStreamReader.BACKGROUND_WORKERS_WHILE_FOREGROUND] single-block
-     * requests while any foreground stream on the account is hungry, and sharing up to half the
-     * account budget with adaptive multi-slot spans once foreground buffers are comfortable.
+     * Background transfers yield immediately to hungry foreground demand. Their accepted prefixes
+     * remain cached, and available capacity is returned without a throughput probe or cooldown.
      *
      * @throws IllegalStateException through the job when the cache has no [DurableBlockStore].
      */

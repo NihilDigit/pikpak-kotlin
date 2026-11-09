@@ -89,6 +89,8 @@ internal class ReadTelemetry(
     var attempts: Int = 0
     /** Transport and truncation retries, plus all retries performed inside HttpEngine. */
     var retries: Int = 0
+    /** Scheduling withdrawals, separate from network failures and retry backoff. */
+    var preemptions: Int = 0
     /** Outer 503 responses plus server-error and rate-limit retries inside HttpEngine. */
     var throttled: Int = 0
     var refreshed: Boolean = false

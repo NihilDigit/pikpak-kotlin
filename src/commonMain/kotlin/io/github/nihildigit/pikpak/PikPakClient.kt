@@ -96,8 +96,8 @@ class PikPakClient(
      */
     transportMemoryBudgetBytes: Long = DEFAULT_TRANSPORT_MEMORY_BUDGET_BYTES,
     /**
-     * Enables automatic range fan-out and dual signed URL lanes by default.
-     * Adaptive caches start at up to four workers and expand only on measured gain.
+     * Enables concurrent range reads within the account, file and signed-link limits.
+     * Capacity follows live demand; playback does not run throughput experiments.
      *
      * When false, each open file or download uses one range connection. Importance,
      * bandwidth shaping and edge-host health steering remain unchanged.
@@ -182,8 +182,7 @@ class PikPakClient(
      * reading different URLs, which is the whole reason this is not just N
      * independent per-file gates.
      */
-    internal val accountGate = PriorityGate(accountConnectionBudget)
-    internal val signedUrlGates = io.github.nihildigit.pikpak.internal.SignedUrlGates()
+    internal val signedUrlGates = io.github.nihildigit.pikpak.internal.SignedUrlGates(accountConnectionBudget)
 
     internal val scheduler = TransferScheduler(
         accountConnectionBudget,
@@ -221,7 +220,7 @@ class PikPakClient(
      * Multi-connection acceleration toggle for streams and downloads on this client.
      *
      * May be toggled at runtime; disabling it clamps each open file to a single sequential range
-     * connection and suppresses dual signed-lane minting. Route health remains independent.
+     * connection. Route health remains independent.
      */
     var concurrentAcceleration: Boolean
         get() = scheduler.concurrentAcceleration
@@ -234,8 +233,29 @@ class PikPakClient(
         get() = scheduler.concurrencyMode
         set(value) { scheduler.concurrencyMode = value }
 
-    /** Marks user interaction so background transfers can leave room for interactive work. */
+    /** Compatibility hint. Use [openTransferDemand] to give interactive work an explicit lifetime. */
     fun notifyInteractiveActivity() = scheduler.onInteractiveActivity()
+
+    /** Legacy single-owner signal. New integrations should use independently closable [openTransferDemand] leases. */
+    fun setUrgentForeground(urgent: Boolean) = scheduler.setExternalUrgentForeground(urgent)
+
+    /**
+     * Account-bound consumer lease for preparation and playback. Pass it to cache streams/prefetches
+     * or as a coroutine context for direct reads. Lower its priority when steady; close it with the session.
+     */
+    fun openTransferDemand(priority: Int = PikPakStreamReader.BLOCKING_PRIORITY): TransferDemand {
+        val registration = scheduler.register {}
+        val demand = TransferDemand(priority)
+        demand.onChanged = { value ->
+            if (value == null) scheduler.unregister(registration)
+            else scheduler.reportDemand(registration, io.github.nihildigit.pikpak.internal.CacheDemand(
+                foreground = value >= PikPakStreamReader.STREAMING_PRIORITY,
+                urgent = value >= PikPakStreamReader.BLOCKING_PRIORITY,
+            ))
+        }
+        demand.updatePriority(priority)
+        return demand
+    }
 
     /**
      * Foreground readers open on this account. Priority alone orders the
@@ -308,6 +328,12 @@ class PikPakClient(
     private var folderWarmJob: Job? = null
     private val prefetchedDetail = MutableStateFlow<PrefetchedDetail?>(null)
 
+    internal fun cacheDownloadDetail(fileId: String, detail: Deferred<FileDetail>): () -> Unit {
+        val entry = PrefetchedDetail(fileId, timeSource.markNow(), detail)
+        prefetchedDetail.value = entry
+        return { prefetchedDetail.compareAndSet(entry, null) }
+    }
+
     internal fun invalidatePrefetchedDetail() {
         prefetchedDetail.update { old ->
             old?.deferred?.cancel()
@@ -348,15 +374,14 @@ class PikPakClient(
                 folderWarmJob = background.launch {
                     delay(debounce)
                     val detailDef = background.async {
-                        withApiPriority(ApiRequestPriority.BACKGROUND) { fetchFileDetailLive(candidate.id) }
+                        withApiPriority(ApiRequestPriority.BACKGROUND) { fetchFileDetailLive(candidate.id, usage = FILE_USAGE_FETCH) }
                     }
-                    val entry = PrefetchedDetail(candidate.id, timeSource.markNow(), detailDef)
-                    prefetchedDetail.value = entry
+                    val discard = cacheDownloadDetail(candidate.id, detailDef)
                     try {
                         val detail = detailDef.await()
                         detail.downloadUrl?.let { warmHostIfCold(it)?.await() }
                     } catch (t: Throwable) {
-                        prefetchedDetail.compareAndSet(entry, null)
+                        discard()
                         detailDef.cancel()
                     }
                 }

@@ -121,7 +121,7 @@ fun FileDetail.variant(mediaId: String?): ResolvedVariant? {
 suspend fun PikPakClient.resolveVariant(
     fileId: String,
     preference: VariantPreference,
-): ResolvedVariant = getFile(fileId).resolveVariant(preference)
+): ResolvedVariant = getFile(fileId, usage = if (preference == VariantPreference.Original) FILE_USAGE_FETCH else null).resolveVariant(preference)
 
 /**
  * Total size of the resource behind a signed URL.
@@ -166,7 +166,7 @@ fun PikPakClient.rangeReader(
 ): RangeReader = RangeReader(
     client = this,
     urlProvider = {
-        val resolved = getFile(fileId).variant(mediaId)
+        val resolved = getFile(fileId, usage = if (mediaId == null) FILE_USAGE_FETCH else null).variant(mediaId)
             ?: throw PikPakException(
                 -1,
                 "rangeReader: variant $mediaId is no longer present on file $fileId",

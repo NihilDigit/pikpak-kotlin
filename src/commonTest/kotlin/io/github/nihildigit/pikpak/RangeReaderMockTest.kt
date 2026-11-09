@@ -125,10 +125,12 @@ class RangeReaderMockTest {
             else respond(ByteReadChannel(ByteArray(0)), HttpStatusCode.NotFound)
         }
         client.hostHealth.observe(FileDetail(webContentLink = "https://dl-z01a-0001.mypikpak.com/f/file"))
+        client.hostHealth.delivered("dl-z01a-0001.mypikpak.com", 262144, 1_000_000)
+        client.hostHealth.refused("https://dl-z01a-9999.mypikpak.com/f/file?sign=s")
         val asked = mutableListOf<UrlRequest>()
         val reader = RangeReader(client, { request -> asked += request; "https://dl-z01a-9999.mypikpak.com/f/file?sign=s" })
 
-        // Priority 0 is a background read, which may try an unmeasured sibling
+        // A failed issued host may use a proven sibling; its rejection must not refresh the signature
         val bytes = reader.readBytes(0, 256, priority = 0)
         assertContentEquals(content.copyOfRange(0, 256), bytes)
         assertEquals(2, hosts.size, "one sibling tried, then the link's host: $hosts")

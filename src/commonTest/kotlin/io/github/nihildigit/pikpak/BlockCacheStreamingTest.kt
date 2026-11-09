@@ -103,13 +103,13 @@ class BlockCacheStreamingTest {
         val source = object : RangeSource {
             override suspend fun <T> read(start: Long, length: Long, priority: Int,
                                          block: suspend (ByteReadChannel) -> T): T = coroutineScope {
-                if (start != 64L || length != 128L) return@coroutineScope block(ByteReadChannel(ByteArray(length.toInt())))
+                if (start != 64L || length < 128L) return@coroutineScope block(ByteReadChannel(ByteArray(length.toInt())))
                 val channel = ByteChannel(autoFlush = true)
                 val writer = launch {
                     channel.writeFully(ByteArray(64))
                     firstDelivered.complete(Unit)
                     releaseSuffix.await()
-                    channel.writeFully(ByteArray(64))
+                    channel.writeFully(ByteArray((length - 64).toInt()))
                     channel.close()
                 }
                 try { block(channel) } finally { writer.cancel() }
@@ -357,7 +357,7 @@ class BlockCacheStreamingTest {
             assertEquals(1, withTimeout(1000) { cache.read(cursor, ByteArray(1), 0, 1) })
             withTimeout(1000) { while (cache.inFlightSlotsForTest() == 0) delay(5) }
             // 63 ready bytes are below the 4-second entry cushion; reserved slots do not count.
-            assertEquals(2, scheduler.workersFor(background, true))
+            assertEquals(8, scheduler.workersFor(background, true))
             release.complete(Unit)
             withTimeout(3000) { while (scheduler.workersFor(background, true) != 8) delay(5) }
         } finally {
@@ -618,7 +618,7 @@ class BlockCacheStreamingTest {
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     @Test
-    fun `idle workers split a slow durable tail without copying its current block`() = runTest {
+    fun `idle workers preserve issued ranges while other downloads finish`() = runTest {
         val blockSize = 64L
         val size = 65 * blockSize
         val firstTransportFinished = CompletableDeferred<Unit>()
@@ -691,15 +691,16 @@ class BlockCacheStreamingTest {
             assertTrue(original.last - original.first + 1 > blockSize, "expected trained range but got $original requests=$requests")
             advanceTimeBy(50)
             runCurrent()
-            assertFalse(slowFinished, "rescue must happen before the original current block completes")
-            assertTrue(requests.any { (start, _) -> start > original.first && start in original },
-                "idle workers must reclaim a tail already requested by the slow connection")
-            assertTrue(writes.keys.any { it > original.first && it in original })
+            assertFalse(slowFinished, "the slow request is still receiving its first block")
+            assertFalse(requests.any { (start, _) -> start > original.first && start in original },
+                "unread transport buffers still belong to the issued request")
+            assertTrue(writes.keys.any { it > original.last }, "independent ranges can finish")
             assertEquals(1, requests.count { it.first == original.first }, "the partially read block stays owned")
             download.await()
             assertEquals((0L until size step blockSize).toSet(), writes.keys)
             assertTrue(writes.values.all { it == 1 }, "each block commits exactly once")
-            assertTrue(peak <= 8, "splitting must use existing worker capacity")
+            assertTrue(peak <= 8, "requests stay within worker capacity")
+            assertEquals(size, requests.sumOf { it.second }, "wire ranges must not overlap")
             assertEquals(size, cache.deliveredBytes)
         } finally {
             cache.close()
@@ -738,147 +739,6 @@ class BlockCacheStreamingTest {
     }
 
     @Test
-    fun `expired head deadline awaits old transport cleanup before replacement`() = runBlocking<Unit> {
-        val started = CompletableDeferred<Unit>()
-        val cleaning = CompletableDeferred<Unit>()
-        val releaseCleanup = CompletableDeferred<Unit>()
-        val replacement = CompletableDeferred<Unit>()
-        var calls = 0
-        val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T {
-                calls++
-                if (calls == 1) {
-                    started.complete(Unit)
-                    try { awaitCancellation() }
-                    finally {
-                        withContext(NonCancellable) {
-                            cleaning.complete(Unit)
-                            releaseCleanup.await()
-                        }
-                    }
-                }
-                replacement.complete(Unit)
-                return block(ByteReadChannel(ByteArray(length.toInt()) { 7 }))
-            }
-        }
-        val cache = cache(source)
-        try {
-            val warm = cache.warm(listOf(0L..63L), StreamRole.BACKGROUND, null)
-            withTimeout(1000) { started.await() }
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
-            cache.reportPlaybackBuffer(cursor, kotlin.time.Duration.ZERO)
-            val output = ByteArray(1)
-            val read = async { cache.read(cursor, output, 0, 1) }
-            withTimeout(1000) { cleaning.await() }
-            assertFalse(replacement.isCompleted)
-            releaseCleanup.complete(Unit)
-            assertEquals(1, withTimeout(1000) { read.await() })
-            assertEquals(7.toByte(), output[0])
-            withTimeout(1000) { warm.await() }
-        } finally { releaseCleanup.complete(Unit); cache.close() }
-    }
-
-    @Test
-    fun `feedback before fetch rescues once and buffer updates shorten a blocked deadline`() = runBlocking<Unit> {
-        for (shorten in listOf(false, true)) {
-            val started = CompletableDeferred<Unit>()
-            val replacement = CompletableDeferred<Unit>()
-            val finish = CompletableDeferred<Unit>()
-            var calls = 0
-            var cancellations = 0
-            val source = object : RangeSource {
-                override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                             block: suspend (ByteReadChannel) -> T): T {
-                    calls++
-                    try {
-                        if (calls == 1) {
-                            started.complete(Unit)
-                            awaitCancellation()
-                        }
-                        replacement.complete(Unit)
-                        finish.await()
-                        return block(ByteReadChannel(ByteArray(length.toInt()) { 7 }))
-                    } catch (e: CancellationException) {
-                        cancellations++
-                        throw e
-                    }
-                }
-            }
-            val clock = kotlin.time.TestTimeSource()
-            val cache = cache(source, timeSource = clock)
-            try {
-                val cursor = cache.openCursor(StreamRole.FOREGROUND)
-                cache.setReadAhead(cursor, 0)
-                cache.reportPlaybackBuffer(cursor, 10_000.milliseconds)
-                val output = ByteArray(1)
-                val read = async { cache.read(cursor, output, 0, 1) }
-                withTimeout(1000) { started.await() }
-                if (shorten) cache.reportPlaybackBuffer(cursor, kotlin.time.Duration.ZERO)
-                else {
-                    clock += 10_000.milliseconds
-                    cache.updateMediaBytesPerSecond(16) // Wake the deadline observer after advancing the clock.
-                }
-                withTimeout(1000) { replacement.await() }
-                // Repeated expired feedback must not cancel the fresh replacement.
-                repeat(3) {
-                    cache.reportPlaybackBuffer(cursor, kotlin.time.Duration.ZERO)
-                    delay(10)
-                }
-                assertEquals(2, calls)
-                assertEquals(1, cancellations)
-                finish.complete(Unit)
-                assertEquals(1, withTimeout(1000) { read.await() })
-                assertEquals(7.toByte(), output[0])
-            } finally { finish.complete(Unit); cache.close() }
-        }
-    }
-
-    @Test
-    fun `urgent feedback rescues a lower priority fetch after the read has started`() = runBlocking<Unit> {
-        val started = CompletableDeferred<Unit>()
-        val cleaning = CompletableDeferred<Unit>()
-        val releaseCleanup = CompletableDeferred<Unit>()
-        val replacement = CompletableDeferred<Unit>()
-        var calls = 0
-        val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T {
-                calls++
-                if (calls == 1) {
-                    started.complete(Unit)
-                    try { awaitCancellation() }
-                    finally {
-                        withContext(NonCancellable) {
-                            cleaning.complete(Unit)
-                            releaseCleanup.await()
-                        }
-                    }
-                }
-                assertEquals(PikPakStreamReader.BLOCKING_PRIORITY, priority)
-                replacement.complete(Unit)
-                return block(ByteReadChannel(ByteArray(length.toInt()) { 7 }))
-            }
-        }
-        val cache = cache(source)
-        try {
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
-            val output = ByteArray(1)
-            val read = async { cache.read(cursor, output, 0, 1) }
-            withTimeout(1000) { started.await() }
-            cache.setUrgent(cursor, true)
-            withTimeout(1000) { cleaning.await() }
-            assertFalse(replacement.isCompleted)
-            releaseCleanup.complete(Unit)
-            assertEquals(1, withTimeout(1000) { read.await() })
-            assertEquals(7.toByte(), output[0])
-            assertEquals(2, calls)
-        } finally { releaseCleanup.complete(Unit); cache.close() }
-    }
-
-    @Test
     fun `shared budget reclaims idle cache ownership for another file`() = runBlocking<Unit> {
         val budget = TransportMemoryBudget(64)
         fun newCache() = BlockCache(FakeRangeSource(ByteArray(256)), 256, 1,
@@ -903,7 +763,7 @@ class BlockCacheStreamingTest {
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     @Test
-    fun `cold high TTFB startup and seek widen the first wave after head protection`() = runTest {
+    fun `cold startup and seek do not speculate beyond their required head`() = runTest {
         val slotBytes = 256L * 1024
         val budget = TransportMemoryBudget(16L * 1024 * 1024)
         val requests = mutableListOf<Pair<Long, Long>>()
@@ -922,6 +782,7 @@ class BlockCacheStreamingTest {
         val cursor = cache.openCursor(StreamRole.FOREGROUND)
         try {
             for (head in listOf(0L, 128 * slotBytes)) {
+                cache.setUrgent(cursor, true)
                 cache.seek(cursor, head)
                 val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
                 runCurrent()
@@ -930,27 +791,19 @@ class BlockCacheStreamingTest {
                 assertEquals(head, wave.single().first)
                 assertEquals(1L, wave.single().second / slotBytes,
                     "blocking head uses a single slot so CDN burst edges finish head immediately")
-                advanceTimeBy(249)
+                advanceTimeBy(1000)
                 runCurrent()
-                assertEquals(1, requests.count { it.first >= head }, "zero-byte head retains startup protection for 250 ms")
-                advanceTimeBy(1)
-                runCurrent()
-                val spans = requests.filter { it.first >= head }
-                assertEquals(4, spans.size)
-                assertEquals(listOf(1L, 2L, 4L, 4L), spans.map { it.second / slotBytes })
-                assertTrue(spans.zipWithNext().all { (left, right) -> left.first + left.second == right.first },
-                    "head and read-ahead ramp contiguously along distance steps")
-                assertFalse(read.isCompleted, "no first byte or completion sample has arrived")
-                assertEquals(4 * slotBytes, budget.usedBytes, "range suffixes reserve no arrays")
-                assertTrue(budget.peakBytes <= 16L * 1024 * 1024)
+                assertEquals(1, requests.count { it.first >= head }, "startup has no speculative suffix before its first block")
+                assertFalse(read.isCompleted)
+                assertEquals(slotBytes, budget.usedBytes)
                 read.cancelAndJoin()
             }
-            assertEquals(4, cancelled, "seek cancels the entire orphaned first wave")
+            assertEquals(1, cancelled, "seek cancels the obsolete head")
         } finally {
             cache.close()
             cache.awaitClosedForTest()
         }
-        assertEquals(8, cancelled)
+        assertEquals(2, cancelled)
         assertEquals(0L, budget.usedBytes)
     }
 

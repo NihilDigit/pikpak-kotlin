@@ -48,7 +48,7 @@ class RangeThrottleTest {
                 val start = testScheduler.currentTime
                 val read = async { reader.readBytes(0, 1) }
                 runCurrent()
-                assertEquals(0, client.accountGate.inUse)
+                assertEquals(0, client.signedUrlGates.inUse)
                 advanceTimeBy(100)
                 runCurrent()
                 val sameFile = async { reader.readBytes(0, 1, priority = 100) }
@@ -65,7 +65,7 @@ class RangeThrottleTest {
                 assertEquals(start + 1000, starts.last().second)
                 assertEquals(1, issued)
                 assertEquals(1, reader.stats.value.throttled)
-                assertEquals(0, client.accountGate.inUse)
+                assertEquals(0, client.signedUrlGates.inUse)
             } finally { reader.close(); other.close(); client.close(); http.close() }
         }
     }
@@ -115,7 +115,7 @@ class RangeThrottleTest {
             advanceTimeBy(5000)
             runCurrent()
             assertEquals(1, calls)
-            assertEquals(0, client.accountGate.inUse)
+            assertEquals(0, client.signedUrlGates.inUse)
             val holders = List(8) { async { client.signedUrlGates.withSlot("https://cdn/file") {} } }
             holders.forEach { it.await() }
         } finally { reader.close(); client.close(); http.close() }
@@ -130,5 +130,90 @@ class RangeThrottleTest {
         assertEquals(0.seconds, parseRetryAfter("Fri, 06 Nov 2026 00:00:00 GMT", now))
         assertNull(parseRetryAfter("-1", now))
         assertNull(parseRetryAfter("invalid", now))
+    }
+
+    @Test
+    fun `xos connection restriction on 403 presses down concurrency without treating url as expired`() = runTest {
+        var calls = 0
+        var urlRequests = 0
+        val http = HttpClient(MockEngine(MockEngineConfig().apply {
+            dispatcher = StandardTestDispatcher(testScheduler)
+            addHandler {
+                calls++
+                if (calls == 1) {
+                    respond(
+                        "",
+                        HttpStatusCode.Forbidden,
+                        headersOf(
+                            "X-Xos-Err-Desc" to listOf("NetDisc_URLConnectionCountRestriction"),
+                            HttpHeaders.RetryAfter to listOf("1"),
+                        ),
+                    )
+                } else {
+                    respond(
+                        ByteReadChannel(byteArrayOf(42)),
+                        HttpStatusCode.PartialContent,
+                        headersOf(
+                            HttpHeaders.ContentRange to listOf("bytes 0-0/1"),
+                            HttpHeaders.ContentLength to listOf("1"),
+                        ),
+                    )
+                }
+            }
+        }))
+        val client = PikPakClient("mock", "pw", httpClient = http, cdnHttpClient = http,
+            sessionStore = InMemorySessionStore(), timeSource = testScheduler.timeSource)
+        val reader = RangeReader(client, { urlRequests++; "https://cdn/file?sig=1" }, connectionBudget = 2)
+        try {
+            val read = async { reader.readBytes(0, 1) }
+            runCurrent()
+            advanceTimeBy(1000)
+            runCurrent()
+            assertEquals(42, read.await().single().toInt())
+            assertEquals(1, urlRequests, "403 with NetDisc_URLConnectionCountRestriction must not refresh URL")
+            assertEquals(0, reader.stats.value.urlRefreshes)
+            assertEquals(1, reader.stats.value.throttled)
+        } finally {
+            reader.close(); client.close(); http.close()
+        }
+    }
+
+    @Test
+    fun `xos signature fault on 400 refreshes url immediately`() = runTest {
+        var calls = 0
+        val requests = mutableListOf<UrlRequest>()
+        val http = HttpClient(MockEngine(MockEngineConfig().apply {
+            dispatcher = StandardTestDispatcher(testScheduler)
+            addHandler {
+                calls++
+                if (calls == 1) {
+                    respond(
+                        "",
+                        HttpStatusCode.BadRequest,
+                        headersOf("X-Xos-Err-Desc" to listOf("NetDisc_URLSignatureFault")),
+                    )
+                } else {
+                    respond(
+                        ByteReadChannel(byteArrayOf(9)),
+                        HttpStatusCode.PartialContent,
+                        headersOf(
+                            HttpHeaders.ContentRange to listOf("bytes 0-0/1"),
+                            HttpHeaders.ContentLength to listOf("1"),
+                        ),
+                    )
+                }
+            }
+        }))
+        val client = PikPakClient("mock", "pw", httpClient = http, cdnHttpClient = http,
+            sessionStore = InMemorySessionStore(), timeSource = testScheduler.timeSource)
+        val reader = RangeReader(client, { req -> requests += req; "https://cdn/file?sig=${requests.size}" })
+        try {
+            assertEquals(9, reader.readBytes(0, 1).single().toInt())
+            assertEquals(2, requests.size)
+            assertTrue(requests[1] is UrlRequest.Expired)
+            assertEquals(1, reader.stats.value.urlRefreshes)
+        } finally {
+            reader.close(); client.close(); http.close()
+        }
     }
 }

@@ -1,5 +1,10 @@
 package io.github.nihildigit.pikpak
 
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.job
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
@@ -65,7 +70,8 @@ class RateLimiter(
         require(backgroundReserve in 0 until capacity) { "backgroundReserve must leave room for a request" }
     }
 
-    private class Waiter(val priority: Int)
+    private class Waiter(var priority: Int, var order: Long = 0)
+    private var nextOrder = 0L
     private val mutex = Mutex()
     // Net balance after deducting every queued reservation. The spendable
     // balance is tokens + waiters.size, never more than capacity.
@@ -77,19 +83,37 @@ class RateLimiter(
     /** Retains the original no-argument entry point. */
     suspend fun acquire() = acquire(ApiRequestPriority.DEFAULT)
 
-    suspend fun acquire(priority: Int) {
-        val waiter = Waiter(priority)
-        val required = 1.0 + if (priority <= ApiRequestPriority.BACKGROUND) backgroundReserve else 0
+    suspend fun acquire(priority: Int) = acquire(priority, null)
+
+    internal suspend fun acquire(priority: Int, demand: TransferDemand?): Unit = coroutineScope {
+        fun effectivePriority() = demand?.let {
+            if (it.priority >= PikPakStreamReader.STREAMING_PRIORITY) ApiRequestPriority.INTERACTIVE else ApiRequestPriority.BACKGROUND
+        } ?: priority
+        if (demand?.isClosed == true) throw CancellationException("demand closed")
+        val waiter = Waiter(effectivePriority())
+        fun required() = 1.0 + if (waiter.priority <= ApiRequestPriority.BACKGROUND) backgroundReserve else 0
+        val waitingJob = currentCoroutineContext().job
+        val updates = demand?.let { owner -> launch {
+            owner.changes.collect {
+                if (owner.isClosed) waitingJob.cancel(CancellationException("demand closed"))
+                else mutex.withLock {
+                    waiter.priority = effectivePriority()
+                    waiters.sortWith(compareByDescending<Waiter> { it.priority }.thenBy { it.order })
+                    signalChange()
+                }
+            }
+        } }
         try {
             mutex.withLock {
                 currentCoroutineContext().ensureActive()
                 refill()
-                if (tokens >= required && waiters.isEmpty()) {
+                if (tokens >= required() && waiters.isEmpty()) {
                     tokens -= 1.0
-                    return
+                    return@coroutineScope
                 }
                 tokens -= 1.0
-                val index = waiters.indexOfFirst { it.priority < priority }
+                waiter.order = nextOrder++
+                val index = waiters.indexOfFirst { it.priority < waiter.priority }
                 if (index < 0) waiters.add(waiter) else waiters.add(index, waiter)
                 signalChange()
             }
@@ -98,21 +122,22 @@ class RateLimiter(
                     currentCoroutineContext().ensureActive()
                     refill()
                     val available = tokens + waiters.size
-                    if (waiters.first() === waiter && available >= required) {
+                    if (waiters.first() === waiter && available >= required()) {
                         waiters.removeAt(0) // reservation was already deducted
                         signalChange()
-                        return
+                        return@coroutineScope
                     }
                     // Only the head keeps a timer. A higher-priority arrival or
                     // cancellation wakes it to hand the timer to the new head.
                     changed to if (waiters.first() === waiter) {
-                        ceil((required - available) * 1000.0 / refillPerSecond).toLong().coerceAtLeast(1)
+                        ceil((required() - available) * 1000.0 / refillPerSecond).toLong().coerceAtLeast(1)
                     } else null
                 }
                 if (waitMillis == null) signal.await()
                 else withTimeoutOrNull(waitMillis) { signal.await() }
             }
         } finally {
+            updates?.cancel()
             withContext(NonCancellable) {
                 mutex.withLock {
                     if (waiters.remove(waiter)) {

@@ -15,7 +15,7 @@ import kotlin.test.assertTrue
 class SignedUrlGatesTest {
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     @Test
-    fun `cancelled signed connections retire before replacement admission`() = kotlinx.coroutines.test.runTest {
+    fun `cancelled exchanges release permits without an artificial delay`() = kotlinx.coroutines.test.runTest {
         val gates = SignedUrlGates()
         val holders = List(8) { async { gates.withSlot("https://cdn/f?s=retire") { awaitCancellation() } } }
         testScheduler.runCurrent()
@@ -24,10 +24,10 @@ class SignedUrlGatesTest {
         var entered = false
         val replacement = async { gates.withSlot("https://cdn/f?s=retire") { entered = true } }
         testScheduler.runCurrent()
-        assertFalse(entered)
+        assertTrue(entered)
         testScheduler.advanceTimeBy(99)
         testScheduler.runCurrent()
-        assertFalse(entered)
+        assertTrue(entered)
         testScheduler.advanceTimeBy(1)
         testScheduler.runCurrent()
         assertTrue(entered)
@@ -36,7 +36,7 @@ class SignedUrlGatesTest {
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     @Test
-    fun `429 and 503 notify congestion immediately and retire only the rejected permit`() = kotlinx.coroutines.test.runTest {
+    fun `429 and 503 notify congestion and release the rejected permit`() = kotlinx.coroutines.test.runTest {
         for (status in listOf(429, 503)) {
             val gates = SignedUrlGates()
             val reject = CompletableDeferred<Unit>()
@@ -58,8 +58,9 @@ class SignedUrlGatesTest {
             var entered = false
             val replacement = async { gates.withSlot("https://cdn/f?s=throttle") { entered = true } }
             testScheduler.runCurrent()
-            assertFalse(entered)
-            testScheduler.advanceTimeBy(100)
+            assertFalse(entered, "explicit congestion reduces capacity until a held exchange exits")
+            holders.first().cancel()
+            holders.first().join()
             testScheduler.runCurrent()
             assertTrue(entered)
             replacement.await()
@@ -78,7 +79,7 @@ class SignedUrlGatesTest {
             val entered = List(8) { CompletableDeferred<Unit>() }
             val holders = List(8) { index ->
                 async {
-                    gates.withSlot("https://cdn/file?sign=priority") {
+                    gates.withSlot("https://cdn/file?sign=priority", priority = 101) {
                         entered[index].complete(Unit)
                         release[index].await()
                     }

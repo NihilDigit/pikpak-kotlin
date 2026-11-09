@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
@@ -278,6 +279,7 @@ class RangeReader internal constructor(
 
     private class BodySilence(val limit: Duration, val afterBytes: Long) :
         Exception("stream went silent for $limit after $afterBytes bytes")
+    private class DemandDeadline : Exception("required byte prefix missed its deadline")
 
     /**
      * Reads a range into memory. Only for ranges small enough to hold; [read] is the general
@@ -303,34 +305,11 @@ class RangeReader internal constructor(
         closed = true
     }
 
-    /**
-     * Takes a slot from this file's budget, then one from the account's.
-     *
-     * The order is not arbitrary. This way a reader holds at most
-     * [connectionBudget] account slots, so one busy file can never occupy the
-     * whole account budget and starve another. The reverse order would let a
-     * reader take every account slot for reads still queued behind its own
-     * per-file gate, which cannot proceed and would hold the account gate shut
-     * while doing nothing.
-     */
+    /** Supplies file identity for atomic admission; a queued read holds no partial permits. */
     private suspend fun <T> withSlot(priority: Int, body: suspend () -> T): T {
-        // A read nobody ordered is ordered by now, which keeps the old arrival order among such reads
-        val order = currentCoroutineContext()[RequestOrder]?.value ?: RequestOrder.Sequence.next()
-        // RangeAdmission measures the whole file/account/signed admission interval.
-        // Counting these gates separately would double-count their wait in telemetry.
-        gate.acquire(priority, order)
-        updateStats()
-        try {
-            client.accountGate.acquire(priority, order)
-            try {
-                return body()
-            } finally {
-                client.accountGate.release()
-            }
-        } finally {
-            gate.release()
-            updateStats()
-        }
+        return withContext(io.github.nihildigit.pikpak.internal.FileAdmission(gate, connectionBudget) { active, queued ->
+            _stats.update { it.copy(activeReads = active, queuedReads = queued) }
+        }) { body() }
     }
 
     private fun launchPump(
@@ -392,7 +371,8 @@ class RangeReader internal constructor(
             // Started even when nobody is listening: the branch would have to
             // be repeated at all six places an attempt can end, and a recorder
             // nothing reads costs one allocation per request.
-            val attempt = RangeAttemptRecorder(offset, remaining, gate.inUse, gate.queued, priority, HostHealth.hostOf(attemptUrl), timeSource)
+            val attempt = RangeAttemptRecorder(offset, remaining, _stats.value.activeReads, _stats.value.queuedReads, priority, HostHealth.hostOf(attemptUrl), timeSource)
+            attempt.admission.granted.invokeOnCompletion { failure -> if (failure == null) telemetry?.let { it.attempts++ } }
 
             val connectionTelemetry = telemetry ?: ReadTelemetry(timeSource)
             connectionTelemetry.resetConnection()
@@ -403,7 +383,6 @@ class RangeReader internal constructor(
                 // counted against this attempt and no other.
                 withSlot(priority) {
                 if (telemetry != null) {
-                    telemetry.attempts++
                     if (rerouted) telemetry.rerouted = true
                 }
                 withContext(attempt.retries + attempt.admission + io.github.nihildigit.pikpak.internal.SignedRequestPriority(priority) + connectionTelemetry) {
@@ -428,6 +407,17 @@ class RangeReader internal constructor(
                             statusesSeen = statuses
                         }
                     }
+                    val demand = currentCoroutineContext()[TransferDemand]
+                    val demandWatch = demand?.let { owner -> launch {
+                        owner.deadline.collectLatest { target ->
+                            if (target != null) {
+                                delay((-target.at.elapsedNow()).coerceAtLeast(Duration.ZERO))
+                                if (owner.deadline.compareAndSet(target, null) && offset + delivered < target.endExclusive)
+                                    throw DemandDeadline()
+                            }
+                        }
+                    } }
+                    try {
                     client.streamRangeFromUrl(attemptUrl, offset, remaining) { stream ->
                         validateTotal(stream.totalSize)
                         answered.complete(Unit)
@@ -447,7 +437,7 @@ class RangeReader internal constructor(
                         val buffer = ByteArray(READ_CHUNK)
                         var firstByteAt: TimeMark? = null
                         while (true) {
-                            val silenceLimit = tailSilenceDeadline(bodySilence, delivered, announced)
+                            val silenceLimit = bodySilence
                             val readStarted = timeSource.markNow()
                             val n = try {
                                 withTimeout(silenceLimit) {
@@ -505,8 +495,7 @@ class RangeReader internal constructor(
                                     onBodyProgress?.invoke(bodyElapsed, bodyRate)
                                     if (bodyElapsed >= bodySilence &&
                                         tailSilenceDeadline(bodySilence, delivered, announced) == bodySilence &&
-                                        bodyRate < MIN_VIABLE_BODY_BYTES_PER_SEC &&
-                                        !client.hostHealth.hasGoodHistory(attemptUrl)
+                                        bodyRate < MIN_VIABLE_BODY_BYTES_PER_SEC
                                     ) {
                                         throw BodySilence(bodySilence, delivered)
                                     }
@@ -514,6 +503,7 @@ class RangeReader internal constructor(
                             }
                         }
                     }
+                    } finally { demandWatch?.cancel() }
                   }
                 }
                 }
@@ -523,6 +513,15 @@ class RangeReader internal constructor(
                     if (attempt.admission.granted.isCompleted) {
                         telemetry.networkDuration += (started.elapsedNow() - attempt.sinkWait - attempt.gateWait).coerceAtLeast(Duration.ZERO)
                     }
+                }
+                if (t is io.github.nihildigit.pikpak.internal.TransferPreempted || t is DemandDeadline) {
+                    telemetry?.let { it.preemptions++ }
+                    report(attempt, attemptUrl, RangeAttempt.Outcome.Cancelled,
+                        if (t is DemandDeadline) RangeAttempt.EndReason.DemandDeadline else RangeAttempt.EndReason.Preempted)
+                    if (!currentCoroutineContext().isActive) throw t
+                    offset += delivered
+                    remaining = remaining?.minus(delivered)
+                    continue
                 }
                 if (t is CancellationException) {
                     // An attempt is reported when it stops delivering, and that can be the
@@ -598,7 +597,7 @@ class RangeReader internal constructor(
                         refreshUrl(UrlRequest.Rejected(linkUrl, t.httpStatus!!), linkUrl)
                     }
                     t is UnresponsiveHost -> {
-                        report(attempt, attemptUrl, RangeAttempt.Outcome.Failed)
+                        report(attempt, attemptUrl, RangeAttempt.Outcome.Failed, RangeAttempt.EndReason.HeaderTimeout)
                         failures++
                         if (failures >= maxAttempts) throw PikPakException(-1, "RangeReader: no host answered at offset $offset", cause = t)
                         bumpRetries()
@@ -613,15 +612,9 @@ class RangeReader internal constructor(
                         }
                     }
                     t is BodySilence -> {
-                        report(attempt, attemptUrl, RangeAttempt.Outcome.Failed)
+                        report(attempt, attemptUrl, RangeAttempt.Outcome.Failed, RangeAttempt.EndReason.BodyStall)
                         bodyStalls++
-                        val canSwitch = rerouted ||
-                            priority < PikPakStreamReader.READ_AHEAD_PRIORITY ||
-                            !client.hostHealth.hasGoodHistory(attemptUrl) ||
-                            bodyStalls >= 2
-                        if (canSwitch) {
-                            client.hostHealth.stalled(attemptUrl, attempt.delivered, attempt.bodyBytesPerSecond(), t.limit)
-                        }
+                        client.hostHealth.stalled(attemptUrl, attempt.delivered, attempt.bodyBytesPerSecond(), t.limit)
                         if (delivered < MIN_VIABLE_BODY_BYTES_PER_SEC || bodyStalls >= maxAttempts) {
                             failures++
                             if (failures >= maxAttempts || bodyStalls >= maxAttempts) {
@@ -629,9 +622,7 @@ class RangeReader internal constructor(
                             }
                         }
                         bumpRetries()
-                        if (canSwitch) {
-                            switchHost(linkUrl, silentFor = t.limit)
-                        }
+                        switchHost(linkUrl, silentFor = t.limit)
                     }
                     else -> {
                         report(attempt, attemptUrl, RangeAttempt.Outcome.Failed)
@@ -658,7 +649,8 @@ class RangeReader internal constructor(
                 telemetry.gateWait += attempt.gateWait
                 telemetry.networkDuration += (started.elapsedNow() - attempt.sinkWait - attempt.gateWait).coerceAtLeast(Duration.ZERO)
             }
-            report(attempt, attemptUrl, outcomeFor(announced, delivered))
+            report(attempt, attemptUrl, outcomeFor(announced, delivered),
+                if (announced != null && delivered < announced!!) RangeAttempt.EndReason.Truncated else null)
 
             offset += delivered
             remaining = remaining?.minus(delivered)
@@ -686,6 +678,13 @@ class RangeReader internal constructor(
                 bumpRetries()
                 delay(client.retryPolicy.delayFor(failures - 1))
                 switchHost(linkUrl)
+            } else if (truncated) {
+                bumpRetries()
+                failures++
+                if (failures >= maxAttempts) throw PikPakException(-1, "truncated range at offset $offset")
+                client.hostHealth.refused(attemptUrl)
+                switchHost(linkUrl)
+
             } else {
                 bumpRetries()
             }
@@ -791,10 +790,6 @@ class RangeReader internal constructor(
     // Counters are bumped from every pump at once; a read-copy-write on
     // StateFlow.value would lose increments, update() retries on contention.
 
-    private fun updateStats() {
-        _stats.update { it.copy(activeReads = gate.inUse, queuedReads = gate.queued) }
-    }
-
     /** A body that stopped short of its own Content-Length by itself ended the way a transport error does. */
     private fun outcomeFor(announced: Long?, delivered: Long): RangeAttempt.Outcome =
         if (announced != null && delivered < announced) RangeAttempt.Outcome.Failed
@@ -808,7 +803,8 @@ class RangeReader internal constructor(
      * does not apply, because the caller supplied the code that threw and it is
      * not on the path the bytes take.
      */
-    private suspend fun report(recorder: RangeAttemptRecorder, url: String, outcome: RangeAttempt.Outcome) {
+    private suspend fun report(recorder: RangeAttemptRecorder, url: String, outcome: RangeAttempt.Outcome,
+        endReason: RangeAttempt.EndReason? = null) {
         currentCoroutineContext()[ReadTelemetry]?.let { telemetry ->
             telemetry.retries += recorder.retries.serverErrors + recorder.retries.rateLimited + recorder.retries.transport
             telemetry.throttled += recorder.retries.serverErrors + recorder.retries.rateLimited
@@ -823,7 +819,7 @@ class RangeReader internal constructor(
         client.accountState.flushDownstreamBytes()
         val observer = onAttempt ?: return
         try {
-            observer(recorder.finish(outcome))
+            observer(recorder.finish(outcome, endReason))
         } catch (e: CancellationException) {
             throw e
         } catch (_: Throwable) {
@@ -862,11 +858,7 @@ class RangeReader internal constructor(
         (THROTTLE_BASE_DELAY_MS * attempt).coerceAtMost(THROTTLE_MAX_DELAY_MS).milliseconds
 
     internal companion object {
-        internal fun tailSilenceDeadline(base: Duration, delivered: Long, announced: Long?): Duration =
-            if (delivered > 0 && announced != null && announced > 0 &&
-                (announced - delivered <= 64 * 1024 || delivered.toDouble() / announced >= 0.8))
-                (base * 2).coerceAtMost(10.seconds)
-            else base
+        internal fun tailSilenceDeadline(base: Duration, delivered: Long, announced: Long?): Duration = base
 
         const val READ_CHUNK = 64 * 1024
 

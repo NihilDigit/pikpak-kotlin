@@ -8,6 +8,7 @@ sealed interface ConcurrencyMode {
         init { require(connections >= 1) }
     }
 
+    /** Work-conserving demand adaptation under a hard ceiling; no active throughput experiments. */
     data class Adaptive(val ceiling: Int = 16) : ConcurrencyMode {
         init { require(ceiling >= 1) }
     }

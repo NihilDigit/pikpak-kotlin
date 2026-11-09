@@ -116,7 +116,7 @@ class RoiSchedulingTest {
     }
 
     @Test
-    fun `interactive signals yield data capacity but explicit maintenance does not`() = runTest {
+    fun `API activity does not change data admission without an owned demand`() = runTest {
         val http = HttpClient(MockEngine { respond("{}") })
         val client = PikPakClient("mock", "pw", httpClient = http,
             sessionStore = InMemorySessionStore(), accountConnectionBudget = 8,
@@ -129,7 +129,7 @@ class RoiSchedulingTest {
             withApiPriority(ApiRequestPriority.BACKGROUND) { client.withInteractiveApiPriority {} }
             assertEquals(8, client.scheduler.workersFor(reg, true))
             client.withInteractiveApiPriority {}
-            assertEquals(4, client.scheduler.workersFor(reg, true))
+            assertEquals(8, client.scheduler.workersFor(reg, true))
             advanceTimeBy(501)
             assertEquals(8, client.scheduler.workersFor(reg, true))
         } finally { client.scheduler.unregister(reg); client.close(); http.close() }

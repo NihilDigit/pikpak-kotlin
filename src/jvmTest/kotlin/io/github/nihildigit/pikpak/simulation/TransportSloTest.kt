@@ -37,9 +37,9 @@ class TransportSimulationTest {
     @Test fun resumableResetAndLossPreserveEveryByte() = runTest(timeout = 5.minutes) {
         download(NetworkProfile(failRequest = 2, lossEveryPackets = 5000), size = 64 * MIB)
     }
-    @Test fun degradedEdgeFindsSibling() = runTest(timeout = 5.minutes) {
+    @Test fun respondingEdgeDoesNotTriggerSpeculativeRouting() = runTest(timeout = 5.minutes) {
         val result = download(NetworkProfile(ttfbMs = 1350, degradedHost = HOST), size = 64 * MIB, steering = true)
-        assertTrue(SIBLING in result.hosts, "slow but responding edge never explored the observed same-family sibling")
+        assertEquals(setOf(HOST), result.hosts, "a responding issued route must not trigger speculative host changes")
         assertTrue(result.hosts.all { it == HOST || it == SIBLING }, "steering crossed the observed host family: ${result.hosts}")
         assertTrue(result.elapsedMs < 60_000, "400 KiB/s origin was not rescued: $result")
     }

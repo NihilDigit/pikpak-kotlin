@@ -28,13 +28,20 @@ import kotlinx.coroutines.withTimeoutOrNull
 /** One wake exchange per handle, shared even by readers retired during a URL refresh. */
 internal class FileReactivationCoordinator(
     private val client: PikPakClient,
-    private val pollInterval: Duration = 8.seconds,
+    private val pollInterval: Duration = DEFAULT_POLL_INTERVAL,
     private val timeout: Duration = 5.minutes,
 ) {
     init {
         require(pollInterval > Duration.ZERO && pollInterval.isFinite())
         require(timeout > Duration.ZERO && timeout.isFinite())
     }
+
+    internal fun pollDelayForAttempt(attempt: Int): Duration =
+        if (pollInterval == DEFAULT_POLL_INTERVAL) {
+            minOf(10 * (attempt + 1), 60).seconds
+        } else {
+            pollInterval
+        }
 
     private val mutex = Mutex()
     private var waiting: CompletableDeferred<Unit>? = null
@@ -114,8 +121,9 @@ internal class FileReactivationCoordinator(
                 url = refresh(url)
             }
         }
+        var attempt = 0
         while (true) {
-            delay(pollInterval)
+            delay(pollDelayForAttempt(attempt++))
             try {
                 client.streamRangeFromUrl(url, 0, 1) { stream ->
                     val byte = ByteArray(1)
@@ -128,5 +136,9 @@ internal class FileReactivationCoordinator(
                 url = refresh(url)
             }
         }
+    }
+
+    companion object {
+        val DEFAULT_POLL_INTERVAL: Duration = 8.seconds
     }
 }

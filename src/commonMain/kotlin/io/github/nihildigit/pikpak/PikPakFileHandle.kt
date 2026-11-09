@@ -33,6 +33,10 @@ data class VariantLink(
     val url: String,
     /** Null when the URL carries no readable expiry; such a link is never refreshed early. */
     val expiresAt: Instant?,
+    /** Whether the CDN explicitly marked this signed URL as rate-limited (`x_limited=1` or `101`). */
+    val isLimited: Boolean = DownloadLink(url = url).isLimited,
+    /** Per-connection speed limit (`ms` query parameter) in bytes per second, when present. */
+    val maxSpeedBytesPerSec: Long? = DownloadLink(url = url).maxSpeedBytesPerSec,
 )
 
 /**
@@ -142,6 +146,7 @@ class PikPakFileHandle(
     reactivationPollInterval: Duration = 8.seconds,
     reactivationTimeout: Duration = 5.minutes,
 ) : RangeSource, AdaptiveRangeSource, AutoCloseable {
+    internal var preferMediaDetails = mediaId != null
     /** Upper case whatever the caller passed, so [contentKey] and the stream-size memo agree. */
     val gcid: String = gcid.canonicalGcid()
 
@@ -191,159 +196,21 @@ class PikPakFileHandle(
 
     /** Outlives any one reader; see where it is handed to [RangeReader]. */
     private val fileGate = PriorityGate(minOf(8, connectionBudget))
-    private val secondaryGate = PriorityGate(minOf(8, connectionBudget))
-
-    override val maxConnections: Int = if (!leased && onObjectMinted == null) minOf(8, connectionBudget) * 2 else minOf(8, connectionBudget)
-    private val mutableConnectionLimit = MutableStateFlow(minOf(8, connectionBudget))
+    override val maxConnections: Int = minOf(8, connectionBudget)
+    private val mutableConnectionLimit = MutableStateFlow(maxConnections)
     override val connectionLimit: StateFlow<Int> = mutableConnectionLimit.asStateFlow()
-    private val allowance = MutableStateFlow(maxConnections)
-    @Volatile private var externallyManagedDemand = false
-    private val expanding = MutableStateFlow(false)
-    @Volatile private var positiveScalingGain = false
-    @Volatile private var readContext: CoroutineContext = EmptyCoroutineContext
-
-    override fun updateCapacityEvidence(positiveScalingGain: Boolean) {
-        this.positiveScalingGain = positiveScalingGain
-    }
-    private val laneMutex = Mutex()
-    @Volatile private var primaryInFlight = 0
-    @Volatile private var secondaryInFlight = 0
-    private var secondaryGeneration: Any? = null
-    @Volatile private var secondary: RangeReader? = null
-    @Volatile private var secondaryLink: VariantLink? = null
     private val detailMutex = Mutex()
     private var lastDetailAt: TimeMark? = initialLink?.let { client.timeSource.markNow() }
-
     override fun updateConnectionAllowance(allowance: Int) {
-        externallyManagedDemand = true
-        this.allowance.value = allowance.coerceIn(0, maxConnections)
-        publishConnectionLimit()
-        considerSecondLane()
+        mutableConnectionLimit.value = allowance.coerceIn(0, maxConnections)
     }
+    private fun observeAttempt(attempt: RangeAttempt) { onRangeAttempt?.invoke(attempt) }
 
-    private fun publishConnectionLimit() {
-        mutableConnectionLimit.value = minOf(allowance.value,
-            if (secondary != null) maxConnections else minOf(8, connectionBudget))
-    }
-
-    private fun observeAttempt(attempt: RangeAttempt) {
-        considerSecondLane()
-        onRangeAttempt?.invoke(attempt)
-    }
-
-    private suspend fun observeProgress(elapsed: Duration, rate: Long) {
-        if (elapsed >= 2.seconds && rate > 0)
-            considerSecondLane(currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext)
-    }
-
-    private fun hasActiveDemand(): Boolean =
-        if (externallyManagedDemand) allowance.value > 0
-        else primaryInFlight > 0 || secondaryInFlight > 0
-
-    private fun considerSecondLane(context: CoroutineContext = readContext) {
-        if (!client.concurrentAcceleration || !positiveScalingGain || fileGate.inUse < 8 ||
-            !hasActiveDemand() || closed || leased || onObjectMinted != null || fileId == null ||
-            allowance.value <= 8 || secondary != null || !expanding.compareAndSet(false, true)) return
-        client.background.launch(context) {
-            try {
-                val candidate = freeLaneLink(expandingCapacity = true)
-                laneMutex.withLock {
-                    val primary = link
-                    if (!closed && client.concurrentAcceleration && positiveScalingGain &&
-                        hasActiveDemand() && allowance.value > 8 && primary != null &&
-                        sameServicePool(primary.url, candidate.url) &&
-                        SignedUrlGates.identityOf(candidate.url) != SignedUrlGates.identityOf(primary.url)) {
-                        val generation = Any()
-                        secondaryGeneration = generation
-                        secondaryLink = candidate
-                        secondary = RangeReader(client, { provideSecondaryUrl(generation, it) },
-                            connectionBudget = 8, gate = secondaryGate, onAttempt = ::observeAttempt,
-                            coordinator = coordinator, onBodyProgress = ::observeProgress)
-                        publishConnectionLimit()
-                    }
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                // Opportunistic capacity must not fail the working primary lane.
-            } finally {
-                expanding.value = false
-            }
-        }
-    }
-
-    /** Never rebuild or mint a charged lease merely to obtain parallel capacity. */
-    private suspend fun freeLaneLink(expandingCapacity: Boolean = false): VariantLink = detailMutex.withLock {
-        lastDetailAt?.let { delay((1500.milliseconds - it.elapsedNow()).coerceAtLeast(Duration.ZERO)) }
-        check(!closed && !leased && onObjectMinted == null)
-        check(!expandingCapacity || (allowance.value > 8 && hasActiveDemand()))
-        val id = checkNotNull(fileId)
-        lastDetailAt = client.timeSource.markNow()
-        val candidate = linkOf(client.getFile(id)) ?: throw PikPakException(-1, "file $id has no readable link")
-        // A second signature is useful only within the current service pool. Combining
-        // a fast original-media lane with a capped download lane can stall ordered reads.
-        val primary = link
-        check(primary == null || sameServicePool(primary.url, candidate.url)) { "Secondary link changed service pool" }
-        candidate
-    }
-
-    private suspend fun provideSecondaryUrl(generation: Any, request: UrlRequest): String {
-        laneMutex.withLock {
-            if (secondaryGeneration !== generation) return checkNotNull(link).url
-            val existing = secondaryLink
-            if (request == UrlRequest.Initial && existing != null && isUsable(existing)) return existing.url
-        }
-        try {
-            val fresh = freeLaneLink()
-            val refused = when (request) {
-                is UrlRequest.Expired -> request.previous
-                is UrlRequest.Rejected -> request.previous
-                else -> null
-            }
-            check(fresh.url != refused) { "secondary signature was not refreshed" }
-            return laneMutex.withLock {
-                if (secondaryGeneration !== generation) return@withLock checkNotNull(link).url
-                check(link?.let { SignedUrlGates.identityOf(it.url) } != SignedUrlGates.identityOf(fresh.url))
-                check(link?.let { sameServicePool(it.url, fresh.url) } == true)
-                secondaryLink = fresh
-                fresh.url
-            }
-        } catch (t: Throwable) {
-            if (t !is CancellationException) {
-                laneMutex.withLock {
-                    if (secondaryGeneration === generation) {
-                        secondaryGeneration = null
-                        secondary = null
-                        secondaryLink = null
-                        publishConnectionLimit()
-                    }
-                }
-                // Existing reads may resume on the primary signature; its client-scoped
-                // signed gate still caps all old and new readers together at eight.
-                link?.let { return it.url }
-            }
-            throw t
-        }
-    }
-
-    @Volatile
-    private var fileId: String? = initialFileId
-
-    @Volatile
-    private var reader: RangeReader? = null
-
-    // Written from provideUrl, which RangeReader calls outside this class's
-    // mutex, and read inside it.
-    @Volatile
-    private var expiresAt: Instant? = null
-
-    @Volatile
-    private var closed = false
-
-    // Only ever written with the same probed value; the variant it describes
-    // cannot change while this handle lives.
-    @Volatile
-    private var probedSize: Long? = streamSize
+    @Volatile private var fileId: String? = initialFileId
+    @Volatile private var reader: RangeReader? = null
+    @Volatile private var expiresAt: Instant? = null
+    @Volatile private var closed = false
+    @Volatile private var probedSize: Long? = streamSize
 
     /**
      * The file object currently backing this handle, or null before the first
@@ -368,29 +235,7 @@ class PikPakFileHandle(
         priority: Int,
         block: suspend (ByteReadChannel) -> T,
     ): T {
-        readContext = currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext
-        val primary = currentReader()
-        val chosen = laneMutex.withLock {
-            val extra = secondary?.takeIf { allowance.value > 8 }
-            if (extra != null && secondaryInFlight < primaryInFlight) {
-                secondaryInFlight++
-                extra to true
-            } else {
-                primaryInFlight++
-                primary to false
-            }
-        }
-        try {
-            considerSecondLane(currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext)
-            return chosen.first.read(start, length, priority, block)
-        } finally {
-            withContext(NonCancellable) {
-                laneMutex.withLock {
-                    if (chosen.second) secondaryInFlight-- else primaryInFlight--
-                }
-            }
-            considerSecondLane(currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext)
-        }
+        return currentReader().read(start, length, priority, block)
     }
 
     /** Resolves the link now so the first read does not pay for it. */
@@ -410,7 +255,7 @@ class PikPakFileHandle(
      * read. So a caller that finds only the original must decide between
      * reading it and giving up; waiting does not help.
      */
-    suspend fun variants(): List<MediaVariant> = detail().medias
+    suspend fun variants(): List<MediaVariant> = detail(usage = null).medias
 
     /**
      * A [PikPakFileCache] reading through this handle, sized to the variant it reads and
@@ -482,12 +327,7 @@ class PikPakFileHandle(
         if (closed) return
         closed = true
         reader?.close()
-        secondary?.close()
-        secondaryGeneration = null
-        secondaryLink = null
-        secondary = null
         reader = null
-        publishConnectionLimit()
         if (release != null && unreportedObject != null) client.background.launch { reportMinted() }
     }
 
@@ -527,7 +367,6 @@ class PikPakFileHandle(
             gate = fileGate,
             onAttempt = ::observeAttempt,
             coordinator = coordinator,
-            onBodyProgress = ::observeProgress,
         ).also { reader = it }
     }
 
@@ -545,17 +384,6 @@ class PikPakFileHandle(
         val chosen = reusable ?: mintAvoidingBadHosts(request)
         link = chosen
         expiresAt = chosen.expiresAt
-        laneMutex.withLock {
-            if (secondaryLink?.let {
-                SignedUrlGates.identityOf(it.url) == SignedUrlGates.identityOf(chosen.url) ||
-                    !sameServicePool(it.url, chosen.url)
-            } == true) {
-                secondaryGeneration = null
-                secondary = null
-                secondaryLink = null
-                publishConnectionLimit()
-            }
-        }
         // After the link, never before it: the object still has to answer the
         // lookups that minted it, and a caller that deletes on this signal would
         // pull it out from under them.
@@ -566,18 +394,16 @@ class PikPakFileHandle(
     private fun isUsable(candidate: VariantLink): Boolean {
         val expiry = candidate.expiresAt
         if (expiry != null && expiry - clock.now() <= refreshMargin) return false
+        if (candidate.isLimited && client.isFreeAccount == false) return false
         return !client.hostHealth.isBad(candidate.url)
     }
 
-    private fun sameServicePool(first: String, second: String): Boolean {
-        val pool = io.github.nihildigit.pikpak.internal.HostHealth.poolOf(first) ?: return false
-        return pool == io.github.nihildigit.pikpak.internal.HostHealth.poolOf(second)
-    }
 
     /**
-     * A fresh link, minted again while it lands on a host another file saw fail. PikPak picks
-     * the host anew for every link, so asking again is all it takes; the cap only keeps an
-     * account whose every host is failing from spinning on lookups.
+     * A fresh link, minted again while it lands on a host another file saw fail or comes back
+     * unexpectedly rate-limited on a premium account. PikPak picks the host anew for every link,
+     * so asking again is all it takes; the cap only keeps an account whose every host is failing
+     * from spinning on lookups.
      */
     private suspend fun mintAvoidingBadHosts(request: UrlRequest): VariantLink {
         // A rejection means the link we held is no good, and so is the file
@@ -586,7 +412,9 @@ class PikPakFileHandle(
         if (request is UrlRequest.Rejected) rebuild()
         var minted = mint()
         repeat(MAX_HOST_REMINTS) {
-            if (!client.hostHealth.isBad(minted.url)) return minted
+            val badHost = client.hostHealth.isBad(minted.url)
+            val unexpectedlyLimited = minted.isLimited && client.isFreeAccount == false
+            if (!badHost && !unexpectedlyLimited) return minted
             minted = mint()
         }
         return minted
@@ -611,15 +439,15 @@ class PikPakFileHandle(
      * hits the same dead id, and letting that one 404 while the read path
      * heals would make the file id look like the identity again.
      */
-    private suspend fun detail(): FileDetail = (try {
-        lookupDetail(ensureFileId())
+    private suspend fun detail(usage: String? = if (preferMediaDetails) null else FILE_USAGE_FETCH): FileDetail = (try {
+        lookupDetail(ensureFileId(), usage)
     } catch (e: PikPakException) {
         // The id died between calls. A reader cannot report this as a
         // rejection because it never got a URL to have rejected, so without
         // this branch the same failing lookup repeats every time.
         if (!isFileGone(e)) throw e
         rebuild()
-        lookupDetail(ensureFileId())
+        lookupDetail(ensureFileId(), usage)
     }).also { detail ->
         client.hostHealth.observe(detail)
         val variant = if (mediaId == null) detail.medias.firstOrNull { it.isOrigin }
@@ -627,9 +455,9 @@ class PikPakFileHandle(
         videoInfo = variant?.video ?: videoInfo
     }
 
-    private suspend fun lookupDetail(id: String): FileDetail = detailMutex.withLock {
+    private suspend fun lookupDetail(id: String, usage: String?): FileDetail = detailMutex.withLock {
         lastDetailAt = client.timeSource.markNow()
-        client.getFile(id)
+        client.getFile(id, usage = usage)
     }
 
     private fun linkOf(detail: FileDetail): VariantLink? {
@@ -640,19 +468,21 @@ class PikPakFileHandle(
                 detail.webContentLink.takeIf { it.isNotBlank() }?.let { DownloadLink(url = it) },
                 detail.medias.firstOrNull { it.isOrigin && it.link.url.isNotBlank() }?.link,
             )
-            val chosen = candidates.firstOrNull { !client.hostHealth.isBad(it.url) } ?: candidates.firstOrNull()
+            val chosen = candidates.firstOrNull { !client.hostHealth.isBad(it.url) && !it.isLimited }
+                ?: candidates.firstOrNull { !client.hostHealth.isBad(it.url) }
+                ?: candidates.firstOrNull { !it.isLimited }
+                ?: candidates.firstOrNull()
                 ?: return null
-            return VariantLink(chosen.url, chosen.expiresAt)
+            return VariantLink(chosen.url, chosen.expiresAt, chosen.isLimited, chosen.maxSpeedBytesPerSec)
         }
         val variant = detail.variant(mediaId) ?: return null
         val url = variant.link.url.takeIf { it.isNotBlank() } ?: return null
-        return VariantLink(url, variant.link.expiresAt)
+        return VariantLink(url, variant.link.expiresAt, variant.link.isLimited, variant.link.maxSpeedBytesPerSec)
     }
 
     /** The reader a read would use right now, creating it if needed. */
     internal suspend fun readerForTest(): RangeReader = currentReader()
 
-    internal fun secondaryReaderForTest(): RangeReader? = secondary
 
     /** Marks the current signature as due for replacement, without waiting for a clock. */
     internal fun expireForTest() {
@@ -676,11 +506,23 @@ class PikPakFileHandle(
         val budget = if (leased) client.leaseBudget else null
         val taken = budget?.acquire(size) ?: 0L
         val created = try {
-            client.instantCreate(
-                ResolvedFile(path = name, size = size, gcid = gcid),
-                parentId = parentId,
-                name = name,
-            )
+            try {
+                client.instantCreate(
+                    ResolvedFile(path = name, size = size, gcid = gcid),
+                    parentId = parentId,
+                    name = name,
+                )
+            } catch (e: PikPakException) {
+                if (parentId.isNotEmpty() && (e.httpStatus == 404 || e.errorMessage.contains("file_invisible") || e.errorMessage.contains("not_found"))) {
+                    client.instantCreate(
+                        ResolvedFile(path = name, size = size, gcid = gcid),
+                        parentId = "",
+                        name = name,
+                    )
+                } else {
+                    throw e
+                }
+            }
         } catch (e: Throwable) {
             withContext(NonCancellable) { budget?.release(taken) }
             throw e
@@ -703,10 +545,11 @@ class PikPakFileHandle(
     companion object {
         /**
          * How long before a link's stated expiry the handle stops handing it
-         * out. A read that starts inside this window would otherwise have its
+         * out. Matches the official client's 600-second proactive renewal margin;
+         * a read that starts inside this window would otherwise risk having its
          * signature expire mid-body.
          */
-        val DEFAULT_REFRESH_MARGIN: Duration = 5.minutes
+        val DEFAULT_REFRESH_MARGIN: Duration = 10.minutes
 
         /** Extra links minted when one lands on a host known to be failing; see [mintAvoidingBadHosts]. */
         internal const val MAX_HOST_REMINTS = 2
@@ -745,7 +588,10 @@ fun PikPakClient.fileHandle(
             detail.webContentLink.takeIf { it.isNotBlank() }?.let { DownloadLink(url = it) },
             detail.medias.firstOrNull { it.isOrigin && it.link.url.isNotBlank() }?.link,
         )
-        candidates.firstOrNull { !hostHealth.isBad(it.url) } ?: candidates.firstOrNull()
+        candidates.firstOrNull { !hostHealth.isBad(it.url) && !it.isLimited }
+            ?: candidates.firstOrNull { !hostHealth.isBad(it.url) }
+            ?: candidates.firstOrNull { !it.isLimited }
+            ?: candidates.firstOrNull()
     } else {
         variant?.link
     }
@@ -760,8 +606,12 @@ fun PikPakClient.fileHandle(
         onObjectMinted = onObjectMinted,
         leased = leased,
         onRangeAttempt = onRangeAttempt,
-        initialLink = link?.url?.takeIf { it.isNotBlank() }?.let { VariantLink(it, link.expiresAt) },
+        initialLink = link?.url?.takeIf { it.isNotBlank() }?.let {
+            VariantLink(it, link.expiresAt, link.isLimited, link.maxSpeedBytesPerSec)
+        },
         streamSize = streamSize ?: detail.sizeBytes.takeIf { mediaId == null },
         videoInfo = variant?.video,
-    )
+    ).also { handle ->
+        if (detail.originMediaLink != null && detail.originMediaLink?.url == link?.url) handle.preferMediaDetails = true
+    }
 }

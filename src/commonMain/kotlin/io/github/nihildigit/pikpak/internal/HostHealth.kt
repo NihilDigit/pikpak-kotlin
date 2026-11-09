@@ -36,9 +36,7 @@ internal class HostHealth(
         val cleanLatencies: List<LatencySample> = emptyList(),
         val silences: Map<String, TimeMark> = emptyMap(),
         val stalls: Map<String, TimeMark> = emptyMap(),
-        val suspects: Map<String, TimeMark> = emptyMap(),
         val refusals: Map<String, TimeMark> = emptyMap(),
-        val preferredByCluster: Map<String, RouteLease> = emptyMap(),
     )
 
     // Route evidence and its epoch are published together. A reader never sees a partial reset.
@@ -48,14 +46,12 @@ internal class HostHealth(
     /** Host labels without the root domain, in the order links named them. Tried before [seedLabels]. */
     private val learned = MutableStateFlow<Map<String, List<String>>>(emptyMap())
     private val seedLabels = seeds.toList()
-    private val lastExplore = MutableStateFlow<Map<String, TimeMark>>(emptyMap())
     private val activeDrains = MutableStateFlow(0)
     private val idleSockets = MutableStateFlow<Map<String, Int>>(emptyMap())
     private val everPooled = MutableStateFlow(false)
     private val lastClusterUrl = MutableStateFlow<Map<String, String>>(emptyMap())
 
     private class RateSample(val bytesPerSecond: Long, val at: TimeMark)
-    private class RouteLease(val label: String, val at: TimeMark)
 
     /**
      * [url]'s host sent response headers [after] the request went out. Null when the wait is not
@@ -198,31 +194,22 @@ internal class HostHealth(
      * first-response deadline and fail short of [MIN_SAMPLE_BYTES], escaping both [markSilent]
      * and [delivered]. Because response headers already arrived on this connection, local network
      * connectivity is proven and concurrent header arrivals on the same host must not clear or
-     * suppress the mid-body stall penalty; only a healthy completed transfer ([delivered]) clears it.
+     * suppress the mid-body stall evidence. It expires with the evidence window or a route epoch change.
      */
     fun stalled(url: String, deliveredBytes: Long, bodyBytesPerSecond: Long, silenceDuration: Duration) {
-        recordLatency(silenceDuration)
         val host = keyOf(url) ?: return
         val now = timeSource.markNow()
-        val effectiveRate = if (deliveredBytes > 0L) bodyBytesPerSecond.coerceAtLeast(1L) else 1L
+        val activeSeconds = if (deliveredBytes > 0L && bodyBytesPerSecond > 0L) {
+            deliveredBytes.toDouble() / bodyBytesPerSecond.toDouble()
+        } else 0.0
+        val totalSeconds = activeSeconds + silenceDuration.inWholeNanoseconds / 1e9
+        val effectiveRate = if (deliveredBytes > 0L && totalSeconds > 0.0) {
+            (deliveredBytes / totalSeconds).toLong().coerceAtLeast(1L)
+        } else 1L
         val sample = RateSample(effectiveRate, now)
         health.update { current ->
-            if (deliveredBytes >= MIN_SAMPLE_BYTES && effectiveRate >= GOOD_RATE_BYTES_PER_SEC) {
-                return@update current.withRate(host, sample)
-            }
-            val hadGoodHistory = current.recentRates(host).any { it >= GOOD_RATE_BYTES_PER_SEC }
-            val alreadySuspect = current.isSuspect(host)
             val updated = current.withRate(host, sample)
-            if (hadGoodHistory && !alreadySuspect) {
-                updated.copy(
-                    suspects = current.suspects.filterValues { it.elapsedNow() < SUSPECT_WINDOW } + (host to now),
-                )
-            } else {
-                updated.copy(
-                    stalls = current.stalls.filterValues { it.elapsedNow() < memory } + (host to now),
-                    suspects = current.suspects - host,
-                )
-            }
+            updated.copy(stalls = updated.stalls + (host to now))
         }
     }
 
@@ -303,9 +290,6 @@ internal class HostHealth(
             if (bytesPerSecond >= GOOD_RATE_BYTES_PER_SEC) {
                 updated.copy(
                     silences = updated.silences - key,
-                    stalls = updated.stalls - key,
-                    suspects = updated.suspects - key,
-                    refusals = updated.refusals - key,
                 )
             } else {
                 updated
@@ -343,117 +327,16 @@ internal class HostHealth(
     ): String = health.value.route(url, mayExplore, requestedBytes, priority, foregroundHungry, demandBytesPerSecond)
 
     private fun HealthState.route(
-        url: String,
-        mayExplore: Boolean,
-        requestedBytes: Long,
-        priority: Int,
-        foregroundHungry: Boolean,
-        demandBytesPerSecond: Long?,
+        url: String, mayExplore: Boolean, requestedBytes: Long, priority: Int,
+        foregroundHungry: Boolean, demandBytesPerSecond: Long?,
     ): String {
         if (!steering) return url
         val edge = Edge.parse(url) ?: return url
         learn(edge)
-
-        val clusterKey = edge.cluster
-        val siblings = siblingsOf(edge)
-        val allCandidates = siblings + edge
-        val bytes = requestedBytes.coerceAtLeast(1)
-        fun viable(host: String): Boolean = usable(host) &&
-            (medianRate(host) ?: 0L) >= (demandBytesPerSecond?.takeIf { it > 0 } ?: Long.MAX_VALUE)
-        val lease = preferredByCluster[clusterKey]
-        if (lease != null && lease.at.elapsedNow() < ROUTE_LEASE) {
-            allCandidates.firstOrNull { it.label == lease.label && usable(it.key) &&
-                (medianRate(it.key) ?: 0L) >= (demandBytesPerSecond?.takeIf { it > 0 } ?: GOOD_RATE_BYTES_PER_SEC) }?.let {
-                return edge.rewrite(url, it)
-            }
-        }
-        val best = siblings
-            .filter { usable(it.key) }
-            .mapNotNull { sibling -> completionSeconds(sibling.key, bytes)?.let { sibling to it } }
-            .minByOrNull { it.second }
-        if (best != null) {
-            val own = completionSeconds(edge.key, bytes)
-            // Require a gain beyond observed variability and a fresh request's setup cost.
-            val ownIsSlow = own != null && own - best.second >
-                uncertaintySeconds(edge.key, bytes) + uncertaintySeconds(best.first.key, bytes) +
-                latencySeconds(best.first.key)
-            if (ownIsSlow || isSilent(edge.key) || isStalled(edge.key)) {
-                rememberPreferred(clusterKey, best.first.label)
-                return edge.rewrite(url, best.first)
-            }
-        } else if (isSilent(edge.key) || isStalled(edge.key)) {
-            // Even before any sibling has accumulated MIN_SAMPLES full completions, a silent or
-            // stalled host yields to a usable observed sibling so retries do not hammer the same
-            // degraded edge node.
-            siblings.firstOrNull { usable(it.key) }?.let { fallback ->
-                return edge.rewrite(url, fallback)
-            }
-        }
-
-        // After the hard lease expires, retain a proven preference for unmeasured links
-        // until another host demonstrates a gain. Rate evidence still ages out with memory.
-        val currentPreferredLabel = preferredByCluster[clusterKey]?.label
-        val currentPreferred = currentPreferredLabel?.let { label ->
-            allCandidates.firstOrNull { it.label == label && usable(it.key) }
-                ?.let { candidate -> completionSeconds(candidate.key, bytes)?.let { candidate to it } }
-        }
-        val preferredEdge = if (currentPreferred != null) {
-            val (preferred, prefTime) = currentPreferred
-            val beatenByBest = best != null && prefTime - best.second >
-                uncertaintySeconds(preferred.key, bytes) + uncertaintySeconds(best.first.key, bytes) +
-                latencySeconds(best.first.key)
-            if (!beatenByBest) preferred else best.first
-        } else {
-            if (currentPreferredLabel != null) {
-                rememberPreferred(clusterKey, null)
-            }
-            allCandidates.firstOrNull { cand ->
-                usable(cand.key) && medianRate(cand.key) != null
-            }
-        }
-        if (preferredEdge != null) {
-            if (preferredEdge.label != edge.label &&
-                (preferredEdge.label != currentPreferredLabel || lease == null || lease.at.elapsedNow() >= ROUTE_LEASE)
-            ) {
-                rememberPreferred(clusterKey, preferredEdge.label)
-            }
-            val own = medianRate(edge.key)
-            if (own == null && recentRates(edge.key).isEmpty()) {
-                return if (preferredEdge.label == edge.label) url else edge.rewrite(url, preferredEdge)
-            }
-        }
-
-        if (!mayExplore || foregroundHungry || viable(edge.key)) return url
-        val measured = (siblings + edge).count { medianRate(it.key) != null }
-        if (measured >= EXPLORE_TARGET) return url
-        // A sibling half measured goes first, or every candidate would stop at one sample and
-        // the family would never reach the target that ends exploring
-        val candidate = siblings
-            .filter {
-                usable(it.key) && recentRates(it.key).size < MIN_SAMPLES
-            }
-            .maxByOrNull { recentRates(it.key).size } ?: return url
-        // Exploration pays one estimated request. More uncertain paths justify earlier sampling;
-        // a stable measured path waits longer, regardless of its absolute throughput.
-        // A long download must not postpone its next observation for the entire
-        // declared range lifetime. Exploration needs only one committed sample.
-        val sampleBytes = minOf(bytes, MIN_SAMPLE_BYTES)
-        val expected = completionSeconds(edge.key, sampleBytes)
-        val uncertainty = uncertaintySeconds(edge.key, sampleBytes)
-        val cooldown = if (expected == null) EXPLORE_INTERVAL else
-            maxOf(EXPLORE_INTERVAL, (expected * (1.0 + expected / uncertainty.coerceAtLeast(expected / 4))).seconds)
-        if (!claimExploreSlot(edge.cluster, cooldown)) return url
-        return edge.rewrite(url, candidate)
-    }
-
-    private fun HealthState.rememberPreferred(cluster: String, label: String?) {
-        health.update { current ->
-            // A route computed before a reset must not restore the old epoch's preference.
-            if (current.epoch != epoch) current else current.copy(
-                preferredByCluster = if (label == null) current.preferredByCluster - cluster else
-                    current.preferredByCluster + (cluster to RouteLease(label, timeSource.markNow())),
-            )
-        }
+        if (usable(edge.key)) return url
+        val candidate = siblingsOf(edge).filter { usable(it.key) && recentRates(it.key).isNotEmpty() }
+            .maxByOrNull { medianRate(it.key) ?: recentRates(it.key).minOrNull() ?: 0L }
+        return candidate?.let { edge.rewrite(url, it) } ?: url
     }
 
     private fun learn(edge: Edge) {
@@ -481,8 +364,6 @@ internal class HostHealth(
 
     private fun HealthState.isStalled(host: String): Boolean = stalls[host]?.let { it.elapsedNow() < memory } == true
 
-    private fun HealthState.isSuspect(host: String): Boolean = suspects[host]?.let { it.elapsedNow() < SUSPECT_WINDOW } == true
-
     private fun HealthState.isRefused(host: String): Boolean = refusals[host]?.let { it.elapsedNow() < memory } == true
 
     /**
@@ -498,31 +379,6 @@ internal class HostHealth(
 
     private fun HealthState.recentRates(host: String): List<Long> =
         rates[host].orEmpty().filter { it.at.elapsedNow() < memory }.map { it.bytesPerSecond }
-
-    private fun HealthState.latencySeconds(host: String): Double {
-        val waits = hostLatencies[host].orEmpty().filter { it.at.elapsedNow() < memory }
-            .map { it.wait.inWholeNanoseconds / 1e9 }.sorted()
-        return if (waits.isEmpty()) 0.0 else waits[(waits.size - 1) / 2]
-    }
-
-    private fun HealthState.completionSeconds(host: String, bytes: Long): Double? =
-        medianRate(host)?.let { latencySeconds(host) + bytes.toDouble() / it }
-
-    private fun HealthState.uncertaintySeconds(host: String, bytes: Long): Double {
-        val samples = recentRates(host)
-        if (samples.isEmpty()) return 0.0
-        val times = samples.map { bytes.toDouble() / it }
-        return (times.maxOrNull()!! - times.minOrNull()!!) / kotlin.math.sqrt(samples.size.toDouble())
-    }
-
-    private fun claimExploreSlot(cluster: String, cooldown: Duration): Boolean {
-        while (true) {
-            val current = lastExplore.value
-            val last = current[cluster]
-            if (last != null && last.elapsedNow() < cooldown) return false
-            if (lastExplore.compareAndSet(current, current + (cluster to timeSource.markNow()))) return true
-        }
-    }
 
     /** A `<cluster>-<number>.<root>` edge host, rerouted only within the same `<cluster>` and `<root>`. */
     private class Edge(val label: String, val family: String, val root: String, val pool: String) {

@@ -112,7 +112,10 @@ class RangeAttempt(
     val host: String? = null,
     /** Consumer wait, excluded from network service measurements. */
     val sinkWait: Duration = Duration.ZERO,
+    /** Why an incomplete attempt ended; cancellation is not evidence of a bad route. */
+    val endReason: EndReason? = null,
 ) {
+    enum class EndReason { Preempted, DemandDeadline, HeaderTimeout, BodyStall, Truncated, TransportFailure }
     val rightCensored: Boolean get() = outcome == Outcome.Cancelled
     val networkDuration: Duration get() = (duration - sinkWait).coerceAtLeast(Duration.ZERO)
 
@@ -280,7 +283,8 @@ internal class RangeAttemptRecorder(
         timeline[slot] += bytes.toLong()
     }
 
-    fun finish(outcome: RangeAttempt.Outcome) = RangeAttempt(
+    fun finish(outcome: RangeAttempt.Outcome, endReason: RangeAttempt.EndReason? = null) = RangeAttempt(
+        endReason = endReason,
         start = start,
         requested = requested,
         delivered = delivered,

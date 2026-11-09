@@ -1,5 +1,6 @@
 package io.github.nihildigit.pikpak.internal
 
+import io.github.nihildigit.pikpak.TransferDemand
 import io.github.nihildigit.pikpak.ApiRequestPriority
 import io.github.nihildigit.pikpak.ErrorCodes
 import io.github.nihildigit.pikpak.PikPakClient
@@ -223,7 +224,10 @@ internal class HttpEngine(
         },
     ) { response ->
         val status = response.status.value
-        if (status == 401 || status == 403) {
+        val cold = response.headers.isColdArchive()
+        val concurrencyRestricted = response.headers.isConcurrencyRestriction()
+        val signatureFault = response.headers.isUrlSignatureError()
+        if (!cold && !concurrencyRestricted && (status == 401 || status == 403 || signatureFault)) {
             throw UrlExpiredException(
                 url = url,
                 httpStatus = status,
@@ -265,7 +269,7 @@ internal class HttpEngine(
         val replayable = method != HttpMethod.Post
         var attempt = 0
         while (true) {
-            if (rateLimited) pikpak.rateLimiter.acquire(currentCoroutineContext()[ApiRequestPriority]?.priority ?: 0)
+            if (rateLimited) pikpak.rateLimiter.acquire(currentCoroutineContext()[ApiRequestPriority]?.priority ?: 0, currentCoroutineContext()[TransferDemand])
             var blockEntered = false
             try {
                 return client.prepareRequest(url) {

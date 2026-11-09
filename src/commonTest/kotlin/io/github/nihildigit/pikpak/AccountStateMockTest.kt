@@ -22,6 +22,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.io.readByteArray
 
 class AccountStateMockTest {
@@ -241,15 +244,15 @@ class AccountStateMockTest {
     @Test
     fun multiAccountSnapshotsAndOptimisticRollbacksStayIsolated() {
         runBlocking {
-            val snapshots = mutableMapOf<String, AccountSnapshot>()
+            val snapshots = MutableStateFlow<Map<String, AccountSnapshot>>(emptyMap())
             val store = object : SessionStore {
                 override suspend fun load(account: String) =
                     Session("tok-$account", "ref-$account", "sub-$account", expiresAt = Long.MAX_VALUE / 2)
                 override suspend fun save(account: String, session: Session) = Unit
                 override suspend fun clear(account: String) = Unit
-                override suspend fun loadAccountSnapshot(account: String): AccountSnapshot? = snapshots[account]
+                override suspend fun loadAccountSnapshot(account: String): AccountSnapshot? = snapshots.value[account]
                 override suspend fun saveAccountSnapshot(account: String, snapshot: AccountSnapshot) {
-                    snapshots[account] = snapshot
+                    snapshots.update { it + (account to snapshot) }
                 }
             }
             val engine = MockEngine { req ->
@@ -278,12 +281,14 @@ class AccountStateMockTest {
             freeClient.getTransferQuota(Duration.ZERO)
             vipClient.getQuota(Duration.ZERO)
             vipClient.getTransferQuota(Duration.ZERO)
-            delay(260.milliseconds)
+            kotlinx.coroutines.withTimeout(5000) {
+                snapshots.first { it["free@x"]?.quota?.quota?.usageBytes == 2_000L && it["vip@x"]?.quota?.quota?.usageBytes == 9_000L }
+            }
 
             assertEquals(true, freeClient.isFreeAccountFlow.value)
             assertEquals(false, vipClient.isFreeAccountFlow.value)
-            assertEquals(2_000L, snapshots["free@x"]?.quota?.quota?.usageBytes)
-            assertEquals(9_000L, snapshots["vip@x"]?.quota?.quota?.usageBytes)
+            assertEquals(2_000L, snapshots.value["free@x"]?.quota?.quota?.usageBytes)
+            assertEquals(9_000L, snapshots.value["vip@x"]?.quota?.quota?.usageBytes)
 
             // Pre-request optimistic trash on freeClient updates live quotaFlow but does NOT pollute persisted snapshot
             val fileA = FileStat(id = "f-free", name = "a.mp4", size = "500", trashed = false)
@@ -291,7 +296,7 @@ class AccountStateMockTest {
             freeClient.noteFilesTrashed(listOf("f-free"))
             assertEquals(1_500L, freeClient.quotaFlow.value?.quota?.usageBytes)
             delay(260.milliseconds)
-            assertEquals(2_000L, snapshots["free@x"]?.quota?.quota?.usageBytes)
+            assertEquals(2_000L, snapshots.value["free@x"]?.quota?.quota?.usageBytes)
 
             // Simulating account switch cancelling in-flight write: revertFiles restores freeClient's live flow
             freeClient.revertFiles(listOf(fileA))

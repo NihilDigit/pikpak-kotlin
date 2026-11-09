@@ -14,6 +14,16 @@ internal class TransportMemoryBudget(bytes: Long) {
     private val state = MutableStateFlow(State(bytes.also { require(it > 0) }))
     internal val revision = MutableStateFlow(0L)
     private val reclaimers = MutableStateFlow<List<() -> Unit>>(emptyList())
+    private val waiters = MutableStateFlow<Map<Any, Int>>(emptyMap())
+
+    internal fun registerWaiter(priority: Int): Any = Any().also { token ->
+        waiters.update { it + (token to priority) }
+    }
+
+    internal fun unregisterWaiter(token: Any) {
+        waiters.update { it - token }
+        revision.update { it + 1 }
+    }
 
     val budgetBytes: Long get() = state.value.budget
     val usedBytes: Long get() = state.value.used
@@ -26,9 +36,10 @@ internal class TransportMemoryBudget(bytes: Long) {
         requestReclaim()
     }
 
-    internal fun tryAcquire(bytes: Long): Boolean {
+    internal fun tryAcquire(bytes: Long, priority: Int = 0): Boolean {
         require(bytes >= 0)
         while (true) {
+            if (waiters.value.values.any { it > priority }) return false
             val old = state.value
             if (bytes > old.budget - old.used) return false
             val used = old.used + bytes
