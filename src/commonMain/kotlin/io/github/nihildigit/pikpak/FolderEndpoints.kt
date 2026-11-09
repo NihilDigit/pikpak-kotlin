@@ -297,15 +297,23 @@ suspend fun PikPakClient.rename(fileId: String, newName: String) = withInteracti
     invalidatePrefetchedDetail()
 }
 
-internal suspend fun PikPakClient.fetchFileDetailLive(fileId: String): FileDetail {
+/** Purpose hint sent on file-detail requests when minting download/streaming links. */
+const val FILE_USAGE_FETCH = "FETCH"
+
+internal suspend fun PikPakClient.fetchFileDetailLive(fileId: String, usage: String? = null): FileDetail {
     if (ownsCdnClient) {
         for (coldUrl in hostHealth.coldClusterUrls()) {
             warmHostIfCold(coldUrl)
         }
     }
+    val query = if (usage.isNullOrBlank()) {
+        mapOf("thumbnail_size" to THUMBNAIL_SIZE)
+    } else {
+        mapOf("thumbnail_size" to THUMBNAIL_SIZE, "usage" to usage)
+    }
     val response = http.request(
         method = HttpMethod.Get,
-        url = buildUrl(DRIVE, "$FILES_PATH/$fileId", mapOf("thumbnail_size" to THUMBNAIL_SIZE)),
+        url = buildUrl(DRIVE, "$FILES_PATH/$fileId", query),
         captchaAction = "GET:/drive/v1/files",
     )
     return json.decodeFromJsonElement(FileDetail.serializer(), response).also { detail ->
@@ -320,18 +328,24 @@ internal suspend fun PikPakClient.fetchFileDetailLive(fileId: String): FileDetai
 /**
  * Returns full file metadata including signed download links. For directory
  * listings prefer [listFiles] — this endpoint is per-id and slower at scale.
+ *
+ * [FILE_USAGE_FETCH] requests a download link but can omit the entire medias list.
+ * Leave usage unset for playback metadata and transcode discovery. FETCH responses
+ * are not interchangeable with full details, including in the prefetch cache.
  */
-suspend fun PikPakClient.getFile(fileId: String): FileDetail = withDefaultApiPriority(ApiRequestPriority.INTERACTIVE) {
-    consumePrefetchedDetail(fileId)?.let { prefetched ->
-        try {
-            return@withDefaultApiPriority prefetched.await()
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            kotlinx.coroutines.currentCoroutineContext().let { ctx ->
-                if (ctx[kotlinx.coroutines.Job]?.isActive == false) throw e
+suspend fun PikPakClient.getFile(fileId: String, usage: String? = null): FileDetail = withDefaultApiPriority(ApiRequestPriority.INTERACTIVE) {
+    if (usage == FILE_USAGE_FETCH) {
+        consumePrefetchedDetail(fileId)?.let { prefetched ->
+            try {
+                return@withDefaultApiPriority prefetched.await()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                kotlinx.coroutines.currentCoroutineContext().let { ctx ->
+                    if (ctx[kotlinx.coroutines.Job]?.isActive == false) throw e
+                }
+            } catch (_: Throwable) {
+                // Fall through to a live request if the background prefetch failed or was cancelled.
             }
-        } catch (_: Throwable) {
-            // Fall through to a live request if the background prefetch failed or was cancelled.
         }
     }
-    fetchFileDetailLive(fileId)
+    fetchFileDetailLive(fileId, usage = usage)
 }

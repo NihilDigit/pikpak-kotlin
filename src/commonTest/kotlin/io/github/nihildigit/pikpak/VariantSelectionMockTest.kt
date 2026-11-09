@@ -26,6 +26,55 @@ import kotlin.time.Duration.Companion.milliseconds
  * both that it does and that a variant which disappeared fails loudly.
  */
 class VariantSelectionMockTest {
+    @Test fun mediaSelectionAndTranscodeRefreshUseFullDetails() = runBlocking<Unit> {
+        val client = clientWith(fileDetail = { detailJson("fresh") }, cdn = { error("no CDN request expected") })
+        try {
+            assertTrue(client.getFile("FID", usage = FILE_USAGE_FETCH).medias.isEmpty())
+            assertEquals("M720", client.resolveVariant("FID", VariantPreference.Resolution("720P")).mediaId)
+            val original = PikPakFileHandle(client, "A".repeat(40), 1024, "test.mkv", initialFileId = "FID")
+            val transcode = client.fileHandle(detail().copy(hash = "A".repeat(40)), mediaId = "M720")
+            try {
+                assertTrue(original.variants().any { it.mediaId == "M720" })
+                val initial = transcode.provideUrl(UrlRequest.Initial)
+                assertEquals("https://cdn/ts720?sig=fresh", transcode.provideUrl(UrlRequest.Expired(initial)))
+            } finally { original.close(); transcode.close() }
+        } finally { client.close() }
+    }
+
+    @Test fun downloadPrefetchCannotSatisfyAFullMetadataRequest() = runBlocking<Unit> {
+        val client = clientWith(cdn = { error("no CDN request expected") })
+        try {
+            client.cacheDownloadDetail("FID", kotlinx.coroutines.CompletableDeferred(detail(medias = emptyList())))
+            assertTrue(client.getFile("FID").medias.any { it.mediaId == "M720" })
+            assertTrue(client.getFile("FID", usage = FILE_USAGE_FETCH).medias.isEmpty())
+        } finally { client.close() }
+    }
+
+    @Test fun originalMediaRefreshPreservesItsMetadataRoute() = runBlocking<Unit> {
+        val initial = detail().copy(hash = "A".repeat(40), medias = listOf(MediaVariant(isOrigin = true,
+            link = DownloadLink("https://cdn/play?sig=old"))))
+        val fresh = initial.copy(medias = initial.medias.map { it.copy(link = DownloadLink("https://cdn/play?sig=new")) })
+        val client = clientWith(fileDetail = { kotlinx.serialization.json.Json.encodeToString(FileDetail.serializer(), fresh) },
+            cdn = { error("no CDN request expected") })
+        val handle = client.fileHandle(initial)
+        try {
+            val previous = handle.provideUrl(UrlRequest.Initial)
+            assertEquals("https://cdn/play?sig=new", handle.provideUrl(UrlRequest.Expired(previous)))
+        } finally { handle.close(); client.close() }
+    }
+
+    @Test fun leasedDetailsIncludeTranscodes() = runBlocking<Unit> {
+        val client = clientWith(cdn = { request ->
+            if (request.url.encodedPath == "/drive/v1/files") {
+                json("""{"upload_type":"UPLOAD_TYPE_RESUMABLE","file":{"id":"FID","kind":"drive#file","phase":"PHASE_TYPE_COMPLETE","size":"1024"}}""")
+            } else json("{}")
+        })
+        try {
+            val leased = client.leaseDetail(ResolvedFile("test.mkv", 1024, "A".repeat(40)))
+            assertTrue(leased.medias.any { it.mediaId == "M720" })
+        } finally { client.close() }
+    }
+
     @Test
     fun `original media wins without changing byte identity and limited or blank links fall back`() {
         val ordinary = DownloadLink("https://cdn/file?ms=5242880")
@@ -254,7 +303,14 @@ class VariantSelectionMockTest {
                 path.endsWith("/v1/shield/captcha/init") -> json("""{"captcha_token":"CAP"}""")
                 path.endsWith("/v1/auth/signin") ->
                     json("""{"access_token":"AT","refresh_token":"RT","sub":"UID","expires_in":3600}""")
-                path.contains("/drive/v1/files/") -> json(fileDetail())
+                path.contains("/drive/v1/files/") -> {
+                    val full = fileDetail()
+                    val body = if (req.url.parameters["usage"] == FILE_USAGE_FETCH) {
+                        val codec = kotlinx.serialization.json.Json
+                        codec.encodeToString(FileDetail.serializer(), codec.decodeFromString(FileDetail.serializer(), full).copy(medias = emptyList()))
+                    } else full
+                    json(body)
+                }
                 else -> cdn(req)
             }
         }

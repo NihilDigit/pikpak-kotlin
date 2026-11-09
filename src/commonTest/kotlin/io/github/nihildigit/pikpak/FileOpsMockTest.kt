@@ -216,7 +216,7 @@ class FileOpsMockTest {
     }
 
     @Test
-    fun `delta follows pages without hiding tombstones and checkpoints first page`() = runBlocking {
+    fun `delta follows pages without hiding tombstones and checkpoints terminal page`() = runBlocking {
         val c = client {
             if ("page_token=" !in it.query)
                 """{"files":[{"id":"A"},{"id":"B","trashed":true}],"sync_time":"FIRST","next_page_token":"NEXT"}"""
@@ -226,7 +226,8 @@ class FileOpsMockTest {
             val result = c.syncFileChanges("SINCE")
             assertEquals(listOf("A", "B"), result.upserted.map { it.id })
             assertEquals(listOf("C"), result.deletedIds)
-            assertEquals("FIRST", result.syncTime)
+            assertEquals("LAST", result.syncTime)
+            assertEquals("FIRST", result.checkpoint.firstSyncTime)
             assertEquals("LAST", result.checkpoint.lastSyncTime)
             assertTrue(sent.all { "with_audit=true" in it.query && "trashed" !in it.query && """"gt":"SINCE"""" in it.query })
         } finally { c.close() }

@@ -446,6 +446,53 @@ class PikPakFileHandleMockTest {
         }
     }
 
+    @Test
+    fun `original file handle requests usage FETCH and parses link speed metadata`() = runBlocking<Unit> {
+        val usages = mutableListOf<String?>()
+        var detailCount = 0
+        val engine = MockEngine { request ->
+            val path = request.url.encodedPath
+            when {
+                path.endsWith("/v1/shield/captcha/init") ->
+                    json("""{"captcha_token":"C","expires_in":300,"url":""}""")
+                path.endsWith("/v1/auth/signin") ->
+                    json("""{"access_token":"AT","refresh_token":"RT","sub":"U","expires_in":3600}""")
+                path == "/drive/v1/about" ->
+                    json("""{"quota":{"limit":"10995116277760","usage":"1"},"user_type":1}""")
+                path.contains("/drive/v1/files/") -> {
+                    usages += request.url.parameters["usage"]
+                    detailCount++
+                    val url = if (detailCount == 1) {
+                        "https://cdn/f1?ms=1048576&th=10485760&x_limited=1"
+                    } else {
+                        "https://cdn/f1?ms=10485760&th=10485760"
+                    }
+                    json(
+                        """{"kind":"drive#file","id":"f1","name":"ep.mkv","size":"1000",
+                            "phase":"PHASE_TYPE_COMPLETE","hash":"${GCID}",
+                            "links":{"application/octet-stream":{"url":"$url","expire":""}}}""",
+                    )
+                }
+                else -> respond("", HttpStatusCode.NotFound, headersOf(HttpHeaders.ContentType, "application/json"))
+            }
+        }
+        val client = PikPakClient("mock@example.com", "pw", sessionStore = InMemorySessionStore(), httpClient = HttpClient(engine))
+        val handle = client.handle()
+        try {
+            client.getQuota()
+            val resolved = handle.provideUrl(UrlRequest.Initial)
+            assertEquals("https://cdn/f1?ms=10485760&th=10485760", resolved, "premium account should remint past x_limited=1")
+            assertEquals<List<String?>>(listOf("FETCH", "FETCH"), usages)
+            val link = DownloadLink(url = resolved)
+            assertEquals(10_485_760L, link.maxSpeedBytesPerSec)
+            assertEquals(10_485_760L, link.thresholdBytes)
+            assertEquals(false, link.isLimited)
+            assertTrue(DownloadLink(url = "https://cdn/f1?x_limited=101").isLimited)
+        } finally {
+            handle.close(); client.close()
+        }
+    }
+
     private companion object {
         const val GCID = "A3C62CB153B61CF265298986AD97EA07A85112DF"
     }

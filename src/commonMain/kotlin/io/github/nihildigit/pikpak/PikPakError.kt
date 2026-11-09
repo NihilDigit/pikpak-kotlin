@@ -51,6 +51,22 @@ open class PikPakException(
     /** First value of [name] (case-insensitive), or null. */
     fun header(name: String): String? = headers[name.lowercase()]?.firstOrNull()
 
+    /** Trimmed value of the CDN `X-Xos-Err-Desc` header, if present. */
+    val xosErrorDescription: String?
+        get() = header("x-xos-err-desc")?.trim()?.takeIf { it.isNotEmpty() }
+
+    /** Trimmed value of the CDN `X-Xos-Storage-Class` header, if present. */
+    val xosStorageClass: String?
+        get() = header("x-xos-storage-class")?.trim()?.takeIf { it.isNotEmpty() }
+
+    /**
+     * Whether the CDN reported a per-URL / per-user / per-IP connection count restriction
+     * or range conflict via `X-Xos-Err-Desc`. Treated as backpressure rather than a dead
+     * signature or broken host.
+     */
+    val isConcurrencyRestriction: Boolean
+        get() = io.github.nihildigit.pikpak.internal.isXosConcurrencyRestriction(xosErrorDescription)
+
     companion object {
         private fun buildMessage(code: Int, message: String, description: String?, http: Int?): String {
             val httpPart = http?.let { " (http=$it)" }.orEmpty()

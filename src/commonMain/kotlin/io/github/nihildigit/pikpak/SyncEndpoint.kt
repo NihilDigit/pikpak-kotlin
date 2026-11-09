@@ -60,8 +60,10 @@ fun PikPakClient.fileChangesPages(sinceSyncTime: String = "", pageSize: Int = 50
 fun PikPakClient.scanFilesPages(pageSize: Int = 500): Flow<FileListPage> = fileChangesPages(pageSize = pageSize)
 
 data class FileSyncCheckpoint(val firstSyncTime: String, val lastSyncTime: String) {
-    /** Replays changes after the first page instead of skipping writes made during traversal. */
-    val syncTime: String get() = firstSyncTime
+    /** Terminal db_modify_time scan watermark; publish only after all pages succeed.
+     * Live pagination with concurrent updates was verified on 2026-11-10 (wiki Measurements).
+     */
+    val syncTime: String get() = lastSyncTime
 }
 
 /** Bounded-memory ingestion. Persist the returned checkpoint only after all page writes succeed. */
@@ -116,12 +118,16 @@ suspend fun PikPakClient.getCurrentSyncTime(sinceSyncTime: String = ""): String 
     consumeFileChanges(sinceSyncTime) {}.lastSyncTime
 
 /** Repeated ids query parameters, not a comma-separated ids value. Missing ids stay missing. */
-suspend fun PikPakClient.batchGetFiles(ids: List<String>): List<FileStat> {
+suspend fun PikPakClient.batchGetFiles(ids: List<String>, usage: String? = null): List<FileStat> {
     require(ids.all { it.isNotBlank() })
     val result = LinkedHashMap<String, FileStat>()
     for (chunk in ids.distinct().chunked(100)) {
+        val params = buildList {
+            for (id in chunk) add("ids" to id)
+            if (!usage.isNullOrBlank()) add("usage" to usage)
+        }
         val raw = http.request(HttpMethod.Get,
-            buildUrl(PikPakConstants.DRIVE_BASE, "/drive/v1/files:batchGet", chunk.map { "ids" to it }),
+            buildUrl(PikPakConstants.DRIVE_BASE, "/drive/v1/files:batchGet", params),
             captchaAction = "GET:/drive/v1/files:batchGet")
         val page = json.decodeFromJsonElement(FileListPage.serializer(), raw)
         accountState.observeFiles(page.files)

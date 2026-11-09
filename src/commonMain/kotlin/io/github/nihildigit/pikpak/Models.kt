@@ -98,9 +98,19 @@ data class DownloadLink(
     /** Raw `expire` field as PikPak sends it. Prefer [expiresAt]. */
     val expire: String = "",
 ) {
-    /** The CDN explicitly marked this signed URL as rate limited. */
+    /** The CDN explicitly marked this signed URL as rate limited (`x_limited=1` or `101`). */
     val isLimited: Boolean
-        get() = io.github.nihildigit.pikpak.internal.signedUrlParameters(url)?.getAll("x_limited")?.contains("1") == true
+        get() = io.github.nihildigit.pikpak.internal.signedUrlParameters(url)
+            ?.getAll("x_limited")
+            ?.any { it == "1" || it == "101" } == true
+
+    /** Per-connection speed limit (`ms` query parameter) in bytes per second, when present in the signed URL. */
+    val maxSpeedBytesPerSec: Long?
+        get() = url.queryParam("ms")?.toLongOrNull()?.takeIf { it > 0L }
+
+    /** Rate-limit burst threshold (`th` query parameter) in bytes, when present in the signed URL. */
+    val thresholdBytes: Long?
+        get() = url.queryParam("th")?.toLongOrNull()?.takeIf { it > 0L }
 
     /**
      * When the signature on [url] stops being accepted, or null when PikPak
