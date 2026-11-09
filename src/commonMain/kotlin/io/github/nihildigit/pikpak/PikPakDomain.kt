@@ -1,15 +1,22 @@
 package io.github.nihildigit.pikpak
 
 import io.github.nihildigit.pikpak.internal.HttpEngine
+import io.github.nihildigit.pikpak.internal.PikPakDnsFallback
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.expectSuccess
 import io.ktor.client.request.get
 import io.ktor.client.request.header
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
+import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
+import io.ktor.http.contentType
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
@@ -159,3 +166,95 @@ private suspend fun HttpClient.gatewayCheck(url: String, timeout: Duration): Gat
 
 /** What both API hosts answer a request without a token, on every root. */
 private const val UNAUTHENTICATED = 16
+
+/** Static DNS mapping for one PikPak host returned by `/config/v1/high_availability`. */
+@Serializable
+data class DnsHostEntry(
+    val domain: String = "",
+    val ip: List<String> = emptyList(),
+    val ipv6: List<String> = emptyList(),
+)
+
+/** High-availability domain and static DNS configuration returned by PikPak's config service. */
+@Serializable
+data class HighAvailabilityConfig(
+    @SerialName("main_domain") val mainDomain: String = "",
+    @SerialName("monitor_domains") val monitorDomains: List<String> = emptyList(),
+    @SerialName("backup_domains") val backupDomains: List<String> = emptyList(),
+    @SerialName("public_network_detection") val publicNetworkDetection: String = "",
+    @SerialName("private_network_detection") val privateNetworkDetection: String = "",
+    val dns: List<DnsHostEntry> = emptyList(),
+)
+
+@Serializable
+private data class HighAvailabilityEnvelope(
+    val result: String = "",
+    val data: HighAvailabilityConfig? = null,
+)
+
+private val HIGH_AVAILABILITY_ORIGINS = listOf(
+    "https://dl.pikpak.io",
+    "https://config.mypikpak.com",
+    "https://config.mypikpak.net",
+    "https://config.pikpak.me",
+)
+
+/**
+ * Fetches PikPak's `/config/v1/high_availability` table across the official config origins
+ * (`dl.pikpak.io`, `config.mypikpak.com`, `config.mypikpak.net`, `config.pikpak.me`) and
+ * updates the process-wide static DNS fallback registry when a valid table is returned.
+ */
+suspend fun PikPakClient.fetchHighAvailabilityConfig(
+    timeoutPerOrigin: Duration = 5.seconds,
+): HighAvailabilityConfig? {
+    for (origin in HIGH_AVAILABILITY_ORIGINS) {
+        val config = try {
+            withTimeout(timeoutPerOrigin) {
+                val response = apiClient.post("$origin/config/v1/high_availability") {
+                    expectSuccess = false
+                    header(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
+                    contentType(ContentType.Application.Json)
+                    setBody("{}")
+                }
+                if (response.status.value !in 200..299) {
+                    null
+                } else {
+                    val envelope = json.decodeFromString(HighAvailabilityEnvelope.serializer(), response.bodyAsText())
+                    envelope.data?.takeIf { envelope.result.equals("ok", ignoreCase = true) || it.dns.isNotEmpty() || it.mainDomain.isNotEmpty() }
+                }
+            }
+        } catch (e: CancellationException) {
+            if (e !is TimeoutCancellationException) throw e
+            null
+        } catch (_: Exception) {
+            null
+        }
+        if (config != null) {
+            PikPakDnsFallback.update(config.dns)
+            return config
+        }
+    }
+    return null
+}
+
+/**
+ * Lightweight zero-body connectivity probe (`GET https://api-drive.<root>/generate_204`)
+ * matching the official client's `private_network_detection` check.
+ */
+suspend fun PikPakClient.probeGateway204(
+    domain: PikPakDomain = this.domain,
+    timeout: Duration = 5.seconds,
+): Boolean = try {
+    withTimeout(timeout) {
+        val response = apiClient.get(domain.apiUrl("${PikPakConstants.DRIVE_BASE}/generate_204")) {
+            expectSuccess = false
+            header(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
+        }
+        response.status.value == 204
+    }
+} catch (e: CancellationException) {
+    if (e !is TimeoutCancellationException) throw e
+    false
+} catch (_: Exception) {
+    false
+}

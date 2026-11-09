@@ -72,6 +72,39 @@ class PikPakDomainMockTest {
         client.close()
     }
 
+    @Test
+    fun `high availability config falls back across origins and updates static dns table`() = runBlocking {
+        io.github.nihildigit.pikpak.internal.PikPakDnsFallback.resetForTest()
+        val client = clientWith { req ->
+            when {
+                req.url.host == "dl.pikpak.io" -> respond(ByteReadChannel(""), HttpStatusCode.BadGateway)
+                req.url.host == "config.mypikpak.com" && req.url.encodedPath == "/config/v1/high_availability" ->
+                    json(
+                        """{"result":"ok","data":{"main_domain":"mypikpak.com","backup_domains":["pickpackapp.com","mypikpak.net"],"private_network_detection":"https://api-drive.mypikpak.com/generate_204","dns":[{"domain":"api-drive.mypikpak.com","ip":["203.0.113.10","203.0.113.11"],"ipv6":[]}]}}""",
+                    )
+                req.url.encodedPath == "/generate_204" -> respond(ByteReadChannel(""), HttpStatusCode.NoContent)
+                else -> respond(ByteReadChannel(""), HttpStatusCode.NotFound)
+            }
+        }
+        try {
+            val config = assertNotNull(client.fetchHighAvailabilityConfig())
+            assertEquals("mypikpak.com", config.mainDomain)
+            assertTrue("pickpackapp.com" in config.backupDomains)
+            assertEquals(
+                listOf("203.0.113.10", "203.0.113.11"),
+                io.github.nihildigit.pikpak.internal.PikPakDnsFallback.lookupIps("api-drive.mypikpak.com"),
+            )
+            assertEquals(
+                listOf("203.0.113.10", "203.0.113.11"),
+                io.github.nihildigit.pikpak.internal.PikPakDnsFallback.lookupIps("api-drive.mypikpak.net"),
+            )
+            assertTrue(client.probeGateway204())
+        } finally {
+            io.github.nihildigit.pikpak.internal.PikPakDnsFallback.resetForTest()
+            client.close()
+        }
+    }
+
     private fun clientWith(handler: suspend MockRequestHandleScope.(HttpRequestData) -> HttpResponseData): PikPakClient =
         PikPakClient(
             account = "mock@x",

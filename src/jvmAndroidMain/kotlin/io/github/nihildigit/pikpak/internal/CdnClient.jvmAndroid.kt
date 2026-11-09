@@ -11,11 +11,14 @@ import okhttp3.Connection
 import okhttp3.ConnectionPool
 import okhttp3.ConnectionSpec
 import okhttp3.Dispatcher
+import okhttp3.Dns
 import okhttp3.EventListener
 import okhttp3.Protocol
 import okhttp3.TlsVersion
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
+import java.net.UnknownHostException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -54,6 +57,7 @@ private fun okHttpApiClient(perHostLimit: Int): HttpClient = HttpClient(OkHttp) 
             // can retry without oversized TLS 1.3 + ML-KEM ClientHello when a
             // mobile TUN/proxy middlebox drops the initial handshake with EOF.
             connectionSpecs(RESILIENT_CONNECTION_SPECS)
+            dns(PikPakOkHttpDns)
             connectionPool(ConnectionPool(perHostLimit.coerceAtLeast(16), 5, TimeUnit.MINUTES))
             dispatcher(
                 Dispatcher().apply {
@@ -101,6 +105,7 @@ private fun okHttpCdnClient(perHostLimit: Int): HttpClient {
                     chain.proceed(chain.request().newBuilder().removeHeader(TELEMETRY_HEADER).build())
                 }
                 connectionSpecs(RESILIENT_CONNECTION_SPECS)
+                dns(PikPakOkHttpDns)
                 // Idle connections survived 90 s in testing, so keeping the pool
                 // warm across seeks is free; sizing it below the budget would make
                 // every read pay a fresh handshake.
@@ -163,4 +168,31 @@ private fun unconfiguredCdnClient(): HttpClient = HttpClient {
         socketTimeoutMillis = CDN_SOCKET_TIMEOUT_MS
     }
     expectSuccess = false
+}
+
+internal object PikPakOkHttpDns : Dns {
+    override fun lookup(hostname: String): List<InetAddress> {
+        val isLocal = hostname.equals("localhost", ignoreCase = true) || hostname == "127.0.0.1" || hostname == "::1"
+        val systemResolved = try {
+            Dns.SYSTEM.lookup(hostname).filterNot { addr ->
+                addr.isAnyLocalAddress || (!isLocal && addr.isLoopbackAddress)
+            }
+        } catch (_: UnknownHostException) {
+            emptyList()
+        }
+        val fallbackIps = PikPakDnsFallback.lookupIps(hostname)
+        if (fallbackIps.isEmpty()) {
+            if (systemResolved.isNotEmpty()) return systemResolved
+            throw UnknownHostException("Unable to resolve host $hostname")
+        }
+        val fallbackAddresses = fallbackIps.mapNotNull { ip ->
+            runCatching {
+                val raw = InetAddress.getByName(ip).address
+                InetAddress.getByAddress(hostname, raw)
+            }.getOrNull()
+        }
+        val combined = (systemResolved + fallbackAddresses).distinctBy { it.hostAddress }
+        if (combined.isNotEmpty()) return combined
+        throw UnknownHostException("Unable to resolve host $hostname")
+    }
 }
