@@ -947,4 +947,54 @@ class BlockCacheStreamingTest {
             assertEquals(0L, cache.cachedBytesForTest())
         } finally { cache.close() }
     }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun `partial slot chunks do not bump schedule revision while waking parked readers`(): Unit = runTest {
+        val channel = ByteChannel(autoFlush = true)
+        val source = object : RangeSource {
+            override suspend fun <T> read(start: Long, length: Long, priority: Int,
+                                         block: suspend (ByteReadChannel) -> T): T = block(channel)
+        }
+        val cache = BlockCache(source, 128, 1, coroutineContext, null,
+            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512)
+        try {
+            val warm = cache.warm(listOf(0L..63L), StreamRole.BACKGROUND, null)
+            runCurrent()
+            val baseRevision = cache.revisionForTest()
+            repeat(8) { step ->
+                channel.writeFully(ByteArray(4) { step.toByte() })
+                runCurrent()
+                assertEquals((step + 1) * 4L, cache.receivedBytes)
+                assertEquals(baseRevision, cache.revisionForTest())
+            }
+            val cursor = cache.openCursor(StreamRole.FOREGROUND)
+            cache.setReadAhead(cursor, 0)
+            cache.seek(cursor, 40)
+            val readBuf = ByteArray(8)
+            val parkedRead = async { cache.read(cursor, readBuf, 0, readBuf.size) }
+            runCurrent()
+            assertFalse(parkedRead.isCompleted)
+            val parkedRevision = cache.revisionForTest()
+            // Bytes 32..35 remain at or below waitingWithin=40: neither schedule nor reader wakes.
+            channel.writeFully(byteArrayOf(5, 5, 5, 5))
+            runCurrent()
+            assertFalse(parkedRead.isCompleted)
+            assertEquals(parkedRevision, cache.revisionForTest())
+            // Bytes 36..43 cross waitingWithin=40: parked reader wakes via readSignal immediately.
+            channel.writeFully(byteArrayOf(6, 6, 6, 6, 7, 7, 7, 7))
+            runCurrent()
+            assertEquals(4, parkedRead.await())
+            assertEquals(listOf<Byte>(7, 7, 7, 7), readBuf.take(4))
+            val prePublishRevision = cache.revisionForTest()
+            channel.writeFully(ByteArray(20) { 9 })
+            channel.close()
+            warm.await()
+            assertEquals(64L, cache.deliveredBytes)
+            assertTrue(cache.revisionForTest() > prePublishRevision)
+        } finally {
+            cache.close()
+            cache.awaitClosedForTest()
+        }
+    }
 }

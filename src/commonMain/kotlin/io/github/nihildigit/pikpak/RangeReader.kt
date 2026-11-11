@@ -21,7 +21,6 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
@@ -37,11 +36,11 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
 
 /** Why [RangeReader] is asking for a URL. */
@@ -284,6 +283,9 @@ class RangeReader internal constructor(
         @Volatile var announced: Long = -1L
         @Volatile var delivered: Long = 0L
         @Volatile var draining: Boolean = false
+        @Volatile var readSeq: Long = 0L
+        @Volatile var activeSilenceNanos: Long = 0L
+        @Volatile var readStartedAt: TimeMark? = null
         fun remainingBytes(): Long = if (announced <= 0L) -1L else (announced - delivered).coerceAtLeast(0L)
     }
 
@@ -367,6 +369,7 @@ class RangeReader internal constructor(
         var rejectionRefreshed = false
         var sizeMismatchRefreshes = 0
         val failedReroutes = HashSet<String>()
+        var chunkBuffer: ByteArray? = null
 
         while ((remaining == null || remaining > 0) && !state.draining) {
             // The link is what refreshes and expiry are about; the attempt may go to a sibling
@@ -456,74 +459,115 @@ class RangeReader internal constructor(
                         announced = stream.contentLength
                         state.announced = announced ?: -1L
                         state.delivered = 0L
+                        state.readSeq = 0L
+                        state.readStartedAt = null
+                        val initialSilence = currentBodySilence()
+                        state.activeSilenceNanos = if (initialSilence.isFinite()) initialSilence.inWholeNanoseconds else Long.MAX_VALUE
                         clippedAtEof = stream.endsBeforeRequested(offset, remaining)
-                        val buffer = ByteArray(READ_CHUNK)
+                        val buffer = chunkBuffer ?: ByteArray(READ_CHUNK).also { chunkBuffer = it }
                         var firstByteAt: TimeMark? = null
-                        while (true) {
-                            val bodySilence = currentBodySilence()
-                            val silenceLimit = bodySilence
-                            val readStarted = timeSource.markNow()
-                            val n = try {
-                                withTimeout(silenceLimit) {
-                                    stream.channel.readAvailable(buffer, 0, buffer.size)
+                        coroutineScope {
+                            val bodyWatchdog = launch {
+                                var observedSeq = state.readSeq
+                                var sleptOnObserved = Duration.ZERO
+                                var nextDelay = currentBodySilence()
+                                while (true) {
+                                    delay(nextDelay)
+                                    val seq1 = state.readSeq
+                                    if (seq1 == observedSeq) {
+                                        sleptOnObserved += nextDelay
+                                    } else {
+                                        observedSeq = seq1
+                                        sleptOnObserved = Duration.ZERO
+                                    }
+                                    if ((seq1 and 1L) == 1L) {
+                                        val limitNanos = state.activeSilenceNanos
+                                        val startedAt = state.readStartedAt
+                                        val deliveredSnap = state.delivered
+                                        val seq2 = state.readSeq
+                                        if (seq1 == seq2) {
+                                            val limit = if (limitNanos == Long.MAX_VALUE) Duration.INFINITE else limitNanos.nanoseconds
+                                            val elapsed = startedAt?.elapsedNow() ?: Duration.ZERO
+                                            if (elapsed >= limit || sleptOnObserved >= limit) {
+                                                throw BodySilence(limit, deliveredSnap)
+                                            }
+                                            nextDelay = (limit - maxOf(elapsed, sleptOnObserved)).coerceAtLeast(1.milliseconds)
+                                            continue
+                                        }
+                                    }
+                                    observedSeq = state.readSeq
+                                    sleptOnObserved = Duration.ZERO
+                                    nextDelay = currentBodySilence()
                                 }
-                            } catch (e: TimeoutCancellationException) {
-                                throw BodySilence(silenceLimit, delivered)
                             }
-                            if (n == -1) {
-                                if (announced == null || delivered >= announced!!) {
-                                    client.hostHealth.onSocketReturned(attemptUrl)
-                                }
-                                break
-                            }
-                            if (n > 0) {
-                                val readElapsed = readStarted.elapsedNow()
-                                if (firstByteAt == null) firstByteAt = timeSource.markNow()
-                                if (announced != null && n.toLong() > announced!! - delivered) {
-                                    throw PikPakException(-1, "RangeReader: body exceeds Content-Range")
-                                }
-                                attempt.record(n)
-                                if (telemetry != null && telemetry.timeToFirstByte == null) {
-                                    telemetry.timeToFirstByte = started?.elapsedNow()?.minus(attempt.gateWait)
-                                }
-                                telemetry?.recordBytes(n)
-                                addBytes(n.toLong())
-                                delivered += n
-                                state.delivered = delivered
-                                if (!state.draining) {
-                                    val sinkStarted = timeSource.markNow()
-                                    telemetry?.beginSinkWait()
-                                    try {
-                                        if (sink.isClosedForWrite) throw sink.closedCause
-                                            ?: IllegalStateException("consumer channel closed before draining")
-                                        sink.writeFully(buffer, 0, n)
-                                        sink.flush()
-                                    } catch (e: CancellationException) {
-                                        if (!state.draining && currentCoroutineContext().isActive) throw SinkFailure(e)
-                                        throw e
-                                    } catch (t: Throwable) {
-                                        if (!state.draining) throw SinkFailure(t)
+                            try {
+                                while (true) {
+                                    val bodySilence = currentBodySilence()
+                                    state.activeSilenceNanos = if (bodySilence.isFinite()) bodySilence.inWholeNanoseconds else Long.MAX_VALUE
+                                    state.readStartedAt = timeSource.markNow()
+                                    state.readSeq += 1L
+                                    val n = try {
+                                        stream.channel.readAvailable(buffer, 0, buffer.size)
                                     } finally {
-                                        telemetry?.endSinkWait()
-                                        val waited = sinkStarted.elapsedNow()
-                                        attempt.recordSinkWait(waited)
-                                        if (telemetry != null) telemetry.sinkWait += waited
+                                        state.readSeq += 1L
+                                    }
+                                    if (n == -1) {
+                                        if (announced == null || delivered >= announced!!) {
+                                            client.hostHealth.onSocketReturned(attemptUrl)
+                                        }
+                                        break
+                                    }
+                                    if (n > 0) {
+                                        if (firstByteAt == null) firstByteAt = timeSource.markNow()
+                                        if (announced != null && n.toLong() > announced!! - delivered) {
+                                            throw PikPakException(-1, "RangeReader: body exceeds Content-Range")
+                                        }
+                                        attempt.record(n)
+                                        if (telemetry != null && telemetry.timeToFirstByte == null) {
+                                            telemetry.timeToFirstByte = started?.elapsedNow()?.minus(attempt.gateWait)
+                                        }
+                                        telemetry?.recordBytes(n)
+                                        addBytes(n.toLong())
+                                        delivered += n
+                                        state.delivered = delivered
+                                        if (!state.draining) {
+                                            val sinkStarted = timeSource.markNow()
+                                            telemetry?.beginSinkWait()
+                                            try {
+                                                if (sink.isClosedForWrite) throw sink.closedCause
+                                                    ?: IllegalStateException("consumer channel closed before draining")
+                                                sink.writeFully(buffer, 0, n)
+                                                sink.flush()
+                                            } catch (e: CancellationException) {
+                                                if (!state.draining && currentCoroutineContext().isActive) throw SinkFailure(e)
+                                                throw e
+                                            } catch (t: Throwable) {
+                                                if (!state.draining) throw SinkFailure(t)
+                                            } finally {
+                                                telemetry?.endSinkWait()
+                                                val waited = sinkStarted.elapsedNow()
+                                                attempt.recordSinkWait(waited)
+                                                if (telemetry != null) telemetry.sinkWait += waited
+                                            }
+                                        }
+                                        // A throttled "drip" edge sending a few KiB every 1–2 s resets per-read
+                                        // bodySilence forever and drags a 256 KiB block to 9+ s. Cut over once
+                                        // bodySilence has elapsed below viable rate on an unproven host.
+                                        val bodyElapsed = (firstByteAt.elapsedNow() - attempt.sinkWait).coerceAtLeast(Duration.ZERO)
+                                        if (announced == null || delivered < announced!!) {
+                                            val bodyRate = attempt.bodyBytesPerSecond()
+                                            onBodyProgress?.invoke(bodyElapsed, bodyRate)
+                                            if (bodyElapsed >= bodySilence &&
+                                                tailSilenceDeadline(bodySilence, delivered, announced) == bodySilence &&
+                                                bodyRate < MIN_VIABLE_BODY_BYTES_PER_SEC
+                                            ) {
+                                                throw BodySilence(bodySilence, delivered)
+                                            }
+                                        }
                                     }
                                 }
-                                // A throttled "drip" edge sending a few KiB every 1–2 s resets per-read
-                                // bodySilence forever and drags a 256 KiB block to 9+ s. Cut over once
-                                // bodySilence has elapsed below viable rate on an unproven host.
-                                val bodyElapsed = (firstByteAt.elapsedNow() - attempt.sinkWait).coerceAtLeast(Duration.ZERO)
-                                if (announced == null || delivered < announced!!) {
-                                    val bodyRate = attempt.bodyBytesPerSecond()
-                                    onBodyProgress?.invoke(bodyElapsed, bodyRate)
-                                    if (bodyElapsed >= bodySilence &&
-                                        tailSilenceDeadline(bodySilence, delivered, announced) == bodySilence &&
-                                        bodyRate < MIN_VIABLE_BODY_BYTES_PER_SEC
-                                    ) {
-                                        throw BodySilence(bodySilence, delivered)
-                                    }
-                                }
+                            } finally {
+                                bodyWatchdog.cancel()
                             }
                         }
                     }

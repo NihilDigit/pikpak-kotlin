@@ -26,7 +26,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
@@ -115,6 +115,7 @@ internal class BlockCache(
     private val adaptiveSource = source as? AdaptiveRangeSource
     private val memoryBudget = memoryBudget ?: TransportMemoryBudget(memoryCapBytes)
     private val owned = HashMap<ByteArray, Long>()
+    private var ownedBytes = 0L
     // Guarded by mutex. Additions and LRU hits cannot orphan an owned array.
     private var ownershipDirty = false
     private var ownershipSweeps = 0L
@@ -122,7 +123,12 @@ internal class BlockCache(
     private val reclaim: () -> Unit = {
         scope.launch {
             locked {
-                val protected = cursors.value.filter { it.reading }.map { slotOf(it.position) }.toSet()
+                val protected = HashSet<Int>()
+                val allCursors = cursors.value
+                for (i in 0 until allCursors.size) {
+                    val c = allCursors[i]
+                    if (c.reading) protected.add(slotOf(c.position))
+                }
                 val victims = cache.keys.filter { it !in protected && it !in persisting }
                 for (slot in victims) evict(slot)
                 for (slot in partials.keys.toList()) if (slot !in protected && slot !in inFlight) {
@@ -159,13 +165,35 @@ internal class BlockCache(
 
     /** Range ownership is revocable and independent of resident buffer ownership. */
     private inner class FlightIndex {
-        operator fun get(slot: Int): Fetch? = activeFetches.firstOrNull { !it.released && slot in it.slots }
+        operator fun get(slot: Int): Fetch? {
+            for (i in 0 until activeFetches.size) {
+                val fetch = activeFetches[i]
+                if (!fetch.released && fetch.containsSlot(slot)) return fetch
+            }
+            return null
+        }
         operator fun contains(slot: Int): Boolean = get(slot) != null
-        fun isNotEmpty(): Boolean = activeFetches.any { !it.released && it.nextSlot < it.endSlot }
-        val size: Int get() = activeFetches.filter { !it.released }.sumOf { (it.endSlot - it.nextSlot).coerceAtLeast(0) }
+        fun isNotEmpty(): Boolean {
+            for (i in 0 until activeFetches.size) {
+                val fetch = activeFetches[i]
+                if (!fetch.released && fetch.nextSlot < fetch.endSlot) return true
+            }
+            return false
+        }
+        val size: Int
+            get() {
+                var total = 0
+                for (i in 0 until activeFetches.size) {
+                    val fetch = activeFetches[i]
+                    if (!fetch.released && fetch.endSlot > fetch.nextSlot) {
+                        total += fetch.endSlot - fetch.nextSlot
+                    }
+                }
+                return total
+            }
     }
     // Stable admission order breaks equal-tail ties without identity-hash randomness.
-    private val activeFetches = linkedSetOf<Fetch>()
+    private val activeFetches = ArrayList<Fetch>()
     private var pendingPersistBytes = 0L
     private var hungry = false
     private var wasAccountHungry = false
@@ -223,18 +251,46 @@ internal class BlockCache(
     @Volatile
     private var foregroundWarms = 0
 
-    /**
-     * Bumped whenever a worker or a reader could have new work to see. Waiters park on it so
-     * they cannot miss a wake-up landing between their check and their suspend.
-     */
-    private val revision = MutableStateFlow(0L)
+    private class RevisionSignal {
+        val flow = MutableStateFlow(0L)
+        private val waiter = MutableStateFlow<CompletableDeferred<Unit>?>(null)
+
+        val value: Long get() = flow.value
+
+        fun bump() {
+            flow.update { it + 1 }
+            waiter.getAndUpdate { null }?.complete(Unit)
+        }
+
+        suspend fun awaitChange(seen: Long) {
+            while (flow.value == seen) {
+                val current = waiter.value ?: CompletableDeferred<Unit>().let { created ->
+                    if (waiter.compareAndSet(null, created)) created else waiter.value
+                }
+                if (flow.value != seen) return
+                current?.await()
+            }
+        }
+    }
 
     /**
-     * Bumped whenever a read ends, for [watchForegroundIdle] alone. A read that stays inside one
-     * block changes nothing the workers care about, so it does not bump [revision]; waking every
-     * worker for each of a player's small reads to tell one watcher would cost more than this.
+     * Bumped whenever scheduling state, demand, or whole-slot state changes. Mid-slot TCP
+     * chunks do not bump [revision], avoiding waking parked workers and schedule reconcilers
+     * on every socket segment; readers parked on an in-flight slot wait on [readSignal].
      */
-    private val readsEnded = MutableStateFlow(0L)
+    private val revision = RevisionSignal()
+
+    /**
+     * Bumped on every [revision] change and selectively on mid-slot partial growth when an
+     * active [Cursor] in [awaitSlot] is waiting past its current offset in that slot.
+     */
+    private val readSignal = RevisionSignal()
+
+    /**
+     * Bumped whenever cursor foreground state or a foreground read's completion may start or
+     * refresh the idle countdown in [watchForegroundIdle].
+     */
+    private val idleSignal = RevisionSignal()
 
     @Volatile
     var closed = false
@@ -311,7 +367,21 @@ internal class BlockCache(
             }
         }
         val size: Int = ends.lastOrNull() ?: 0
-        operator fun contains(slot: Int): Boolean = ranges.any { slot in it }
+        operator fun contains(slot: Int): Boolean {
+            for (i in 0 until ranges.size) {
+                val range = ranges[i]
+                if (slot >= range.first && slot <= range.last) return true
+            }
+            return false
+        }
+        fun overlaps(first: Int, lastInclusive: Int): Boolean {
+            if (first > lastInclusive) return false
+            for (i in 0 until ranges.size) {
+                val range = ranges[i]
+                if (first <= range.last && lastInclusive >= range.first) return true
+            }
+            return false
+        }
         operator fun get(index: Int): Int {
             require(index in 0 until size)
             var low = 0
@@ -332,14 +402,93 @@ internal class BlockCache(
         var next = 0
     }
 
+    private fun wantsSlot(want: Want, slot: Int): Boolean =
+        slot !in want.completed && (!want.durable || slot !in durableDone) && slot in want.slots
+
     private inner class Wanted {
-        operator fun get(slot: Int): List<Want>? = wants.filter {
-            slot in it.slots && slot !in it.completed && (!it.durable || slot !in durableDone)
-        }.takeIf { it.isNotEmpty() }
-        fun getValue(slot: Int): List<Want> = get(slot) ?: error("unclaimed slot")
-        operator fun contains(slot: Int): Boolean = get(slot) != null
-        fun isNotEmpty(): Boolean = wants.any { it.next < it.slots.size }
-        fun remove(slot: Int): List<Want>? = get(slot)?.also { claims -> claims.forEach { it.completed += slot } }
+        fun claims(want: Want, slot: Int): Boolean = wantsSlot(want, slot)
+
+        operator fun contains(slot: Int): Boolean {
+            val list = wants
+            for (i in 0 until list.size) {
+                if (wantsSlot(list[i], slot)) return true
+            }
+            return false
+        }
+
+        fun overlapsRange(first: Int, lastExclusive: Int): Boolean {
+            if (first >= lastExclusive) return false
+            val list = wants
+            val lastInclusive = lastExclusive - 1
+            for (i in 0 until list.size) {
+                val want = list[i]
+                if (!want.slots.overlaps(first, lastInclusive)) continue
+                for (slot in first until lastExclusive) {
+                    if (wantsSlot(want, slot)) return true
+                }
+            }
+            return false
+        }
+
+        fun maxPriority(slot: Int): Int {
+            val list = wants
+            var best = Int.MIN_VALUE
+            for (i in 0 until list.size) {
+                val want = list[i]
+                if (wantsSlot(want, slot)) {
+                    val p = want.priority
+                    if (p > best) best = p
+                }
+            }
+            return best
+        }
+
+        fun strongestOrNull(slot: Int, durableOnly: Boolean = false): Want? {
+            val list = wants
+            var best: Want? = null
+            for (i in 0 until list.size) {
+                val want = list[i]
+                if ((durableOnly && !want.durable) || !wantsSlot(want, slot)) continue
+                if (best == null || outranks(want, best)) best = want
+            }
+            return best
+        }
+
+        fun hasDurable(slot: Int): Boolean {
+            val list = wants
+            for (i in 0 until list.size) {
+                val want = list[i]
+                if (want.durable && wantsSlot(want, slot)) return true
+            }
+            return false
+        }
+
+        fun allDurable(slot: Int): Boolean {
+            val list = wants
+            var any = false
+            for (i in 0 until list.size) {
+                val want = list[i]
+                if (wantsSlot(want, slot)) {
+                    if (!want.durable) return false
+                    any = true
+                }
+            }
+            return any
+        }
+
+        /** Marks [slot] completed in every claiming [Want] and returns bitmask: 1 = any, 2 = durable, 4 = non-durable. */
+        fun completeSlot(slot: Int): Int {
+            val list = wants
+            var mask = 0
+            for (i in 0 until list.size) {
+                val want = list[i]
+                if (wantsSlot(want, slot)) {
+                    want.completed += slot
+                    mask = mask or 1 or (if (want.durable) 2 else 4)
+                }
+            }
+            return mask
+        }
     }
 
     private class StoreWrite(val slot: Int, val offset: Long, val bytes: ByteArray) {
@@ -397,6 +546,13 @@ internal class BlockCache(
         @Volatile
         internal var reading = false
 
+        /** Slot index and intra-slot byte offset [awaitSlot] is currently waiting past, or -1. */
+        @Volatile
+        internal var waitingSlot: Int = -1
+
+        @Volatile
+        internal var waitingWithin: Int = 0
+
         @Volatile
         internal var seeking = true
 
@@ -446,6 +602,7 @@ internal class BlockCache(
             adaptiveSource?.updateConnectionAllowance(0)
             registration?.let { scheduler?.unregister(it) }
             syncForegroundCount()
+            idleSignal.bump()
             bump()
         }
         this.memoryBudget.register(reclaim)
@@ -486,12 +643,17 @@ internal class BlockCache(
         // than re-entering scheduler.update or the lazy registration from its callback.
         if (adaptiveSource != null || scheduler != null) {
             scope.launch {
-                revision.collect { locked { updateSchedule(liveCursors()) } }
+                revision.flow.collect { locked { updateSchedule(liveCursors()) } }
             }
         }
         if (adaptiveSource != null) {
             scope.launch {
                 adaptiveSource.connectionLimit.collect { workerLimitChanged() }
+            }
+        }
+        if (scheduler == null && foregroundStreams != null) {
+            scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                foregroundStreams.active.collect { bump() }
             }
         }
         repeat(concurrency) { index -> scope.launch { runWorker(index) } }
@@ -550,6 +712,7 @@ internal class BlockCache(
         val cursor = Cursor(role)
         cursors.update { it + cursor }
         syncForegroundCount()
+        idleSignal.bump()
         bump()
         return cursor
     }
@@ -563,6 +726,7 @@ internal class BlockCache(
         cursors.update { it - cursor }
         syncForegroundCount()
         if (!closed) scope.launch { cancelUnwanted() }
+        idleSignal.bump()
         bump()
     }
 
@@ -571,6 +735,7 @@ internal class BlockCache(
         cursor.demandActive = active
         syncForegroundCount()
         if (!active && !closed) scope.launch { cancelUnwanted() }
+        idleSignal.bump()
         bump()
     }
 
@@ -578,6 +743,7 @@ internal class BlockCache(
         if (cursor.role == role) return
         cursor.role = role
         syncForegroundCount()
+        idleSignal.bump()
         bump()
     }
 
@@ -588,8 +754,9 @@ internal class BlockCache(
             cursor.headHysteresis = true
         }
         cursor.demandWatch = demand?.let { owner -> scope.launch {
-            owner.changes.collect { if (owner.isClosed) closeCursor(cursor) else { syncForegroundCount(); bump() } }
+            owner.changes.collect { if (owner.isClosed) closeCursor(cursor) else { syncForegroundCount(); idleSignal.bump(); bump() } }
         } }
+        idleSignal.bump()
         bump()
     }
 
@@ -630,6 +797,7 @@ internal class BlockCache(
         val previous = cursor.readAhead
         cursor.readAhead = bytes.coerceIn(0, readAheadBytes)
         if (cursor.readAhead < previous && !closed) scope.launch { cancelUnwanted(); syncForegroundCount() }
+        idleSignal.bump()
         bump()
     }
 
@@ -655,6 +823,7 @@ internal class BlockCache(
             cursor.headSequentialBytes = -1L
         }
         cancelUnwanted()
+        idleSignal.bump()
         bump()
     }
 
@@ -699,7 +868,7 @@ internal class BlockCache(
         } finally {
             cursor.reading = false
             cursor.lastActive = timeSource.markNow()
-            readsEnded.update { it + 1 }
+            if (cursor.effectiveRole == StreamRole.FOREGROUND) idleSignal.bump()
             syncForegroundCount()
             if (!cursor.demandActive && !closed) scope.launch { cancelUnwanted() }
             if (cursor.readAhead == 0L || !cursor.demandActive) bump()
@@ -717,11 +886,11 @@ internal class BlockCache(
             cursor.seeking = false
             bump()
         }
-        val previousWindowEnd = windowOf(cursor).last
+        val previousWindowEnd = windowLast(packedWindowOf(cursor))
         cursor.position = pos + available
         // Advancing the head can free a block; advancing the tail can expose a missing
         // block even when a small cached read stays inside the same head block.
-        if (slotOf(cursor.position) != slot || windowOf(cursor).last != previousWindowEnd) {
+        if (slotOf(cursor.position) != slot || windowLast(packedWindowOf(cursor)) != previousWindowEnd) {
             bump()
         }
         return available
@@ -869,8 +1038,8 @@ internal class BlockCache(
                 val bytes = offered[slot] ?: return@locked null
                 val accounted = slot !in cache
                 if (accounted) {
-                    val windows = liveCursors().map(::windowOf)
-                    val victims = cache.keys.filter { it !in persisting && windows.none { window -> it in window } }
+                    val live = liveCursors()
+                    val victims = cache.keys.filter { it !in persisting && !isSlotInWindows(live, it) }
                     val free = memoryCapBytes - cachedBytes - inFlightBytes() - pendingPersistBytes
                     if (free + victims.sumOf { cache.getValue(it).size.toLong() } < bytes.size) {
                         waiting = true
@@ -884,12 +1053,12 @@ internal class BlockCache(
                 }
                 PersistTask(slot, bytes, accounted, optionalWrites[slot]).also {
                     persisting[slot] = it
-                    wanted.remove(slot)
+                    wanted.completeSlot(slot)
                     bump()
                 }
             }
             if (!waiting) return task
-            revision.first { it != seen }
+            revision.awaitChange(seen)
         }
     }
 
@@ -900,6 +1069,7 @@ internal class BlockCache(
         registration?.let { scheduler?.unregister(it) }
         syncForegroundCount()
         scope.cancel()
+        idleSignal.bump()
         bump()
     }
 
@@ -911,12 +1081,19 @@ internal class BlockCache(
     private fun outranks(a: Want, b: Want): Boolean =
         a.priority > b.priority || (a.priority == b.priority && a.order < b.order)
 
-    /** The request that decides when a slot several warms want is fetched. */
-    private fun strongest(wants: List<Want>): Want = wants.reduce { best, next -> if (outranks(next, best)) next else best }
-
-    private fun hasForegroundDemand(): Boolean =
-        cursors.value.any { it.effectiveRole == StreamRole.FOREGROUND && isActive(it) } ||
-            wants.any { !it.durable && it.priority >= PikPakStreamReader.STREAMING_PRIORITY }
+    private fun hasForegroundDemand(): Boolean {
+        val allCursors = cursors.value
+        for (i in 0 until allCursors.size) {
+            val c = allCursors[i]
+            if (c.effectiveRole == StreamRole.FOREGROUND && isActive(c)) return true
+        }
+        val allWants = wants
+        for (i in 0 until allWants.size) {
+            val w = allWants[i]
+            if (!w.durable && w.priority >= PikPakStreamReader.STREAMING_PRIORITY) return true
+        }
+        return false
+    }
 
     private fun isActive(cursor: Cursor): Boolean =
         !cursor.closed && (cursor.reading || (cursor.demandActive && cursor.readAhead > 0L && cursor.lastActive.elapsedNow() < foregroundIdle))
@@ -927,6 +1104,7 @@ internal class BlockCache(
         cursor.lastActive = timeSource.markNow()
         if (!wasActive && cursor.effectiveRole == StreamRole.FOREGROUND) {
             syncForegroundCount()
+            idleSignal.bump()
             bump()
         }
     }
@@ -937,15 +1115,21 @@ internal class BlockCache(
      */
     private suspend fun watchForegroundIdle() {
         while (currentCoroutineContext().isActive) {
-            val seen = revision.value to readsEnded.value
-            val nextIdle = cursors.value
-                .filter { it.effectiveRole == StreamRole.FOREGROUND && !it.closed && !it.reading }
-                .map { foregroundIdle - it.lastActive.elapsedNow() }
-                .filter { it.isPositive() }
-                .minOrNull()
+            val seen = idleSignal.value
+            var nextIdle: Duration? = null
+            val allCursors = cursors.value
+            for (i in 0 until allCursors.size) {
+                val c = allCursors[i]
+                if (c.effectiveRole == StreamRole.FOREGROUND && !c.closed && !c.reading) {
+                    val remaining = foregroundIdle - c.lastActive.elapsedNow()
+                    if (remaining.isPositive() && (nextIdle == null || remaining < nextIdle)) {
+                        nextIdle = remaining
+                    }
+                }
+            }
             if (nextIdle == null) {
                 syncForegroundCount()
-                combine(revision, readsEnded) { r, e -> r to e }.first { it != seen }
+                idleSignal.awaitChange(seen)
                 continue
             }
             delay(nextIdle)
@@ -996,50 +1180,102 @@ internal class BlockCache(
             minOf(capacity, if (scheduler?.isAccountHungry() == true) 1 else 2) else capacity
     }
 
+    private fun pendingCursor(cursor: Cursor): Boolean {
+        if (cursor.reading) return true
+        val win = packedWindowOf(cursor)
+        if (isWindowEmpty(win)) return false
+        for (slot in windowFirst(win)..windowLast(win)) {
+            if (slot !in cache && slot !in offered && slot !in failed && slot !in persisting) return true
+        }
+        return false
+    }
+
     private fun updateSchedule(live: List<Cursor>) {
-        val foreground = live.filter { it.effectiveRole == StreamRole.FOREGROUND && isActive(it) }
-        for (cursor in foreground) {
-            val runway = cursor.feedbackAt?.let { cursor.bufferedDuration - it.elapsedNow() }
-            cursor.hungry = cursor.urgent || (cursor.demand?.priority ?: 0) >= PikPakStreamReader.BLOCKING_PRIORITY || if (runway != null) runway <= Duration.ZERO
-                else cursor.reading && slotOf(cursor.position) !in cache
+        var anyForegroundActive = false
+        var anyForegroundHungry = false
+        var anyForegroundUrgent = false
+        var anyForegroundNotSeeking = false
+        var anyPendingCursor = false
+        var anyBackgroundPendingCursor = false
+        for (i in 0 until live.size) {
+            val cursor = live[i]
+            val isFgActive = cursor.effectiveRole == StreamRole.FOREGROUND && isActive(cursor)
+            if (isFgActive) {
+                anyForegroundActive = true
+                val isUrgent = cursor.urgent || (cursor.demand?.priority ?: 0) >= PikPakStreamReader.BLOCKING_PRIORITY
+                val runway = cursor.feedbackAt?.let { cursor.bufferedDuration - it.elapsedNow() }
+                cursor.hungry = isUrgent || if (runway != null) runway <= Duration.ZERO
+                    else cursor.reading && slotOf(cursor.position) !in cache
+                if (cursor.hungry) anyForegroundHungry = true
+                if (isUrgent) anyForegroundUrgent = true
+                if (!cursor.seeking) anyForegroundNotSeeking = true
+            }
+            if (!anyPendingCursor || (!anyBackgroundPendingCursor && cursor.effectiveRole == StreamRole.BACKGROUND)) {
+                if (pendingCursor(cursor)) {
+                    anyPendingCursor = true
+                    if (cursor.effectiveRole == StreamRole.BACKGROUND) anyBackgroundPendingCursor = true
+                }
+            }
         }
-        val requiredWarm = wants.any { !it.durable && it.priority >= PikPakStreamReader.STREAMING_PRIORITY }
-        hungry = foreground.any { it.hungry } || requiredWarm
-        val pendingWarm = wants.any { nextClaimable(it) != null } ||
-            activeFetches.any { fetch -> !fetch.cancelled && !fetch.released && fetch.slots.any { it in wanted } }
-        fun pendingCursor(cursor: Cursor): Boolean = cursor.reading || windowOf(cursor).any { slot ->
-            slot !in cache && slot !in offered && slot !in failed && slot !in persisting
+        val allWants = wants
+        var requiredWarm = false
+        var urgentWarm = false
+        var backgroundWarm = false
+        var pendingWarm = false
+        for (i in 0 until allWants.size) {
+            val want = allWants[i]
+            val p = want.priority
+            if (!want.durable && p >= PikPakStreamReader.STREAMING_PRIORITY) requiredWarm = true
+            if (!want.durable && p >= PikPakStreamReader.BLOCKING_PRIORITY) urgentWarm = true
+            if (want.durable || want.role == StreamRole.BACKGROUND) backgroundWarm = true
+            if (!pendingWarm && nextClaimable(want) != null) pendingWarm = true
         }
-        val hasDemand = !closed && (pendingWarm || live.any(::pendingCursor))
-        val urgent = (foreground.any { it.urgent || (it.demand?.priority ?: 0) >= PikPakStreamReader.BLOCKING_PRIORITY } ||
-            wants.any { !it.durable && it.priority >= PikPakStreamReader.BLOCKING_PRIORITY }) && hasDemand
+        if (!pendingWarm) {
+            for (i in 0 until activeFetches.size) {
+                val fetch = activeFetches[i]
+                if (!fetch.cancelled && !fetch.released && wanted.overlapsRange(fetch.nextSlot, fetch.endSlot)) {
+                    pendingWarm = true
+                    break
+                }
+            }
+        }
+        hungry = anyForegroundHungry || requiredWarm
+        val hasDemand = !closed && (pendingWarm || anyPendingCursor)
+        val urgent = (anyForegroundUrgent || urgentWarm) && hasDemand
         registration?.let { scheduler!!.reportDemand(it, io.github.nihildigit.pikpak.internal.CacheDemand(
-            foreground = (foreground.isNotEmpty() || requiredWarm) && hasDemand,
+            foreground = (anyForegroundActive || requiredWarm) && hasDemand,
             warm = !closed && foregroundWarms > 0 && pendingWarm,
             hungry = hungry && hasDemand,
             urgent = urgent,
-            background = hasDemand && (wants.any { want ->
-                want.durable || want.role == StreamRole.BACKGROUND
-            } || live.any { it.effectiveRole == StreamRole.BACKGROUND && pendingCursor(it) }),
+            background = hasDemand && (backgroundWarm || anyBackgroundPendingCursor),
         )) }
         adaptiveSource?.updateConnectionAllowance(if (hasDemand) {
             registration?.let { scheduler!!.connectionAllowanceFor(it) } ?: concurrency
         } else 0)
         val accountHungry = scheduler?.isAccountHungry() ?: hungry
-        val minActivePriority = if (foreground.any { !it.seeking }) {
+        val minActivePriority = if (anyForegroundNotSeeking) {
             PikPakStreamReader.READ_AHEAD_PRIORITY
         } else {
             PikPakStreamReader.STREAMING_PRIORITY
         }
-        for (fetch in activeFetches) {
-            val heads = live.filter { it.reading && slotOf(it.position) == fetch.nextSlot }
-            val priority = maxOf(live.filter { fetch.nextSlot in windowOf(it) }
-                .maxOfOrNull { priorityFor(it, fetch.nextSlot) } ?: Int.MIN_VALUE,
-                wanted[fetch.nextSlot]?.maxOfOrNull { it.priority } ?: Int.MIN_VALUE)
+        for (i in 0 until activeFetches.size) {
+            val fetch = activeFetches[i]
+            val nextSlot = fetch.nextSlot
+            var hasReadingHead = false
+            var maxCursorPriority = Int.MIN_VALUE
+            for (j in 0 until live.size) {
+                val c = live[j]
+                if (c.reading && slotOf(c.position) == nextSlot) hasReadingHead = true
+                if (windowContains(packedWindowOf(c), nextSlot)) {
+                    val p = priorityFor(c, nextSlot)
+                    if (p > maxCursorPriority) maxCursorPriority = p
+                }
+            }
+            val priority = maxOf(maxCursorPriority, wanted.maxPriority(nextSlot))
             fetch.demand.updatePriority(priority)
-            if (accountHungry && fetch.durable && heads.isNotEmpty()) {
+            if (accountHungry && fetch.durable && hasReadingHead) {
                 // Inherit the useful head, but do not carry its priority into the remaining download.
-                fetch.endSlot = fetch.nextSlot + 1
+                fetch.endSlot = nextSlot + 1
             }
             if (scheduler != null && accountHungry && priority < minActivePriority) {
                 fetch.cancelled = true
@@ -1047,7 +1283,6 @@ internal class BlockCache(
             }
         }
         wasAccountHungry = accountHungry
-
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -1066,70 +1301,89 @@ internal class BlockCache(
                                   destination: ByteArray, offset: Int, length: Int): Int {
         var firstPass = true
         var retried = false
-        while (true) {
-            checkOpen(cursor)
-            var seen = 0L
-            var failure: Throwable? = null
-            var cleared = false
-            val cached = locked {
-                val isFirstPass = firstPass
-                firstPass = false
-                seen = revision.value
+        try {
+            while (true) {
                 checkOpen(cursor)
-                updateSchedule(liveCursors())
-                inFlight[slot]?.takeIf { it.nextSlot == slot && it.priority < PikPakStreamReader.STREAMING_PRIORITY }?.let { fetch ->
-                    val urgentWait = cursor.urgent || (cursor.demand?.priority ?: 0) >= PikPakStreamReader.BLOCKING_PRIORITY
-                    val mark = cursor.feedbackAt
-                    val deadline = when {
-                        urgentWait -> timeSource.markNow() + URGENT_TAKEOVER_DEADLINE
-                        mark != null -> mark + cursor.bufferedDuration
-                        else -> null
+                var seen = 0L
+                var failure: Throwable? = null
+                val cached = locked {
+                    val isFirstPass = firstPass
+                    firstPass = false
+                    seen = readSignal.value
+                    checkOpen(cursor)
+                    updateSchedule(liveCursors())
+                    inFlight[slot]?.takeIf { slot > it.nextSlot }?.let {
+                        // A future range tail is a plan, not a reason to wait for its predecessor.
+                        it.endSlot = slot
+                        if (activeFetches.size >= activeWorkers()) {
+                            it.cancelled = true
+                            it.job?.cancel()
+                        }
+                        revision.bump()
                     }
-                    if (deadline != null && fetch.deadlineSlot != slot && (urgentWait || fetch.deadlineFeedback !== mark)) {
-                        fetch.deadlineSlot = slot
-                        fetch.deadlineFeedback = mark
-                        fetch.demand.requireBytesBy(slot.toLong() * blockSize + within + 1, deadline)
+                    val slotFailure = failed[slot]
+                    if (slotFailure != null) {
+                        if (!isFirstPass || retried) {
+                            failure = slotFailure
+                        } else {
+                            failed.remove(slot)
+                            retried = true
+                            revision.bump()
+                        }
                     }
-                }
-                inFlight[slot]?.takeIf { slot > it.nextSlot }?.let {
-                    // A future range tail is a plan, not a reason to wait for its predecessor.
-                    it.endSlot = slot
-                    if (activeFetches.size >= activeWorkers()) {
-                        it.cancelled = true
-                        it.job?.cancel()
-                    }
-                    bump()
-                }
-                val slotFailure = failed[slot]
-                if (slotFailure != null) {
-                    if (!isFirstPass || retried) {
-                        failure = slotFailure
+                    val complete = hit(slot) ?: persisting[slot]?.bytes ?: offered[slot]
+                    val fetch = inFlight[slot]?.takeIf { it.nextSlot == slot }
+                    val partial = partials[slot]
+                    val bytes = complete ?: fetch?.buffer ?: partial?.bytes
+                    val end = complete?.size ?: fetch?.buffered ?: partial?.length ?: 0
+                    if (bytes != null && end > within) {
+                        cursor.waitingSlot = -1
+                        val count = minOf(end - within, length)
+                        // The published prefix is append-only. Copy under the ownership lock, so
+                        // no snapshot allocation or escaped cache reference needs extra credits.
+                        bytes.copyInto(destination, offset, within, within + count)
+                        if (complete == null) fetch?.consumed = true
+                        count
                     } else {
-                        failed.remove(slot)
-                        retried = true
-                        cleared = true
+                        if (failure == null && fetch != null && fetch.priority < PikPakStreamReader.STREAMING_PRIORITY) {
+                            val urgentWait = cursor.urgent || (cursor.demand?.priority ?: 0) >= PikPakStreamReader.BLOCKING_PRIORITY
+                            val mark = cursor.feedbackAt
+                            val runway = mark?.let { cursor.bufferedDuration - it.elapsedNow() }
+                            val deadline = when {
+                                urgentWait && fetch.priority < PikPakStreamReader.READ_AHEAD_PRIORITY -> timeSource.markNow()
+                                urgentWait -> if (runway != null && runway < URGENT_TAKEOVER_DEADLINE) {
+                                    mark + cursor.bufferedDuration
+                                } else {
+                                    timeSource.markNow() + URGENT_TAKEOVER_DEADLINE
+                                }
+                                mark != null -> mark + cursor.bufferedDuration
+                                else -> null
+                            }
+                            if (deadline != null && (fetch.deadlineSlot != slot ||
+                                    (urgentWait && !fetch.deadlineUrgent) ||
+                                    (!urgentWait && fetch.deadlineFeedback !== mark))
+                            ) {
+                                fetch.deadlineSlot = slot
+                                fetch.deadlineUrgent = urgentWait
+                                fetch.deadlineFeedback = mark
+                                fetch.demand.requireBytesBy(slot.toLong() * blockSize + within + 1, deadline)
+                            }
+                        }
+                        if (failure == null) {
+                            cursor.waitingSlot = slot
+                            cursor.waitingWithin = within
+                        } else {
+                            cursor.waitingSlot = -1
+                        }
+                        null
                     }
                 }
-                val complete = hit(slot) ?: persisting[slot]?.bytes ?: offered[slot]
-                val fetch = inFlight[slot]?.takeIf { it.nextSlot == slot }
-                val partial = partials[slot]
-                val bytes = complete ?: fetch?.buffer ?: partial?.bytes
-                val end = complete?.size ?: fetch?.buffered ?: partial?.length ?: 0
-                if (bytes != null && end > within) {
-                    val count = minOf(end - within, length)
-                    // The published prefix is append-only. Copy under the ownership lock, so
-                    // no snapshot allocation or escaped cache reference needs extra credits.
-                    bytes.copyInto(destination, offset, within, within + count)
-                    if (complete == null) fetch?.consumed = true
-                    count
-                } else null
+                if (cached != null) return cached
+                failure?.let { throw PikPakException(-1, "stream failed at offset ${slot.toLong() * blockSize}", cause = it) }
+                readSignal.awaitChange(seen)
             }
-            if (cached != null) return cached
-            failure?.let { throw PikPakException(-1, "stream failed at offset ${slot.toLong() * blockSize}", cause = it) }
-            // Once, for the workers to see the slot claimable again. On every pass it would
-            // spin: first() below returns at once for a revision this loop just moved.
-            if (cleared) bump()
-            revision.first { it != seen }
+        } finally {
+            cursor.waitingSlot = -1
         }
     }
 
@@ -1158,7 +1412,7 @@ internal class BlockCache(
             if (lost) throw PikPakException(-1, "download lost track of offset ${slot.toLong() * blockSize}")
             // Neither cached nor wanted: fetched and then evicted, which still counts as warmed
             if (!pending) return
-            revision.first { it != seen }
+            revision.awaitChange(seen)
         }
     }
 
@@ -1180,6 +1434,7 @@ internal class BlockCache(
          */
         val demand = TransferDemand(priority)
         var deadlineSlot: Int = -1
+        var deadlineUrgent: Boolean = false
         var deadlineFeedback: TimeMark? = null
         val done = CompletableDeferred<Unit>(scope.coroutineContext[Job])
 
@@ -1204,6 +1459,7 @@ internal class BlockCache(
         val startOffset: Long get() = firstSlot.toLong() * blockSize
         val endOffset: Long get() = (endSlot.toLong() * blockSize).coerceAtMost(size)
         val slots: IntRange get() = nextSlot until endSlot
+        fun containsSlot(slot: Int): Boolean = slot >= nextSlot && slot < endSlot
     }
 
     private suspend fun runWorker(index: Int) {
@@ -1211,18 +1467,13 @@ internal class BlockCache(
             val seen = revision.value
             if (index >= activeWorkers()) {
                 // Parked above the background cap. It lifts when this file gains foreground
-                // demand, which bumps, or when the account's last foreground file leaves,
-                // which only the count says.
-                if (scheduler != null) revision.first { it != seen }
-                else {
-                    val foreground = foregroundStreams?.active ?: flowOf(0)
-                    combine(revision, foreground) { r, _ -> r != seen || index < activeWorkers() }.first { it }
-                }
+                // demand, which bumps, or when the account's last foreground file leaves.
+                revision.awaitChange(seen)
                 continue
             }
             val fetch = locked { claimNext() }
             if (fetch == null) {
-                revision.first { it != seen }
+                revision.awaitChange(seen)
                 continue
             }
             // Its own child job so losing its demand can cancel this block without taking the
@@ -1282,19 +1533,43 @@ internal class BlockCache(
             }
             return false
         }
-        val minCursorPriority = if (live.any { it.effectiveRole == StreamRole.FOREGROUND && isActive(it) && !it.seeking }) {
+        var anyFgNotSeeking = false
+        for (i in 0 until live.size) {
+            val c = live[i]
+            if (c.effectiveRole == StreamRole.FOREGROUND && isActive(c) && !c.seeking) {
+                anyFgNotSeeking = true
+                break
+            }
+        }
+        val minCursorPriority = if (anyFgNotSeeking) {
             PikPakStreamReader.READ_AHEAD_PRIORITY
         } else {
             PikPakStreamReader.STREAMING_PRIORITY
         }
         val effectiveReadAhead = effectiveReadAheadConcurrency()
-        val readAheadHeld = activeFetches.count { !it.durable && it.slots.none { s -> s in wanted } } >= effectiveReadAhead
-        for (cursor in live) {
-            for (slot in windowOf(cursor)) {
+        var readAheadActive = 0
+        var durableActive = 0
+        for (i in 0 until activeFetches.size) {
+            val f = activeFetches[i]
+            if (f.durable) {
+                durableActive++
+            } else if (!wanted.overlapsRange(f.nextSlot, f.endSlot)) {
+                readAheadActive++
+            }
+        }
+        val readAheadHeld = readAheadActive >= effectiveReadAhead
+        val accountHungryNow = scheduler?.isAccountHungry() == true
+        for (i in 0 until live.size) {
+            val cursor = live[i]
+            val win = packedWindowOf(cursor)
+            if (isWindowEmpty(win)) continue
+            val cursorHead = slotOf(cursor.position)
+            for (slot in windowFirst(win)..windowLast(win)) {
                 if (slot in cache || slot in offered || slot in inFlight || slot in failed || slot in persisting) continue
-                if (readAheadHeld && slot != slotOf(cursor.position)) continue
-                if (scheduler?.isAccountHungry() == true && priorityFor(cursor, slot) < minCursorPriority) continue
-                consider(slot, priorityFor(cursor, slot), cursor.order, cursor)
+                if (readAheadHeld && slot != cursorHead) continue
+                val prio = priorityFor(cursor, slot)
+                if (accountHungryNow && prio < minCursorPriority) continue
+                consider(slot, prio, cursor.order, cursor)
                 break
             }
         }
@@ -1302,13 +1577,15 @@ internal class BlockCache(
         val durableLimit = registration?.let { scheduler!!.workersFor(it, true) }
             ?: if (downloadsThrottled()) PikPakStreamReader.BACKGROUND_WORKERS_WHILE_FOREGROUND else concurrency
         val localLimit = concurrency
-        val downloadsHeld = activeFetches.count { it.durable } >= minOf(durableLimit, localLimit)
-        for (want in wants) {
+        val downloadsHeld = durableActive >= minOf(durableLimit, localLimit)
+        val allWants = wants
+        for (i in 0 until allWants.size) {
+            val want = allWants[i]
             if (want.durable && downloadsHeld) continue
             val slot = nextClaimable(want) ?: continue
             // A slot several warms want goes at the strongest of them
-            val strongest = strongest(wanted.getValue(slot))
-            if (scheduler?.isAccountHungry() == true && strongest.priority < PikPakStreamReader.STREAMING_PRIORITY) continue
+            val strongest = wanted.strongestOrNull(slot) ?: continue
+            if (accountHungryNow && strongest.priority < PikPakStreamReader.STREAMING_PRIORITY) continue
             if (consider(slot, strongest.priority, strongest.order, null)) targetWant = want
         }
         // Only idle capacity rescues owned work; unclaimed demand always wins. Keep the
@@ -1316,19 +1593,31 @@ internal class BlockCache(
         // The ownership transfer below commits under the same lock as memory admission.
         var tailDonor: Fetch? = null
         if (target == -1 && !downloadsHeld) {
-            val donor = activeFetches.filter {
-                it.durable && !it.released && !it.cancelled && !it.networkStarted && it.endSlot - it.nextSlot > 1 &&
-                    it.lastProgressAt.elapsedNow() > Duration.ZERO
-            }.sortedByDescending { it.endSlot - it.nextSlot }.firstOrNull { fetch ->
-                val split = fetch.endSlot - (fetch.endSlot - fetch.nextSlot) / 2
-                wanted[split]?.any { it.durable } == true
+            var donor: Fetch? = null
+            var donorSpan = 1
+            for (i in 0 until activeFetches.size) {
+                val f = activeFetches[i]
+                val span = f.endSlot - f.nextSlot
+                if (f.durable && !f.released && !f.cancelled && !f.networkStarted && span > donorSpan &&
+                    f.lastProgressAt.elapsedNow() > Duration.ZERO
+                ) {
+                    val split = f.endSlot - span / 2
+                    if (wanted.hasDurable(split)) {
+                        donor = f
+                        donorSpan = span
+                    }
+                }
             }
             if (donor != null) {
-                target = donor.endSlot - (donor.endSlot - donor.nextSlot) / 2
-                targetWant = strongest(wanted.getValue(target).filter { it.durable })
-                targetPriority = targetWant.priority
-                targetOrder = targetWant.order
-                tailDonor = donor
+                val split = donor.endSlot - (donor.endSlot - donor.nextSlot) / 2
+                val durableStrongest = wanted.strongestOrNull(split, durableOnly = true)
+                if (durableStrongest != null) {
+                    target = split
+                    targetWant = durableStrongest
+                    targetPriority = durableStrongest.priority
+                    targetOrder = durableStrongest.order
+                    tailDonor = donor
+                }
             }
         }
         if (target == -1) return null
@@ -1350,14 +1639,14 @@ internal class BlockCache(
             owner != null -> minOf(activeWorkers(), effectiveReadAhead)
             else -> activeWorkers()
         }.coerceAtLeast(1)
+        val ownerWindow = if (owner != null) packedWindowOf(owner) else EMPTY_WINDOW
         val fairShare = when {
             downloadWant != null -> {
                 val remaining = (downloadWant.slots.size - downloadWant.next).coerceAtLeast(1).toLong()
                 ((remaining + spanWorkers - 1) / spanWorkers).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
             }
             owner != null -> {
-                val win = windowOf(owner)
-                val winCount = (if (win.isEmpty()) 1 else (win.last - target + 1).coerceAtLeast(1)).toLong()
+                val winCount = (if (isWindowEmpty(ownerWindow)) 1 else (windowLast(ownerWindow) - target + 1).coerceAtLeast(1)).toLong()
                 ((winCount + spanWorkers - 1) / spanWorkers).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
             }
             else -> 2
@@ -1381,21 +1670,41 @@ internal class BlockCache(
             else -> minOf(fairShare, registration?.let { scheduler!!.spanFor(it, spanWorkers, downloadWant != null) } ?: 2)
         }
         val cap = minOf(memoryCapBytes, memoryBudget.budgetBytes)
-        val windows = live.map(::windowOf)
-        val outside = cache.keys.filter { slot -> slot !in persisting && slot !in offered && windows.none { slot in it } }
-        val outsidePartials = partials.keys.filter { slot -> slot != target && slot !in inFlight && windows.none { slot in it } }
-        val pendingFetchBytes = activeFetches.sumOf { f ->
+        val windows = packedWindowsOf(live)
+        var pendingFetchBytes = 0L
+        for (i in 0 until activeFetches.size) {
+            val f = activeFetches[i]
             val blockNeed = if (f.buffer != null) 0L else maxOf(f.reserved, minOf(blockSize, size - f.nextSlot.toLong() * blockSize).coerceAtLeast(0L))
-            blockNeed + f.transportReserved
+            pendingFetchBytes += blockNeed + f.transportReserved
         }
         val newFetchTransport = if (source is RangeReader || source is PikPakFileHandle) RangeReader.READ_CHUNK.toLong() else 0L
         val actualUsed = maxOf(
             cachedBytes + inFlightBytes() + pendingPersistBytes,
-            owned.values.sum() + pendingFetchBytes + newFetchTransport,
+            ownedBytes + pendingFetchBytes + newFetchTransport,
         )
         val baseFree = (cap - actualUsed).coerceAtLeast(0L) + (partials[target]?.bytes?.size ?: 0)
-        val outsideBytes = outside.sumOf { cache.getValue(it).size.toLong() } +
-            outsidePartials.sumOf { partials.getValue(it).bytes.size.toLong() }
+        var outsideBytes = 0L
+        var insideBlockingBytes = 0L
+        for ((cachedSlot, cachedArr) in cache) {
+            if (cachedSlot in persisting || cachedSlot in offered) continue
+            if (!inPackedWindows(windows, cachedSlot)) {
+                outsideBytes += cachedArr.size.toLong()
+            } else if (blocking) {
+                var stoppedHere = false
+                for (i in 0 until live.size) {
+                    if (slotOf(live[i].position) == cachedSlot) {
+                        stoppedHere = true
+                        break
+                    }
+                }
+                if (!stoppedHere) insideBlockingBytes += cachedArr.size.toLong()
+            }
+        }
+        for ((partialSlot, partial) in partials) {
+            if (partialSlot != target && partialSlot !in inFlight && !inPackedWindows(windows, partialSlot)) {
+                outsideBytes += partial.bytes.size.toLong()
+            }
+        }
         var slotCount = 0
         var bytes = 0L
         for (k in 1..maxSpan) {
@@ -1407,28 +1716,28 @@ internal class BlockCache(
             }
             if (slot.toLong() * blockSize >= size || slot in cache || (k > 1 && slot in partials) ||
                 (slot in inFlight && inFlight[slot] !== tailDonor) || slot in failed || slot in persisting) break
-            if (owner != null && slot !in windowOf(owner)) break
-            if (owner == null && wanted[slot]?.contains(targetWant) != true) break
+            if (owner != null && !windowContains(ownerWindow, slot)) break
+            if (owner == null && (targetWant == null || !wanted.claims(targetWant, slot))) break
             bytes = if (downloadWant != null) {
                 minOf(blockSize, size - target.toLong() * blockSize)
             } else {
                 bytes + minOf(blockSize, size - slot.toLong() * blockSize)
             }
-            val inside = if (k == 1 && blocking) cache.keys.filter { it !in outside && it !in persisting && it !in offered && live.none { c -> slotOf(c.position) == it } }.sumOf { cache.getValue(it).size.toLong() } else 0L
+            val inside = if (k == 1 && blocking) insideBlockingBytes else 0L
             if (bytes > baseFree + outsideBytes + inside) break
             slotCount = k
         }
         if (slotCount == 0) return null
         val needed = if (target in partials) 0L else minOf(blockSize, size - target.toLong() * blockSize)
-        while (maxOf(cachedBytes + inFlightBytes() + pendingPersistBytes, owned.values.sum() + pendingFetchBytes + newFetchTransport) + needed > cap) {
-            val partialVictim = partials.keys.firstOrNull { slot -> slot != target && slot !in inFlight && windows.none { slot in it } }
+        while (maxOf(cachedBytes + inFlightBytes() + pendingPersistBytes, ownedBytes + pendingFetchBytes + newFetchTransport) + needed > cap) {
+            val partialVictim = partials.keys.firstOrNull { slot -> slot != target && slot !in inFlight && !inPackedWindows(windows, slot) }
             if (partialVictim != null) {
                 partials.remove(partialVictim)
                 ownershipDirty = true
                 releaseUnowned()
                 continue
             }
-            val victim = cache.keys.firstOrNull { it in outside }
+            val victim = cache.keys.firstOrNull { slot -> slot !in persisting && slot !in offered && !inPackedWindows(windows, slot) }
                 ?: (if (slotCount == 1 && blocking) neededLast(live) else null)
                 ?: return null
             evict(victim)
@@ -1436,7 +1745,7 @@ internal class BlockCache(
         }
         val fetch = Fetch(target, slotCount, targetPriority, targetOrder, durable = downloadWant != null)
         tailDonor?.let { it.endSlot = target }
-        activeFetches += fetch
+        activeFetches.add(fetch)
         return fetch
     }
 
@@ -1450,33 +1759,77 @@ internal class BlockCache(
     private fun nextClaimable(want: Want): Int? {
         val slots = want.slots
         var i = want.next
-        while (i < slots.size && wanted[slots[i]]?.contains(want) != true) i++
+        while (i < slots.size) {
+            val slot = slots[i]
+            if (slot !in want.completed && (!want.durable || slot !in durableDone)) break
+            i++
+        }
         want.next = i
         while (i < slots.size) {
             val slot = slots[i]
-            if (slot !in inFlight && slot !in cache && slot !in offered && slot !in failed && slot !in persisting && wanted[slot]?.contains(want) == true) return slot
+            if (slot !in want.completed && (!want.durable || slot !in durableDone) &&
+                slot !in inFlight && slot !in cache && slot !in offered && slot !in failed && slot !in persisting
+            ) return slot
             i++
         }
         return null
     }
 
-    private fun liveCursors(): List<Cursor> = cursors.value.filter {
-        it.consuming && !it.closed && it.position < size && (it.demandActive || it.reading)
+    private fun liveCursors(): List<Cursor> {
+        val all = cursors.value
+        if (all.isEmpty()) return emptyList()
+        var result: ArrayList<Cursor>? = null
+        for (i in 0 until all.size) {
+            val c = all[i]
+            if (c.consuming && !c.closed && c.position < size && (c.demandActive || c.reading)) {
+                (result ?: ArrayList<Cursor>(all.size).also { result = it }).add(c)
+            }
+        }
+        return result ?: emptyList()
     }
 
-    private fun windowOf(cursor: Cursor): IntRange {
-        if (!cursor.demandActive && !cursor.reading) return IntRange.EMPTY
-        if (cursor.readAhead == 0L) return if (cursor.reading && cursor.position < size) slotOf(cursor.position)..slotOf(cursor.position) else IntRange.EMPTY
-        if (cursor.headHysteresis) {
-            if (size <= 0L || cursor.position >= size) return IntRange.EMPTY
-            val endByte = minOf(size - 1, maxOf(cursor.position, cursor.headTargetBytes - 1))
-            return slotOf(cursor.position)..slotOf(endByte)
+    private fun packedWindowOf(cursor: Cursor): Long {
+        if (!cursor.demandActive && !cursor.reading) return EMPTY_WINDOW
+        if (cursor.readAhead == 0L) {
+            return if (cursor.reading && cursor.position < size) {
+                val s = slotOf(cursor.position)
+                packWindow(s, s)
+            } else EMPTY_WINDOW
         }
-        if (cursor.effectiveRole == StreamRole.FOREGROUND && cursor.seeking && (cursor.urgent || (cursor.demand?.priority ?: 0) >= PikPakStreamReader.BLOCKING_PRIORITY)) {
-            return if (cursor.position < size) slotOf(cursor.position)..slotOf(cursor.position) else IntRange.EMPTY
+        if (cursor.headHysteresis) {
+            if (size <= 0L || cursor.position >= size) return EMPTY_WINDOW
+            val endByte = minOf(size - 1, maxOf(cursor.position, cursor.headTargetBytes - 1))
+            return packWindow(slotOf(cursor.position), slotOf(endByte))
+        }
+        if (cursor.effectiveRole == StreamRole.FOREGROUND && cursor.seeking &&
+            (cursor.urgent || (cursor.demand?.priority ?: 0) >= PikPakStreamReader.BLOCKING_PRIORITY)
+        ) {
+            return if (cursor.position < size) {
+                val s = slotOf(cursor.position)
+                packWindow(s, s)
+            } else EMPTY_WINDOW
         }
         val end = (cursor.position + cursor.readAhead).coerceAtMost(size)
-        return if (cursor.position >= end) IntRange.EMPTY else slotOf(cursor.position)..slotOf(end - 1)
+        return if (cursor.position >= end) EMPTY_WINDOW else packWindow(slotOf(cursor.position), slotOf(end - 1))
+    }
+
+    private fun packedWindowsOf(live: List<Cursor>): LongArray {
+        if (live.isEmpty()) return EMPTY_WINDOWS
+        return LongArray(live.size) { packedWindowOf(live[it]) }
+    }
+
+    private fun inPackedWindows(windows: LongArray, slot: Int): Boolean {
+        for (i in 0 until windows.size) {
+            if (windowContains(windows[i], slot)) return true
+        }
+        return false
+    }
+
+    private fun isSlotInWindows(live: List<Cursor>, slot: Int): Boolean {
+        for (i in 0 until live.size) {
+            if (windowContains(packedWindowOf(live[i]), slot)) return true
+        }
+        return false
     }
 
     /**
@@ -1527,13 +1880,49 @@ internal class BlockCache(
 
     /** The cached slot farthest ahead of the nearest cursor behind it; never one a cursor is stopped on. */
     private fun neededLast(live: List<Cursor>): Int? {
-        val stoppedOn = live.map { slotOf(it.position) }.toSet()
-        return cache.keys.filter { it !in stoppedOn && it !in persisting && it !in offered }.maxByOrNull { slot ->
-            live.filter { slot in windowOf(it) }.minOfOrNull { slot - slotOf(it.position) } ?: Int.MAX_VALUE
+        var bestSlot = -1
+        var bestDistance = Int.MIN_VALUE
+        for (slot in cache.keys) {
+            if (slot in persisting || slot in offered) continue
+            var stopped = false
+            var minDistance = Int.MAX_VALUE
+            for (i in 0 until live.size) {
+                val c = live[i]
+                val head = slotOf(c.position)
+                if (head == slot) {
+                    stopped = true
+                    break
+                }
+                if (windowContains(packedWindowOf(c), slot)) {
+                    val d = slot - head
+                    if (d < minDistance) minDistance = d
+                }
+            }
+            if (!stopped && minDistance > bestDistance) {
+                bestDistance = minDistance
+                bestSlot = slot
+            }
         }
+        return if (bestSlot >= 0) bestSlot else null
     }
 
-    private fun inFlightBytes(): Long = activeFetches.sumOf { minOf(blockSize, size - it.nextSlot.toLong() * blockSize).coerceAtLeast(0) }
+    private fun inFlightBytes(): Long {
+        var total = 0L
+        for (i in 0 until activeFetches.size) {
+            val f = activeFetches[i]
+            total += minOf(blockSize, size - f.nextSlot.toLong() * blockSize).coerceAtLeast(0L)
+        }
+        return total
+    }
+
+    private fun activeReservedBytes(): Long {
+        var total = 0L
+        for (i in 0 until activeFetches.size) {
+            val f = activeFetches[i]
+            total += f.reserved + f.transportReserved
+        }
+        return total
+    }
 
     private suspend fun runFetch(fetch: Fetch) {
         try {
@@ -1593,7 +1982,18 @@ internal class BlockCache(
                                     locked {
                                         fetch.buffered += count
                                         receivedBytes += count
-                                        bump()
+                                        if (fetch.buffered < expected) {
+                                            val allCursors = cursors.value
+                                            var wakeReaders = false
+                                            for (i in 0 until allCursors.size) {
+                                                val c = allCursors[i]
+                                                if (c.waitingSlot == slot && fetch.buffered > c.waitingWithin) {
+                                                    c.waitingSlot = -1
+                                                    wakeReaders = true
+                                                }
+                                            }
+                                            if (wakeReaders) readSignal.bump()
+                                        }
                                     }
                                 }
                                 publish(fetch, slot, bytes, fromNetwork = true)
@@ -1631,8 +2031,8 @@ internal class BlockCache(
 
     private suspend fun limitBlock(fetch: Fetch, slot: Int): Duration {
         val limited = locked {
-            val windows = liveCursors().map(::windowOf)
-            val bytes = if (wanted[slot]?.all { it.durable } == true && windows.none { slot in it })
+            val live = liveCursors()
+            val bytes = if (wanted.allDurable(slot) && !isSlotInWindows(live, slot))
                 minOf(blockSize, size - slot.toLong() * blockSize) else 0L
             fetch.waitingForLimiter = bytes > 0 && downloadLimiter != null
             bytes
@@ -1645,8 +2045,8 @@ internal class BlockCache(
                 val promoted = async {
                     while (true) {
                         val seen = revision.value
-                        if (locked { liveCursors().any { slot in windowOf(it) } }) break
-                        revision.first { it != seen }
+                        if (locked { isSlotInWindows(liveCursors(), slot) }) break
+                        revision.awaitChange(seen)
                     }
                 }
                 try {
@@ -1667,15 +2067,14 @@ internal class BlockCache(
         var queued: PersistTask? = null
         locked {
             if (inFlight[slot] !== fetch) return@locked
-            val claims = wanted.remove(slot)
+            val claimMask = wanted.completeSlot(slot)
             failed.remove(slot)
-            val windows = liveCursors().map(::windowOf)
-            val downloadOnly = claims != null && claims.all { it.durable } && windows.none { slot in it }
+            val downloadOnly = claimMask == 3 && !isSlotInWindows(liveCursors(), slot)
             if (!downloadOnly) {
                 put(slot, bytes)
                 if (fetch.consumed) unreadSlots.remove(slot)
             }
-            val durable = claims?.any { it.durable } == true
+            val durable = (claimMask and 2) != 0
             if (durable && !fromNetwork) durableDone += slot
             else if (durable && slot !in persisting) {
                 val task = PersistTask(slot, bytes, accounted = downloadOnly, optional = optionalWrites[slot])
@@ -1728,8 +2127,8 @@ internal class BlockCache(
     private suspend fun fail(fetch: Fetch, cause: Throwable) {
         mutex.withLock {
             releaseSlotsLocked(fetch)
-            for (slot in fetch.slots) {
-                wanted.remove(slot)
+            for (slot in fetch.nextSlot until fetch.endSlot) {
+                wanted.completeSlot(slot)
                 failed[slot] = cause
             }
         }
@@ -1743,24 +2142,46 @@ internal class BlockCache(
      */
     private suspend fun cancelUnwanted() {
         val victims = locked {
-            updateSchedule(liveCursors())
-            val windows = liveCursors().map(::windowOf)
-            fun consumedHead(fetch: Fetch) = fetch.consumed && cursors.value.any {
-                !it.closed && it.demandActive && it.consuming && slotOf(it.position) == fetch.nextSlot
+            val live = liveCursors()
+            updateSchedule(live)
+            val windows = packedWindowsOf(live)
+            fun consumedHead(fetch: Fetch): Boolean {
+                if (!fetch.consumed) return false
+                val all = cursors.value
+                for (i in 0 until all.size) {
+                    val c = all[i]
+                    if (!c.closed && c.demandActive && c.consuming && slotOf(c.position) == fetch.nextSlot) return true
+                }
+                return false
             }
-            for (fetch in activeFetches) {
-                if (fetch.cancelled || fetch.released) continue
-                val lastWanted = fetch.slots.lastOrNull { slot -> slot in wanted || windows.any { slot in it } }
-                    ?: fetch.nextSlot.takeIf { consumedHead(fetch) }
-                if (lastWanted != null && lastWanted + 1 < fetch.endSlot) {
-                    fetch.endSlot = maxOf(fetch.nextSlot + 1, lastWanted + 1)
+            var toCancel: ArrayList<Fetch>? = null
+            for (i in 0 until activeFetches.size) {
+                val fetch = activeFetches[i]
+                if (fetch.cancelled) continue
+                var lastWanted = -1
+                for (slot in fetch.endSlot - 1 downTo fetch.nextSlot) {
+                    if (slot in wanted || inPackedWindows(windows, slot)) {
+                        lastWanted = slot
+                        break
+                    }
+                }
+                val headConsumed = lastWanted < 0 && consumedHead(fetch)
+                if (!fetch.released) {
+                    val keepLast = if (lastWanted >= 0) lastWanted else if (headConsumed) fetch.nextSlot else -1
+                    if (keepLast >= 0 && keepLast + 1 < fetch.endSlot) {
+                        fetch.endSlot = maxOf(fetch.nextSlot + 1, keepLast + 1)
+                    }
+                }
+                if (lastWanted < 0 && !headConsumed) {
+                    fetch.cancelled = true
+                    (toCancel ?: ArrayList<Fetch>(4).also { toCancel = it }).add(fetch)
                 }
             }
-            activeFetches.toList()
-                .filter { fetch -> !fetch.cancelled && !consumedHead(fetch) && fetch.slots.none { it in wanted || windows.any { window -> it in window } } }
-                .onEach { it.cancelled = true }
+            toCancel
         }
-        for (fetch in victims) fetch.job?.cancel()
+        if (victims != null) {
+            for (i in 0 until victims.size) victims[i].job?.cancel()
+        }
     }
 
     /**
@@ -1834,18 +2255,19 @@ internal class BlockCache(
         ownershipDirty = false
         if (owned.isEmpty()) return
         ownershipSweeps++
-        val live = HashSet<ByteArray>()
+        val live = HashSet<ByteArray>(cache.size + partials.size + offered.size + activeFetches.size + 4)
         live.addAll(cache.values)
-        partials.values.mapTo(live) { it.bytes }
+        for (partial in partials.values) live.add(partial.bytes)
         live.addAll(offered.values)
-        optionalWrites.values.mapTo(live) { it.bytes }
-        persisting.values.mapNotNullTo(live) { it.bytes }
-        activeFetches.mapNotNullTo(live) { it.buffer }
+        for (write in optionalWrites.values) live.add(write.bytes)
+        for (task in persisting.values) task.bytes?.let { live.add(it) }
+        for (i in 0 until activeFetches.size) activeFetches[i].buffer?.let { live.add(it) }
         val entries = owned.entries.iterator()
         while (entries.hasNext()) {
             val entry = entries.next()
             if (entry.key !in live) {
                 memoryBudget.release(entry.value)
+                ownedBytes -= entry.value
                 entries.remove()
             }
         }
@@ -1883,42 +2305,54 @@ internal class BlockCache(
         val transport = if ((source is RangeReader || source is PikPakFileHandle) && fetch.transportReserved == 0L) RangeReader.READ_CHUNK.toLong() else 0L
         val required = (if (fetch.buffer == null) bytes else 0) + transport
         while (true) {
-            val seen = memoryBudget.revision.value to revision.value
+            val seenBudget = memoryBudget.revision.value
+            val seenCache = revision.value
             val acquired = locked {
                 checkOpen()
                 require(required <= memoryBudget.budgetBytes && required <= memoryCapBytes) {
                     "transport budget must hold one block and its pump page ($required bytes)"
                 }
-                val live = liveCursors()
-                val windows = live.map(::windowOf)
-                val blocking = live.any { slotOf(it.position) == fetch.nextSlot }
-                for (slot in partials.keys.toList()) {
-                    val used = owned.values.sum() + activeFetches.sumOf { it.reserved + it.transportReserved }
-                    if (used + required <= memoryCapBytes && memoryBudget.usedBytes + required <= memoryBudget.budgetBytes) break
-                    if (slot != fetch.nextSlot && slot !in inFlight && windows.none { slot in it }) {
-                        partials.remove(slot)
-                        ownershipDirty = true
-                        releaseUnowned()
+                fun fitsMemory(): Boolean =
+                    ownedBytes + activeReservedBytes() + required <= memoryCapBytes &&
+                        memoryBudget.usedBytes + required <= memoryBudget.budgetBytes
+                if (!fitsMemory()) {
+                    val live = liveCursors()
+                    val windows = packedWindowsOf(live)
+                    var blocking = false
+                    for (i in 0 until live.size) {
+                        if (slotOf(live[i].position) == fetch.nextSlot) {
+                            blocking = true
+                            break
+                        }
+                    }
+                    if (!fitsMemory() && partials.isNotEmpty()) {
+                        for (slot in partials.keys.toList()) {
+                            if (fitsMemory()) break
+                            if (slot != fetch.nextSlot && slot !in inFlight && !inPackedWindows(windows, slot)) {
+                                partials.remove(slot)
+                                ownershipDirty = true
+                                releaseUnowned()
+                            }
+                        }
+                    }
+                    if (!fitsMemory() && cache.isNotEmpty()) {
+                        for (slot in cache.keys.toList()) {
+                            if (fitsMemory()) break
+                            if (slot !in persisting && slot !in offered && !inPackedWindows(windows, slot)) {
+                                evict(slot)
+                                releaseUnowned()
+                            }
+                        }
+                    }
+                    if (blocking) {
+                        while (!fitsMemory()) {
+                            val victim = neededLast(live) ?: break
+                            evict(victim)
+                            releaseUnowned()
+                        }
                     }
                 }
-                for (slot in cache.keys.toList()) {
-                    val used = owned.values.sum() + activeFetches.sumOf { it.reserved + it.transportReserved }
-                    if (used + required <= memoryCapBytes && memoryBudget.usedBytes + required <= memoryBudget.budgetBytes) break
-                    if (slot !in persisting && slot !in offered && windows.none { slot in it }) {
-                        evict(slot)
-                        releaseUnowned()
-                    }
-                }
-                if (blocking) {
-                    while (true) {
-                        val used = owned.values.sum() + activeFetches.sumOf { it.reserved + it.transportReserved }
-                        if (used + required <= memoryCapBytes && memoryBudget.usedBytes + required <= memoryBudget.budgetBytes) break
-                        val victim = neededLast(live) ?: break
-                        evict(victim)
-                        releaseUnowned()
-                    }
-                }
-                val used = owned.values.sum() + activeFetches.sumOf { it.reserved + it.transportReserved }
+                val used = ownedBytes + activeReservedBytes()
                 if (used + required <= memoryCapBytes && memoryBudget.tryAcquire(required, priority)) {
                     fetch.reserved = if (fetch.buffer == null) bytes.toLong() else 0L
                     fetch.transportReserved += transport
@@ -1931,13 +2365,14 @@ internal class BlockCache(
             // unstarted slots then become demand again, including after a shared-budget shrink.
             if (fetch.transportReserved > 0L) return false
             if (memoryBudget.usedBytes + required > memoryBudget.budgetBytes) memoryBudget.requestReclaim()
-            combine(memoryBudget.revision, revision) { a, b -> a to b }.first { it != seen }
+            combine(memoryBudget.revision, revision.flow) { a, b -> a != seenBudget || b != seenCache }.first { it }
         }
     }
 
     private suspend fun adoptBuffer(fetch: Fetch, bytes: ByteArray) = locked {
         check(fetch.reserved == bytes.size.toLong())
-        owned[bytes] = fetch.reserved
+        val previous = owned.put(bytes, fetch.reserved)
+        ownedBytes += fetch.reserved - (previous ?: 0L)
         fetch.reserved = 0
         if (fetch.buffer != null && fetch.buffer !== bytes) ownershipDirty = true
         fetch.buffer = bytes
@@ -1946,7 +2381,8 @@ internal class BlockCache(
     }
 
     private fun bump() {
-        revision.update { it + 1 }
+        revision.bump()
+        readSignal.bump()
     }
 
     private fun checkOpen() {
@@ -1963,7 +2399,7 @@ internal class BlockCache(
         cleanupComplete.await()
     }
 
-    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class, kotlinx.coroutines.DelicateCoroutinesApi::class)
     internal fun optionalWriteQueueEmptyForTest(): Boolean =
         storeWrites?.let { it.isClosedForReceive || it.isEmpty } ?: true
 
@@ -1975,7 +2411,9 @@ internal class BlockCache(
 
     internal suspend fun inFlightSlotsForTest(): Int = locked { inFlight.size }
 
-    internal suspend fun accountedBytesForTest(): Long = locked { owned.values.sum() + activeFetches.sumOf { it.reserved + it.transportReserved } }
+    internal suspend fun accountedBytesForTest(): Long = locked { ownedBytes + activeReservedBytes() }
+
+    internal fun revisionForTest(): Long = revision.value
 
     /** Bytes from the cursor that are cached or on their way, counted contiguously and stopping at its window. */
     internal suspend fun readAheadDepthForTest(cursor: Cursor): Long = locked {
@@ -2011,6 +2449,14 @@ internal class BlockCache(
     internal suspend fun abandonForTest(fetch: Fetch): Unit = abandon(fetch)
 
     internal companion object {
+        private const val EMPTY_WINDOW: Long = 0xFFFF_FFFFL // windowFirst = 0, windowLast = -1
+        private val EMPTY_WINDOWS = LongArray(0)
+        private fun packWindow(first: Int, last: Int): Long = (first.toLong() shl 32) or (last.toLong() and 0xFFFF_FFFFL)
+        private fun windowFirst(packed: Long): Int = (packed shr 32).toInt()
+        private fun windowLast(packed: Long): Int = packed.toInt()
+        private fun isWindowEmpty(packed: Long): Boolean = windowFirst(packed) > windowLast(packed)
+        private fun windowContains(packed: Long, slot: Int): Boolean = slot >= windowFirst(packed) && slot <= windowLast(packed)
+
         /** Default 4-way striping across 256 KiB slots = 1 MiB read-ahead window. */
         const val DEFAULT_READ_AHEAD_CONCURRENCY = 4
         private const val HIGH_BITRATE_READ_AHEAD_THRESHOLD_BYTES_PER_SEC = 3L * 1024 * 1024
