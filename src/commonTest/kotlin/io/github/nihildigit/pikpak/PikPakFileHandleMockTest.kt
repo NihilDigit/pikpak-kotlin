@@ -9,6 +9,7 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.toByteArray
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -491,6 +492,270 @@ class PikPakFileHandleMockTest {
         } finally {
             handle.close(); client.close()
         }
+    }
+
+    @Test
+    fun `original candidate links rewrite congested media host onto fast octet host`() {
+        val health = io.github.nihildigit.pikpak.internal.HostHealth()
+        val detail = FileDetail(
+            id = "f1",
+            hash = GCID,
+            size = "104857600",
+            links = mapOf(
+                "application/octet-stream" to DownloadLink(
+                    url = "https://dl-z01a-0042.mypikpak.com/download/?fid=f1&ms=10485760",
+                ),
+            ),
+            medias = listOf(
+                MediaVariant(
+                    mediaId = "orig",
+                    isOrigin = true,
+                    link = DownloadLink(
+                        url = "https://dl-z01a-0054.mypikpak.com/download/?fid=f1&category=original&ms=57671680",
+                    ),
+                ),
+            ),
+        )
+        val candidates = candidateLinksOf(detail, mediaId = null, hostHealth = health)
+        assertEquals(
+            "https://dl-z01a-0042.mypikpak.com/download/?fid=f1&category=original&ms=57671680",
+            candidates.first().url,
+        )
+        assertEquals(57_671_680L, candidates.first().maxSpeedBytesPerSec)
+        assertTrue(candidates.any { it.url == "https://dl-z01a-0054.mypikpak.com/download/?fid=f1&category=original&ms=57671680" })
+    }
+
+    @Test
+    fun `sharded archive dl-a10b links never rewrite across sibling shard nodes`() {
+        val health = io.github.nihildigit.pikpak.internal.HostHealth()
+        val detail = FileDetail(
+            id = "f1",
+            hash = GCID,
+            size = "104857600",
+            links = mapOf(
+                "application/octet-stream" to DownloadLink(
+                    url = "https://dl-a10b-0861.mypikpak.com/download/?fid=f1&t=0",
+                ),
+            ),
+            medias = listOf(
+                MediaVariant(
+                    mediaId = "orig",
+                    isOrigin = true,
+                    link = DownloadLink(
+                        url = "https://dl-a10b-1194.mypikpak.com/download/?fid=f1&category=original",
+                    ),
+                ),
+                MediaVariant(
+                    mediaId = "m720",
+                    mediaName = "720P",
+                    link = DownloadLink(
+                        url = "https://dl-a10b-1556.mypikpak.com/download/?fid=f1&t=1",
+                    ),
+                ),
+            ),
+        )
+        val transcodeCandidates = candidateLinksOf(detail, mediaId = "m720", hostHealth = health)
+        assertEquals(
+            listOf("https://dl-a10b-1556.mypikpak.com/download/?fid=f1&t=1"),
+            transcodeCandidates.map { it.url },
+        )
+        val originCandidates = candidateLinksOf(detail, mediaId = null, hostHealth = health)
+        assertEquals(
+            "https://dl-a10b-1194.mypikpak.com/download/?fid=f1&category=original",
+            originCandidates.first().url,
+        )
+    }
+
+    @Test
+    fun `transcoded Original alias is excluded from originMediaLink while real original keeps 81MBps boost`() {
+        val health = HostHealth()
+        val fakeOriginRemux = FileDetail(
+            id = "remux4k",
+            hash = GCID,
+            size = "102682361361",
+            links = mapOf(
+                "application/octet-stream" to DownloadLink(
+                    url = "https://dl-z01a-0042.mypikpak.com/download/raw-remux?fid=remux4k&category=original&t=0&ms=5242880",
+                ),
+            ),
+            medias = listOf(
+                MediaVariant(
+                    mediaId = "fake_orig",
+                    mediaName = "Original",
+                    isOrigin = true,
+                    link = DownloadLink(
+                        url = "https://dl-z01a-0054.mypikpak.com/download/transcode-4k?fid=remux4k&category=transcoded&t=1&ms=81600000",
+                    ),
+                ),
+                MediaVariant(
+                    mediaId = "m4k",
+                    mediaName = "4K",
+                    isOrigin = false,
+                    link = DownloadLink(
+                        url = "https://dl-z01a-0054.mypikpak.com/download/transcode-4k?fid=remux4k&category=transcoded&t=1&ms=81600000",
+                    ),
+                ),
+            ),
+        )
+        assertNull(fakeOriginRemux.originMediaLink)
+        assertEquals(
+            "https://dl-z01a-0042.mypikpak.com/download/raw-remux?fid=remux4k&category=original&t=0&ms=5242880",
+            fakeOriginRemux.originalLink.url,
+        )
+        assertEquals(
+            listOf("https://dl-z01a-0042.mypikpak.com/download/raw-remux?fid=remux4k&category=original&t=0&ms=5242880"),
+            candidateLinksOf(fakeOriginRemux, mediaId = null, hostHealth = health).map { it.url },
+        )
+
+        val realOriginVideo = FileDetail(
+            id = "normal",
+            hash = GCID,
+            size = "15231093",
+            links = mapOf(
+                "application/octet-stream" to DownloadLink(
+                    url = "https://dl-z01a-0042.mypikpak.com/download/raw-normal?fid=normal&t=0&ms=5242880",
+                ),
+            ),
+            medias = listOf(
+                MediaVariant(
+                    mediaId = "real_orig",
+                    mediaName = "Original",
+                    isOrigin = true,
+                    link = DownloadLink(
+                        url = "https://dl-z01a-0042.mypikpak.com/download/raw-normal?fid=normal&category=original&t=0&ms=81600000",
+                    ),
+                ),
+            ),
+        )
+        assertEquals(81_600_000L, realOriginVideo.originMediaLink?.maxSpeedBytesPerSec)
+        assertEquals(
+            81_600_000L,
+            candidateLinksOf(realOriginVideo, mediaId = null, hostHealth = health).first().maxSpeedBytesPerSec,
+        )
+    }
+
+    @Test
+    fun `mismatched Content-Range total on raw file handle switches to true-size link before delivering bytes`() = runBlocking {
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            val path = request.url.encodedPath
+            when {
+                path.endsWith("/v1/shield/captcha/init") ->
+                    json("""{"captcha_token":"C","expires_in":300,"url":""}""")
+                path.endsWith("/v1/auth/signin") ->
+                    json("""{"access_token":"AT","refresh_token":"RT","sub":"U","expires_in":3600}""")
+                url == "https://cdn.example/fake-origin" -> respond(
+                    content = ByteReadChannel("WRON"),
+                    status = HttpStatusCode.PartialContent,
+                    headers = headersOf(
+                        HttpHeaders.ContentRange to listOf("bytes 0-3/500"),
+                        HttpHeaders.ContentLength to listOf("4"),
+                    ),
+                )
+                url == "https://cdn.example/real-octet" -> respond(
+                    content = ByteReadChannel("REAL"),
+                    status = HttpStatusCode.PartialContent,
+                    headers = headersOf(
+                        HttpHeaders.ContentRange to listOf("bytes 0-3/1000"),
+                        HttpHeaders.ContentLength to listOf("4"),
+                    ),
+                )
+                path.contains("/drive/v1/files/f1") -> json(
+                    """{"kind":"drive#file","id":"f1","name":"remux.mkv","size":"1000",
+                        "phase":"PHASE_TYPE_COMPLETE","hash":"$GCID",
+                        "links":{"application/octet-stream":{"url":"https://cdn.example/real-octet","expire":""}},
+                        "medias":[{"media_id":"$GCID","media_name":"Original","is_origin":true,
+                                   "link":{"url":"https://cdn.example/fake-origin","expire":""}}]}""",
+                )
+                else -> respond("", HttpStatusCode.NotFound)
+            }
+        }
+        val client = PikPakClient(
+            account = "mock@example.com",
+            password = "pw",
+            sessionStore = InMemorySessionStore(),
+            httpClient = HttpClient(engine),
+        )
+        val handle = PikPakFileHandle(
+            client = client,
+            gcid = GCID,
+            size = 1000L,
+            name = "remux.mkv",
+            initialFileId = "f1",
+            initialLink = VariantLink("https://cdn.example/fake-origin", expiresAt = null),
+        )
+        try {
+            val data = handle.read(start = 0L, length = 4L, priority = 0) { it.toByteArray() }
+            assertEquals("REAL", data.decodeToString())
+            assertEquals(1000L, handle.knownStreamSize)
+        } finally {
+            handle.close()
+            client.close()
+        }
+    }
+
+    @Test
+    fun `transcode candidate links keep proven fast octet host across first stall and place clean seeds ahead of congested base`() {
+        val health = io.github.nihildigit.pikpak.internal.HostHealth(
+            seeds = io.github.nihildigit.pikpak.internal.HostHealth.DEFAULT_DL_Z01A_SEEDS,
+        )
+        val detail = FileDetail(
+            id = "f1",
+            hash = GCID,
+            size = "102682361361",
+            links = mapOf(
+                "application/octet-stream" to DownloadLink(
+                    url = "https://dl-z01a-0048.mypikpak.com/download/?fid=f1&t=0",
+                ),
+            ),
+            medias = listOf(
+                MediaVariant(
+                    mediaId = "m1080",
+                    mediaName = "1080P",
+                    isOrigin = false,
+                    link = DownloadLink(
+                        url = "https://dl-z01a-0026.mypikpak.com/download/?fid=f1&t=1",
+                    ),
+                ),
+                MediaVariant(
+                    mediaId = "m4k",
+                    mediaName = "4K",
+                    isOrigin = false,
+                    link = DownloadLink(
+                        url = "https://dl-z01a-0054.mypikpak.com/download/?fid=f1&t=1",
+                    ),
+                ),
+            ),
+        )
+        val fastUrl = "https://dl-z01a-0048.mypikpak.com/download/?fid=f1&t=1"
+        repeat(io.github.nihildigit.pikpak.internal.HostHealth.MIN_SAMPLES) {
+            health.delivered(
+                "dl-z01a-0048.mypikpak.com",
+                io.github.nihildigit.pikpak.internal.HostHealth.MIN_SAMPLE_BYTES,
+                4_000_000L,
+                fastUrl,
+            )
+        }
+        health.stalled(
+            fastUrl,
+            deliveredBytes = 64 * 1024L,
+            bodyBytesPerSecond = 32 * 1024L,
+            silenceDuration = kotlin.time.Duration.parse("2s"),
+        )
+        val afterFirstStall = candidateLinksOf(detail, mediaId = "m1080", hostHealth = health)
+        assertEquals(fastUrl, afterFirstStall.first().url)
+
+        health.stalled(
+            fastUrl,
+            deliveredBytes = 64 * 1024L,
+            bodyBytesPerSecond = 32 * 1024L,
+            silenceDuration = kotlin.time.Duration.parse("2s"),
+        )
+        val afterSecondStall = candidateLinksOf(detail, mediaId = "m1080", hostHealth = health)
+        assertEquals("https://dl-z01a-0041.mypikpak.com/download/?fid=f1&t=1", afterSecondStall.first().url)
+        val congestedIdx = afterSecondStall.indexOfFirst { it.url.contains("dl-z01a-0026") }
+        val seed50Idx = afterSecondStall.indexOfFirst { it.url.contains("dl-z01a-0050") }
+        assertTrue(seed50Idx in 0 until congestedIdx, "clean seeds should precede congested 0026: ${afterSecondStall.map { it.url }}")
     }
 
     private companion object {

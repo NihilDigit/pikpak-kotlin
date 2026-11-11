@@ -5,6 +5,7 @@ import io.ktor.http.HttpMethod
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
@@ -134,4 +135,36 @@ suspend fun PikPakClient.batchGetFiles(ids: List<String>, usage: String? = null)
         for (file in page.files) if (file.id in chunk) result[file.id] = file
     }
     return ids.distinct().mapNotNull { result[it] }
+}
+
+@Serializable
+private data class FileDetailBatchPage(val files: List<FileDetail> = emptyList())
+
+/**
+ * Batch-fetches [FileDetail] records (including [FileDetail.medias] and signed [FileDetail.links])
+ * via `GET /drive/v1/files:batchGet` with repeated `ids` parameters, chunked by 100.
+ */
+suspend fun PikPakClient.batchGetFileDetails(ids: List<String>, usage: String? = "PLAY"): List<FileDetail> {
+    require(ids.all { it.isNotBlank() })
+    val distinctIds = ids.distinct()
+    if (distinctIds.isEmpty()) return emptyList()
+    val result = LinkedHashMap<String, FileDetail>(distinctIds.size)
+    for (chunk in distinctIds.chunked(100)) {
+        val params = buildList {
+            for (id in chunk) add("ids" to id)
+            if (!usage.isNullOrBlank()) add("usage" to usage)
+        }
+        val raw = http.request(
+            HttpMethod.Get,
+            buildUrl(PikPakConstants.DRIVE_BASE, "/drive/v1/files:batchGet", params),
+            captchaAction = "GET:/drive/v1/files:batchGet",
+        )
+        val page = json.decodeFromJsonElement(FileDetailBatchPage.serializer(), raw)
+        for (detail in page.files) {
+            accountState.observeFile(detail)
+            hostHealth.observe(detail)
+            if (detail.id in chunk) result[detail.id] = detail
+        }
+    }
+    return distinctIds.mapNotNull { result[it] }
 }

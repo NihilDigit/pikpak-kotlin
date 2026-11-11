@@ -11,13 +11,20 @@ import io.github.nihildigit.pikpak.internal.TransferScheduler
 import io.github.nihildigit.pikpak.internal.TransportMemoryBudget
 import io.github.nihildigit.pikpak.internal.defaultCdnHttpClient
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.HttpSend
+import io.ktor.client.plugins.plugin
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpStatusCode
 import kotlin.concurrent.Volatile
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -170,7 +177,22 @@ class PikPakClient(
      * to keep both, pass [tunedCdnClient] as `cdnHttpClient`.
      */
     private val cdn: Lazy<HttpClient> = lazy {
-        cdnHttpClient ?: httpClient ?: defaultCdnHttpClient(maxOf(connectionBudget, accountConnectionBudget))
+        (cdnHttpClient ?: httpClient ?: defaultCdnHttpClient(maxOf(connectionBudget, accountConnectionBudget))).also { client ->
+            client.plugin(HttpSend).intercept { request ->
+                val call = execute(request)
+                if (call.response.status == HttpStatusCode.PartialContent) {
+                    val totalSize = call.response.headers[HttpHeaders.ContentRange]
+                        ?.substringAfterLast('/', "")
+                        ?.trim()
+                        ?.toLongOrNull()
+                    if (totalSize != null && totalSize > 0L) {
+                        currentCoroutineContext()[StreamSizeListener]?.onTotalSize?.invoke(totalSize)
+                        notifyStreamSizeByUrl(request.url.toString(), totalSize)
+                    }
+                }
+                call
+            }
+        }
     }
     /**
      * The account-wide half of the two-level connection limit.
@@ -275,11 +297,28 @@ class PikPakClient(
     // Keyed by content and variant: a transcode's length is only learned by a probe, and it
     // cannot change while the content exists, whichever file object or link reaches it.
     private val streamSizes = MutableStateFlow<Map<String, Long>>(emptyMap())
+    private val streamSizeUrlListeners = MutableStateFlow<Map<String, (Long) -> Unit>>(emptyMap())
 
-    internal fun knownStreamSize(gcid: String, mediaId: String): Long? = streamSizes.value["$gcid/$mediaId"]
+    fun knownStreamSize(gcid: String, mediaId: String): Long? =
+        streamSizes.value["${gcid.canonicalGcid()}/$mediaId"]
 
-    internal fun rememberStreamSize(gcid: String, mediaId: String, size: Long) {
-        streamSizes.update { it + ("$gcid/$mediaId" to size) }
+    fun rememberStreamSize(gcid: String, mediaId: String, size: Long) {
+        if (size <= 0L) return
+        val canonical = gcid.canonicalGcid()
+        streamSizes.update { it + ("$canonical/$mediaId" to size) }
+    }
+
+    internal fun registerStreamSizeUrls(urls: Iterable<String>, listener: (Long) -> Unit) {
+        val entries = urls.filter { it.isNotBlank() }.associateWith { listener }
+        if (entries.isEmpty()) return
+        streamSizeUrlListeners.update { current ->
+            val merged = current + entries
+            if (merged.size <= 512) merged else merged.entries.drop(merged.size - 512).associate { it.toPair() }
+        }
+    }
+
+    private fun notifyStreamSizeByUrl(url: String, totalSize: Long) {
+        streamSizeUrlListeners.value[url]?.invoke(totalSize)
     }
 
     // A handle built from a leased detail is given the object leaseDetail already deletes, as the
@@ -615,4 +654,10 @@ internal class ClientState(val passwordSupplier: suspend () -> String) {
         }
 
     @Volatile var captchaToken: String = ""
+}
+
+internal class StreamSizeListener(
+    val onTotalSize: (Long) -> Unit,
+) : AbstractCoroutineContextElement(StreamSizeListener) {
+    companion object Key : CoroutineContext.Key<StreamSizeListener>
 }

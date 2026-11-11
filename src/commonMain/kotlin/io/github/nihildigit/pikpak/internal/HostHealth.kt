@@ -35,6 +35,7 @@ internal class HostHealth(
         val latencies: List<LatencySample> = emptyList(),
         val cleanLatencies: List<LatencySample> = emptyList(),
         val silences: Map<String, TimeMark> = emptyMap(),
+        val suspects: Map<String, TimeMark> = emptyMap(),
         val stalls: Map<String, TimeMark> = emptyMap(),
         val refusals: Map<String, TimeMark> = emptyMap(),
     )
@@ -60,8 +61,13 @@ internal class HostHealth(
      */
     fun answered(url: String, after: Duration? = null, connectionReused: Boolean? = null) {
         val host = keyOf(url) ?: return
-        answers.update { it + (host to timeSource.markNow()) }
-        val sample = after?.let { LatencySample(it, timeSource.markNow()) }
+        val bareHost = hostOf(url)
+        val now = timeSource.markNow()
+        answers.update { cur ->
+            if (bareHost != null && bareHost != host) cur + (host to now) + (bareHost to now)
+            else cur + (host to now)
+        }
+        val sample = after?.let { LatencySample(it, now) }
         health.update { previous ->
             // Only proven pooled connections compare route RTT. Cold handshakes and engines
             // without connection evidence still train deadlines, never the route epoch.
@@ -70,8 +76,9 @@ internal class HostHealth(
                 connectionReused == true -> previous.recordCleanLatency(sample)
                 else -> previous.copy(latencies = (previous.latencies + sample).takeLast(MAX_LATENCY_SAMPLES))
             }
+            val clearedSilences = if (bareHost != null) current.silences - host - bareHost else current.silences - host
             current.copy(
-                silences = current.silences - host,
+                silences = clearedSilences,
                 hostLatencies = if (sample == null) current.hostLatencies else
                     current.hostLatencies + (host to (current.hostLatencies[host].orEmpty() + sample).takeLast(MAX_SAMPLES)),
             )
@@ -109,12 +116,24 @@ internal class HostHealth(
     fun markSilent(url: String, waited: Duration) {
         recordLatency(waited)
         val host = keyOf(url) ?: return
+        val bareHost = hostOf(url)
         if (answers.value[host]?.let { it.elapsedNow() < waited } == true) return
-        val othersAnswering = answers.value.any { (other, at) -> other != host && at.elapsedNow() < CORROBORATION }
+        if (bareHost != null && answers.value[bareHost]?.let { it.elapsedNow() < waited } == true) return
+        val othersAnswering = answers.value.any { (other, at) ->
+            other != host && other != bareHost &&
+                (bareHost == null || !other.startsWith("$bareHost|")) &&
+                at.elapsedNow() < CORROBORATION
+        }
         if (!othersAnswering) return
         val now = timeSource.markNow()
         health.update { current ->
-            current.copy(silences = current.silences.filterValues { it.elapsedNow() < memory } + (host to now))
+            val active = current.silences.filterValues { it.elapsedNow() < memory }
+            val updated = if (bareHost != null && bareHost != host) {
+                active + (host to now) + (bareHost to now)
+            } else {
+                active + (host to now)
+            }
+            current.copy(silences = updated)
         }
     }
 
@@ -182,7 +201,7 @@ internal class HostHealth(
         val edge = Edge.parse(url) ?: return false
         return with(health.value) {
             siblingsOf(edge).any { sibling ->
-                usable(sibling.key) && (medianRate(sibling.key) ?: 0L) >= GOOD_RATE_BYTES_PER_SEC
+                usable(sibling) && (medianRate(sibling.key) ?: 0L) >= GOOD_RATE_BYTES_PER_SEC
             }
         }
     }
@@ -198,6 +217,7 @@ internal class HostHealth(
      */
     fun stalled(url: String, deliveredBytes: Long, bodyBytesPerSecond: Long, silenceDuration: Duration) {
         val host = keyOf(url) ?: return
+        val bareHost = hostOf(url)
         val now = timeSource.markNow()
         val activeSeconds = if (deliveredBytes > 0L && bodyBytesPerSecond > 0L) {
             deliveredBytes.toDouble() / bodyBytesPerSecond.toDouble()
@@ -208,8 +228,33 @@ internal class HostHealth(
         } else 1L
         val sample = RateSample(effectiveRate, now)
         health.update { current ->
+            val provenGood = (current.medianRate(host) ?: 0L) >= GOOD_RATE_BYTES_PER_SEC ||
+                (bareHost != null && (current.medianRate(bareHost) ?: 0L) >= GOOD_RATE_BYTES_PER_SEC)
+            val alreadySuspect = current.isSuspect(host) ||
+                (bareHost != null && current.isSuspect(bareHost))
             val updated = current.withRate(host, sample)
-            updated.copy(stalls = updated.stalls + (host to now))
+            if (provenGood && !alreadySuspect) {
+                val activeSuspects = updated.suspects.filterValues { it.elapsedNow() < SUSPECT_WINDOW }
+                val newSuspects = if (bareHost != null && bareHost != host) {
+                    activeSuspects + (host to now) + (bareHost to now)
+                } else {
+                    activeSuspects + (host to now)
+                }
+                updated.copy(suspects = newSuspects)
+            } else {
+                val activeStalls = updated.stalls.filterValues { it.elapsedNow() < memory }
+                val newStalls = if (bareHost != null && bareHost != host) {
+                    activeStalls + (host to now) + (bareHost to now)
+                } else {
+                    activeStalls + (host to now)
+                }
+                val clearedSuspects = if (bareHost != null) {
+                    updated.suspects - host - bareHost
+                } else {
+                    updated.suspects - host
+                }
+                updated.copy(stalls = newStalls, suspects = clearedSuspects)
+            }
         }
     }
 
@@ -242,7 +287,11 @@ internal class HostHealth(
 
     fun isBad(url: String): Boolean {
         val host = keyOf(url) ?: return false
-        return with(health.value) { isSilent(host) || isStalled(host) }
+        val bareHost = hostOf(url)
+        return with(health.value) {
+            isSilent(host) || isStalled(host) ||
+                (bareHost != null && (isSilent(bareHost) || isStalled(bareHost)))
+        }
     }
 
     fun isAnswering(url: String): Boolean {
@@ -284,12 +333,14 @@ internal class HostHealth(
     fun delivered(host: String?, bytes: Long, bytesPerSecond: Long, url: String? = null) {
         if (host == null || bytes < MIN_SAMPLE_BYTES || bytesPerSecond <= 0) return
         val key = if (url == null) host else keyOf(url) ?: return
+        val bareHost = if (url == null) host else hostOf(url)
         val sample = RateSample(bytesPerSecond, timeSource.markNow())
         health.update { current ->
             val updated = current.withRate(key, sample)
             if (bytesPerSecond >= GOOD_RATE_BYTES_PER_SEC) {
+                val cleared = if (bareHost != null) updated.silences - key - bareHost else updated.silences - key
                 updated.copy(
-                    silences = updated.silences - key,
+                    silences = cleared,
                 )
             } else {
                 updated
@@ -333,9 +384,26 @@ internal class HostHealth(
         if (!steering) return url
         val edge = Edge.parse(url) ?: return url
         learn(edge)
-        if (usable(edge.key)) return url
-        val candidate = siblingsOf(edge).filter { usable(it.key) && recentRates(it.key).isNotEmpty() }
-            .maxByOrNull { medianRate(it.key) ?: recentRates(it.key).minOrNull() ?: 0L }
+        val edgeProvenGood = (medianRate(edge.key) ?: 0L) >= GOOD_RATE_BYTES_PER_SEC ||
+            (medianRate(edge.host) ?: 0L) >= GOOD_RATE_BYTES_PER_SEC
+        val avoidCongestedPrimary = isCongestedLabel(edge.label) && !edgeProvenGood
+        if (usable(edge) && !avoidCongestedPrimary) return url
+        val usableSiblings = siblingsOf(edge).filter { usable(it) }
+        val cleanSiblings = usableSiblings.filter { !isSuspect(it) }
+        if (!usable(edge)) {
+            val pool = cleanSiblings.ifEmpty { usableSiblings }
+            val measured = pool.filter { recentRates(it.key).isNotEmpty() }
+                .maxByOrNull { medianRate(it.key) ?: recentRates(it.key).minOrNull() ?: 0L }
+            val candidate = measured
+                ?: pool.firstOrNull { !isCongestedLabel(it.label) }
+                ?: pool.firstOrNull()
+            return candidate?.let { edge.rewrite(url, it) } ?: url
+        }
+        val nonCongestedClean = cleanSiblings.filter { !isCongestedLabel(it.label) }
+        val measuredFast = nonCongestedClean
+            .filter { (medianRate(it.key) ?: 0L) >= GOOD_RATE_BYTES_PER_SEC }
+            .maxByOrNull { medianRate(it.key) ?: 0L }
+        val candidate = measuredFast ?: nonCongestedClean.firstOrNull()
         return candidate?.let { edge.rewrite(url, it) } ?: url
     }
 
@@ -354,11 +422,24 @@ internal class HostHealth(
     }
 
     private fun siblingsOf(edge: Edge): List<Edge> =
-        (learned.value[edge.cluster].orEmpty() + if (edge.pool == "download") seedLabels else emptyList())
+        (learned.value[edge.cluster].orEmpty() +
+            if (edge.pool == "download" || edge.pool == "transcoded") seedLabels else emptyList())
             .distinct().filter { it != edge.label && Edge.familyOf(it) == edge.family }
             .map { Edge(it, edge.family, edge.root, edge.pool) }
 
+    private fun HealthState.usable(edge: Edge): Boolean =
+        usable(edge.key) && !isSilent(edge.host) && !isStalled(edge.host)
+
     private fun HealthState.usable(host: String): Boolean = !isSilent(host) && !isStalled(host) && !isRefused(host)
+
+    private fun HealthState.isSuspect(edge: Edge): Boolean = isSuspect(edge.key) || isSuspect(edge.host)
+
+    private fun HealthState.isSuspect(host: String): Boolean = suspects[host]?.let { it.elapsedNow() < SUSPECT_WINDOW } == true
+
+    private fun isCongestedLabel(label: String): Boolean {
+        val nodeNumber = label.substringAfterLast('-', "").toIntOrNull() ?: return false
+        return nodeNumber in 26..27 || nodeNumber in 51..55 || nodeNumber in 63..64
+    }
 
     private fun HealthState.isSilent(host: String): Boolean = silences[host]?.let { it.elapsedNow() < memory } == true
 
@@ -402,6 +483,9 @@ internal class HostHealth(
                 val label = host.substringBefore('.')
                 val root = host.substringAfter('.', "").ifEmpty { return null }
                 val family = familyOf(label) ?: return null
+                // dl-a10b-* is a sharded cold/archive storage cluster (1500+ nodes), not a stateless
+                // front-end CDN edge pool; rewriting onto sibling nodes returns 0-byte 206 bodies.
+                if (family.equals("dl-a10b", ignoreCase = true)) return null
                 return Edge(label, family, root, poolOf(url) ?: return null)
             }
         }
@@ -416,6 +500,7 @@ internal class HostHealth(
         val DEFAULT_MEMORY: Duration = 10.minutes
         val SUSPECT_WINDOW: Duration = 2.minutes
         val ROUTE_LEASE: Duration = 30.seconds
+        val DEFAULT_DL_Z01A_SEEDS: List<String> = (41..50).map { "dl-z01a-${it.toString().padStart(4, '0')}" }
 
         /** How recently another host must have answered for a silence to be the host's own. */
         val CORROBORATION: Duration = 10.seconds

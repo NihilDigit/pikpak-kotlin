@@ -86,6 +86,7 @@ class PikPakStreamReader internal constructor(
             memoryCapBytes = memoryCapBytes,
             wideBlockThresholdBytes = wideBlockThresholdBytes,
             foregroundStreams = foregroundStreams,
+            readAheadConcurrency = maxOf(BlockCache.DEFAULT_READ_AHEAD_CONCURRENCY, concurrency),
         ),
         ownsCache = true,
         initialRole = initialRole,

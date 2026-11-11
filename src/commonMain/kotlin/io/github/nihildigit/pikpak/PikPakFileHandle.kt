@@ -1,6 +1,7 @@
 package io.github.nihildigit.pikpak
 
 import io.github.nihildigit.pikpak.internal.AdaptiveRangeSource
+import io.github.nihildigit.pikpak.internal.HostHealth
 import io.github.nihildigit.pikpak.internal.SignedUrlGates
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
@@ -8,6 +9,7 @@ import kotlin.coroutines.ContinuationInterceptor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlin.time.TimeMark
 import kotlin.time.Duration.Companion.milliseconds
 import io.github.nihildigit.pikpak.internal.FileReactivationCoordinator
@@ -139,6 +141,11 @@ class PikPakFileHandle(
      * [PikPakClient.fileHandle], which fills this in.
      */
     initialLink: VariantLink? = null,
+    /**
+     * Ordered candidate links for this representation (including cross-host rewritten transcode
+     * URLs ahead of congested transcode nodes, keeping the original transcode URL as fallback).
+     */
+    initialCandidates: List<VariantLink> = emptyList(),
     /** The variant's length when the caller already knows it, which saves a transcode the probe in [streamSize]. */
     streamSize: Long? = null,
     /** Metadata of the fixed representation, used to size its playback reserve. */
@@ -163,9 +170,20 @@ class PikPakFileHandle(
     /** Whether this file is waiting for its archived bytes to become readable. */
     val isReactivating: StateFlow<Boolean> = coordinator.isReactivating
 
+    /** Ordered candidate links (including cross-host rewritten URLs and the original fallback). */
+    @Volatile
+    private var candidateLinks: List<VariantLink> = initialCandidates
+        .filter { it.url.isNotBlank() }
+        .ifEmpty { listOfNotNull(initialLink?.takeIf { it.url.isNotBlank() }) }
+
+    /** Ordered candidate URLs currently held by this handle. */
+    val candidateUrls: List<String> get() = candidateLinks.map { it.url }
+
     /** The link [provideUrl] handed out last; reused by a new reader while it stays valid. */
     @Volatile
-    private var link: VariantLink? = initialLink?.takeIf { it.url.isNotBlank() }
+    private var link: VariantLink? = initialLink?.takeIf { it.url.isNotBlank() } ?: candidateLinks.firstOrNull()
+    private val mismatchedUrls = MutableStateFlow<Set<String>>(emptySet())
+    private val mismatchedPaths = MutableStateFlow<Set<String>>(emptySet())
 
     /** Guards [unreportedObject] alone, so it is never held across a network call. */
     private val reportMutex = Mutex()
@@ -213,6 +231,23 @@ class PikPakFileHandle(
     @Volatile private var probedSize: Long? = streamSize
 
     /**
+     * Latest known byte length of this representation (`probedSize` or client's remembered
+     * `streamSize`), updated automatically on the very first `206 Partial Content` response.
+     */
+    val knownStreamSize: Long?
+        get() = probedSize ?: mediaId?.let { client.knownStreamSize(gcid, it) } ?: size.takeIf { mediaId == null }
+
+    init {
+        client.registerStreamSizeUrls(candidateUrls, ::recordStreamSize)
+    }
+
+    internal fun recordStreamSize(totalSize: Long) {
+        if (totalSize <= 0L) return
+        probedSize = totalSize
+        client.rememberStreamSize(gcid, mediaId ?: ORIGINAL_KEY, totalSize)
+    }
+
+    /**
      * The file object currently backing this handle, or null before the first
      * read. Changes whenever the handle has to rebuild. A caller may cache it
      * to save this handle's successor one request, but must not treat it as the
@@ -234,8 +269,8 @@ class PikPakFileHandle(
         length: Long,
         priority: Int,
         block: suspend (ByteReadChannel) -> T,
-    ): T {
-        return currentReader().read(start, length, priority, block)
+    ): T = withContext(StreamSizeListener(::recordStreamSize)) {
+        currentReader().read(start, length, priority, block)
     }
 
     /** Resolves the link now so the first read does not pay for it. */
@@ -367,6 +402,8 @@ class PikPakFileHandle(
             gate = fileGate,
             onAttempt = ::observeAttempt,
             coordinator = coordinator,
+            allowEmptyBodyReactivation = mediaId == null,
+            expectedTotal = size.takeIf { mediaId == null && it > 0L },
         ).also { reader = it }
     }
 
@@ -377,13 +414,24 @@ class PikPakFileHandle(
      * instead of having to make the CDN answer 404 first.
      */
     internal suspend fun provideUrl(request: UrlRequest): String {
+        if (request is UrlRequest.SizeMismatch) {
+            mismatchedUrls.update { it + request.previous }
+            urlObjectPath(request.previous)?.let { p -> mismatchedPaths.update { it + p } }
+            if (mediaId == null) preferMediaDetails = false
+        }
         // A reader asking for its first link gets the one already in hand while it is good: the
         // link a caller passed in from the detail it just looked up, or the one the probe in
         // streamSize minted a moment ago. Each used to cost another detail lookup.
-        val reusable = link.takeIf { request == UrlRequest.Initial && it != null && isUsable(it) }
+        val reusable = when (request) {
+            UrlRequest.Initial -> link?.takeIf { isUsable(it) } ?: candidateLinks.firstOrNull { isUsable(it) }
+            is UrlRequest.Unresponsive -> link?.url?.let(::nextCandidateAfter)
+            is UrlRequest.SizeMismatch -> nextCandidateAfter(request.previous)
+            else -> null
+        }
         val chosen = reusable ?: mintAvoidingBadHosts(request)
         link = chosen
         expiresAt = chosen.expiresAt
+        client.registerStreamSizeUrls(listOf(chosen.url), ::recordStreamSize)
         // After the link, never before it: the object still has to answer the
         // lookups that minted it, and a caller that deletes on this signal would
         // pull it out from under them.
@@ -391,7 +439,24 @@ class PikPakFileHandle(
         return chosen.url
     }
 
+    private fun nextCandidateAfter(staleUrl: String): VariantLink? {
+        val current = candidateLinks
+        if (current.isEmpty()) return null
+        val staleIndex = current.indexOfFirst { it.url == staleUrl }
+        if (staleIndex >= 0) {
+            for (i in (staleIndex + 1) until current.size) {
+                val candidate = current[i]
+                if (isUsable(candidate)) return candidate
+            }
+        }
+        return current.firstOrNull { it.url != staleUrl && isUsable(it) }
+    }
+
+    private fun isMismatchedUrl(url: String): Boolean =
+        url in mismatchedUrls.value || (urlObjectPath(url)?.let { it in mismatchedPaths.value } == true)
+
     private fun isUsable(candidate: VariantLink): Boolean {
+        if (isMismatchedUrl(candidate.url)) return false
         val expiry = candidate.expiresAt
         if (expiry != null && expiry - clock.now() <= refreshMargin) return false
         if (candidate.isLimited && client.isFreeAccount == false) return false
@@ -461,23 +526,15 @@ class PikPakFileHandle(
     }
 
     private fun linkOf(detail: FileDetail): VariantLink? {
-        if (mediaId == null) {
-            val candidates = listOfNotNull(
-                detail.originMediaLink,
-                detail.octetStream.takeIf { it.url.isNotBlank() },
-                detail.webContentLink.takeIf { it.isNotBlank() }?.let { DownloadLink(url = it) },
-                detail.medias.firstOrNull { it.isOrigin && it.link.url.isNotBlank() }?.link,
-            )
-            val chosen = candidates.firstOrNull { !client.hostHealth.isBad(it.url) && !it.isLimited }
-                ?: candidates.firstOrNull { !client.hostHealth.isBad(it.url) }
-                ?: candidates.firstOrNull { !it.isLimited }
-                ?: candidates.firstOrNull()
-                ?: return null
-            return VariantLink(chosen.url, chosen.expiresAt, chosen.isLimited, chosen.maxSpeedBytesPerSec)
-        }
-        val variant = detail.variant(mediaId) ?: return null
-        val url = variant.link.url.takeIf { it.isNotBlank() } ?: return null
-        return VariantLink(url, variant.link.expiresAt, variant.link.isLimited, variant.link.maxSpeedBytesPerSec)
+        val candidates = candidateLinksOf(detail, mediaId, client.hostHealth)
+            .filterNot { isMismatchedUrl(it.url) }
+        if (candidates.isEmpty()) return null
+        candidateLinks = candidates
+        client.registerStreamSizeUrls(candidates.map { it.url }, ::recordStreamSize)
+        return candidates.firstOrNull { !client.hostHealth.isBad(it.url) && !it.isLimited }
+            ?: candidates.firstOrNull { !client.hostHealth.isBad(it.url) }
+            ?: candidates.firstOrNull { !it.isLimited }
+            ?: candidates.firstOrNull()
     }
 
     /** The reader a read would use right now, creating it if needed. */
@@ -575,26 +632,19 @@ fun PikPakClient.fileHandle(
     onObjectMinted: (suspend (String) -> Unit)? = null,
     leased: Boolean = false,
     onRangeAttempt: ((RangeAttempt) -> Unit)? = null,
+    reactivationPollInterval: Duration = 8.seconds,
+    reactivationTimeout: Duration = 5.minutes,
 ): PikPakFileHandle {
     // Read off the detail directly, not through variant(): that throws for an original with no
     // link, and a missing link here only means the handle mints the first one itself
     val variant = if (mediaId == null) detail.medias.firstOrNull { it.isOrigin }
         else detail.medias.firstOrNull { it.mediaId == mediaId }
     hostHealth.observe(detail)
-    val link = if (mediaId == null) {
-        val candidates = listOfNotNull(
-            detail.originMediaLink,
-            detail.octetStream.takeIf { it.url.isNotBlank() },
-            detail.webContentLink.takeIf { it.isNotBlank() }?.let { DownloadLink(url = it) },
-            detail.medias.firstOrNull { it.isOrigin && it.link.url.isNotBlank() }?.link,
-        )
-        candidates.firstOrNull { !hostHealth.isBad(it.url) && !it.isLimited }
-            ?: candidates.firstOrNull { !hostHealth.isBad(it.url) }
-            ?: candidates.firstOrNull { !it.isLimited }
-            ?: candidates.firstOrNull()
-    } else {
-        variant?.link
-    }
+    val candidates = candidateLinksOf(detail, mediaId, hostHealth)
+    val chosen = candidates.firstOrNull { !hostHealth.isBad(it.url) && !it.isLimited }
+        ?: candidates.firstOrNull { !hostHealth.isBad(it.url) }
+        ?: candidates.firstOrNull { !it.isLimited }
+        ?: candidates.firstOrNull()
     return PikPakFileHandle(
         client = this,
         gcid = detail.hash,
@@ -606,12 +656,247 @@ fun PikPakClient.fileHandle(
         onObjectMinted = onObjectMinted,
         leased = leased,
         onRangeAttempt = onRangeAttempt,
-        initialLink = link?.url?.takeIf { it.isNotBlank() }?.let {
-            VariantLink(it, link.expiresAt, link.isLimited, link.maxSpeedBytesPerSec)
-        },
+        initialLink = chosen,
+        initialCandidates = candidates,
         streamSize = streamSize ?: detail.sizeBytes.takeIf { mediaId == null },
         videoInfo = variant?.video,
+        reactivationPollInterval = reactivationPollInterval,
+        reactivationTimeout = reactivationTimeout,
     ).also { handle ->
-        if (detail.originMediaLink != null && detail.originMediaLink?.url == link?.url) handle.preferMediaDetails = true
+        if (detail.originMediaLink != null &&
+            (detail.originMediaLink?.url == chosen?.url || chosen?.url?.let { HostHealth.poolOf(it) == "original" } == true)
+        ) {
+            handle.preferMediaDetails = true
+        }
     }
+}
+
+internal fun candidateLinksOf(
+    detail: FileDetail,
+    mediaId: String?,
+    hostHealth: HostHealth,
+): List<VariantLink> {
+    if (mediaId == null) {
+        val originLink = detail.originMediaLink
+            ?: detail.medias.firstOrNull { detail.isRawOriginalMedia(it) }?.link
+        val rawLinks = listOfNotNull(
+            detail.originMediaLink,
+            detail.links["application/octet-stream"]?.takeIf { it.url.isNotBlank() },
+            detail.octetStream.takeIf { it.url.isNotBlank() },
+            detail.webContentLink.takeIf { it.isNotBlank() }?.let { DownloadLink(url = it) },
+            detail.medias.firstOrNull { detail.isRawOriginalMedia(it) }?.link,
+        ).map { VariantLink(it.url, it.expiresAt, it.isLimited, it.maxSpeedBytesPerSec) }
+        val originVariant = originLink?.takeIf { it.url.isNotBlank() }?.let {
+            VariantLink(it.url, it.expiresAt, it.isLimited, it.maxSpeedBytesPerSec)
+        }
+        val rewrittenOrigin = originVariant?.let { base ->
+            val originUrl = base.url
+            val originHost = extractUrlHost(originUrl) ?: return@let null
+            val fastOctetHosts = listOfNotNull(
+                detail.links["application/octet-stream"]?.url?.takeIf { it.isNotBlank() },
+                detail.octetStream.url.takeIf { it.isNotBlank() },
+                detail.webContentLink.takeIf { it.isNotBlank() },
+            ).mapNotNull(::extractUrlHost)
+                .filter { canRewriteTranscodeHost(originUrl, originHost, it) && !isCongestedTranscodeHost(it) }
+                .distinct()
+            val nonCongestedMediaHosts = detail.medias
+                .mapNotNull { extractUrlHost(it.link.url) }
+                .filter {
+                    canRewriteTranscodeHost(originUrl, originHost, it) &&
+                        !isCongestedTranscodeHost(it) &&
+                        it !in fastOctetHosts
+                }
+                .distinct()
+            fun rewriteOriginTo(targetHost: String) = VariantLink(
+                url = replaceUrlHost(originUrl, targetHost),
+                expiresAt = base.expiresAt,
+                isLimited = base.isLimited,
+                maxSpeedBytesPerSec = base.maxSpeedBytesPerSec,
+            )
+            val fastRewrites = fastOctetHosts.map(::rewriteOriginTo)
+            val mediaRewrites = nonCongestedMediaHosts.map(::rewriteOriginTo)
+            val originCongestedOrBad = isCongestedTranscodeHost(originHost) || hostHealth.isBad(originUrl)
+            val seedRewrites = if (originCongestedOrBad) {
+                defaultFastClusterHostsOf(originHost)
+                    .filter {
+                        canRewriteTranscodeHost(originUrl, originHost, it) &&
+                            it !in fastOctetHosts &&
+                            it !in nonCongestedMediaHosts
+                    }
+                    .map(::rewriteOriginTo)
+            } else {
+                emptyList()
+            }
+            Quadruple(originCongestedOrBad, fastRewrites, mediaRewrites, seedRewrites)
+        }
+        val expandedLinks = buildList {
+            if (rewrittenOrigin != null) {
+                val (originCongestedOrBad, fastRewrites, mediaRewrites, seedRewrites) = rewrittenOrigin
+                if (originCongestedOrBad) {
+                    addAll(fastRewrites)
+                    addAll(mediaRewrites)
+                    addAll(rawLinks.filter { link -> extractUrlHost(link.url)?.let(::isCongestedTranscodeHost) != true })
+                    addAll(seedRewrites)
+                    addAll(rawLinks)
+                } else {
+                    originVariant.let(::add)
+                    addAll(fastRewrites)
+                    addAll(mediaRewrites)
+                    addAll(rawLinks)
+                }
+            } else {
+                addAll(rawLinks)
+            }
+        }
+        return buildList {
+            addAll(expandedLinks.filter { !hostHealth.isBad(it.url) && !it.isLimited })
+            addAll(expandedLinks.filter { !hostHealth.isBad(it.url) })
+            addAll(expandedLinks.filter { !it.isLimited })
+            addAll(expandedLinks)
+        }.distinctBy { it.url }
+    }
+    val variant = detail.medias.firstOrNull { it.mediaId == mediaId } ?: return emptyList()
+    val baseLink = variant.link
+    val baseUrl = baseLink.url.takeIf { it.isNotBlank() } ?: return emptyList()
+    val baseVariantLink = VariantLink(baseUrl, baseLink.expiresAt, baseLink.isLimited, baseLink.maxSpeedBytesPerSec)
+    val baseHost = extractUrlHost(baseUrl) ?: return listOf(baseVariantLink)
+
+    val fastOctetHosts = listOfNotNull(
+        detail.links["application/octet-stream"]?.url?.takeIf { it.isNotBlank() },
+        detail.octetStream.url.takeIf { it.isNotBlank() },
+        detail.webContentLink.takeIf { it.isNotBlank() },
+    ).mapNotNull(::extractUrlHost)
+        .filter { canRewriteTranscodeHost(baseUrl, baseHost, it) }
+        .distinct()
+
+    val mediaHosts = buildList {
+        detail.originMediaLink?.url?.let(::extractUrlHost)?.let(::add)
+        detail.medias.forEach { m ->
+            extractUrlHost(m.link.url)?.let(::add)
+        }
+    }.filter { canRewriteTranscodeHost(baseUrl, baseHost, it) && it !in fastOctetHosts }
+        .distinct()
+
+    fun rewriteTo(targetHost: String): VariantLink = VariantLink(
+        url = replaceUrlHost(baseUrl, targetHost),
+        expiresAt = baseLink.expiresAt,
+        isLimited = baseLink.isLimited,
+        maxSpeedBytesPerSec = baseLink.maxSpeedBytesPerSec,
+    )
+
+    val fastOctetCandidates = fastOctetHosts
+        .filter { !isCongestedTranscodeHost(it) }
+        .map(::rewriteTo)
+    val nonCongestedMediaCandidates = mediaHosts
+        .filter { !isCongestedTranscodeHost(it) }
+        .map(::rewriteTo)
+    val baseCongestedOrBad = isCongestedTranscodeHost(baseHost) || hostHealth.isBad(baseUrl)
+    val seedCandidates = if (baseCongestedOrBad) {
+        defaultFastClusterHostsOf(baseHost)
+            .filter { canRewriteTranscodeHost(baseUrl, baseHost, it) && it !in fastOctetHosts && it !in mediaHosts }
+            .map(::rewriteTo)
+    } else {
+        emptyList()
+    }
+    val congestedFallbackCandidates = (fastOctetHosts.filter(::isCongestedTranscodeHost) +
+        mediaHosts.filter(::isCongestedTranscodeHost))
+        .map(::rewriteTo)
+
+    return buildList {
+        // Place fast octet-stream host(s) and non-congested dl-z01a seeds ahead of congested
+        // transcode nodes (0026/0027/0051..0055/0063..0064), while keeping the server-issued
+        // transcode URL first when its own host is healthy.
+        if (baseCongestedOrBad) {
+            addAll(fastOctetCandidates.filter { !hostHealth.isBad(it.url) })
+            addAll(nonCongestedMediaCandidates.filter { !hostHealth.isBad(it.url) })
+            addAll(seedCandidates.filter { !hostHealth.isBad(it.url) })
+            add(baseVariantLink)
+        } else {
+            add(baseVariantLink)
+            addAll(fastOctetCandidates.filter { !hostHealth.isBad(it.url) })
+            addAll(nonCongestedMediaCandidates.filter { !hostHealth.isBad(it.url) })
+        }
+        addAll(congestedFallbackCandidates.filter { !hostHealth.isBad(it.url) })
+        addAll(fastOctetCandidates)
+        addAll(nonCongestedMediaCandidates)
+        addAll(seedCandidates)
+        add(baseVariantLink)
+        addAll(congestedFallbackCandidates)
+    }.distinctBy { it.url }
+}
+
+private data class Quadruple<out A, out B, out C, out D>(
+    val first: A,
+    val second: B,
+    val third: C,
+    val fourth: D,
+)
+
+private fun defaultFastClusterHostsOf(baseHost: String): List<String> {
+    val lower = baseHost.lowercase()
+    if (!lower.startsWith("dl-z01a-")) return emptyList()
+    val dot = baseHost.indexOf('.')
+    if (dot <= 0) return emptyList()
+    val domain = baseHost.substring(dot)
+    return io.github.nihildigit.pikpak.internal.HostHealth.DEFAULT_DL_Z01A_SEEDS.map { "$it$domain" }
+}
+
+private fun extractUrlHost(url: String): String? {
+    val schemeEnd = url.indexOf("://")
+    if (schemeEnd < 0) return null
+    val hostStart = schemeEnd + 3
+    val authorityEnd = url.indexOf('/', hostStart).let { if (it < 0) url.length else it }
+    val authority = url.substring(hostStart, authorityEnd)
+    return authority.substringBefore(':').takeIf { it.isNotEmpty() }
+}
+
+private fun replaceUrlHost(url: String, newHost: String): String {
+    val schemeEnd = url.indexOf("://")
+    if (schemeEnd < 0) return url
+    val hostStart = schemeEnd + 3
+    val authorityEnd = url.indexOf('/', hostStart).let { if (it < 0) url.length else it }
+    val authority = url.substring(hostStart, authorityEnd)
+    val portSuffix = if (':' in authority) ":" + authority.substringAfter(':') else ""
+    return url.substring(0, hostStart) + newHost + portSuffix + url.substring(authorityEnd)
+}
+
+private fun clusterPrefixOf(host: String): String? {
+    val lower = host.lowercase()
+    val dash = lower.lastIndexOf('-')
+    if (dash <= 0) return null
+    val dot = lower.indexOf('.', dash)
+    val nodePart = (if (dot > dash) lower.substring(dash + 1, dot) else lower.substring(dash + 1))
+    if (nodePart.isEmpty() || !nodePart.all { it.isDigit() }) return null
+    val domainPart = if (dot > 0) lower.substring(dot) else ""
+    return lower.substring(0, dash + 1) + "*" + domainPart
+}
+
+private fun isOssHost(host: String): Boolean =
+    host.contains("aliyuncs.com", ignoreCase = true)
+
+private fun isShardedArchiveHost(host: String): Boolean =
+    host.startsWith("dl-a10b-", ignoreCase = true)
+
+private fun canRewriteTranscodeHost(baseUrl: String, baseHost: String, targetHost: String): Boolean {
+    if (targetHost.isBlank() || targetHost.equals(baseHost, ignoreCase = true)) return false
+    if (isOssHost(baseHost) || isOssHost(targetHost)) return false
+    if (isShardedArchiveHost(baseHost) || isShardedArchiveHost(targetHost)) return false
+    if (baseUrl.contains("x-oss-signature", ignoreCase = true)) return false
+    val baseCluster = clusterPrefixOf(baseHost)
+    val targetCluster = clusterPrefixOf(targetHost)
+    if (baseCluster != null && targetCluster != null) {
+        return baseCluster == targetCluster
+    }
+    return baseUrl.contains("/download/")
+}
+
+private fun isCongestedTranscodeHost(host: String): Boolean {
+    if (isShardedArchiveHost(host)) return false
+    val lower = host.lowercase()
+    val dash = lower.lastIndexOf('-')
+    if (dash < 0) return false
+    val dot = lower.indexOf('.', dash)
+    val nodeNumber = (if (dot > dash) lower.substring(dash + 1, dot) else lower.substring(dash + 1)).toIntOrNull()
+        ?: return false
+    return nodeNumber in 26..27 || nodeNumber in 51..55 || nodeNumber in 63..64
 }

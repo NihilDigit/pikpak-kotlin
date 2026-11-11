@@ -312,6 +312,88 @@ class FileReactivationTest {
         }
     }
 
+    @Test
+    fun `original handle wakes cold storage on empty 206 bodies and polls past premature stream disconnects`() = runTest {
+        var warmed = false
+        var probes = 0
+        val probeEntered = CompletableDeferred<Unit>()
+        val releaseReady = CompletableDeferred<Unit>()
+        fixture { request ->
+            when (request.headers[HttpHeaders.Range]) {
+                null -> {
+                    warmed = true
+                    respond("", HttpStatusCode.OK)
+                }
+                "bytes=0-0" -> {
+                    probes++
+                    probeEntered.complete(Unit)
+                    if (probes == 1) {
+                        val broken = io.ktor.utils.io.ByteChannel(autoFlush = true).apply {
+                            cancel(kotlinx.io.IOException("unexpected end of stream"))
+                        }
+                        respond(
+                            broken,
+                            HttpStatusCode.PartialContent,
+                            Headers.build {
+                                append(HttpHeaders.ContentRange, "bytes 0-0/3")
+                                append(HttpHeaders.ContentLength, "1")
+                            },
+                        )
+                    } else {
+                        releaseReady.await()
+                        ready()
+                    }
+                }
+                "bytes=0-2" -> if (!warmed) {
+                    val empty = io.ktor.utils.io.ByteChannel(autoFlush = true).apply {
+                        cancel(kotlinx.io.IOException("unexpected end of stream"))
+                    }
+                    respond(
+                        empty,
+                        HttpStatusCode.PartialContent,
+                        Headers.build {
+                            append(HttpHeaders.ContentRange, "bytes 0-2/3")
+                            append(HttpHeaders.ContentLength, "3")
+                        },
+                    )
+                } else {
+                    respond(
+                        ByteReadChannel(byteArrayOf(9, 8, 7)),
+                        HttpStatusCode.PartialContent,
+                        Headers.build {
+                            append(HttpHeaders.ContentRange, "bytes 0-2/3")
+                            append(HttpHeaders.ContentLength, "3")
+                        },
+                    )
+                }
+                else -> error("unexpected range: ${request.headers[HttpHeaders.Range]}")
+            }
+        }.use { fixture ->
+            val handle = PikPakFileHandle(
+                client = fixture.client,
+                gcid = "A3C62CB153B61CF265298986AD97EA07A85112DF",
+                size = 3,
+                name = "cold.mp4",
+                initialLink = VariantLink(URL, expiresAt = null),
+                reactivationPollInterval = 10.milliseconds,
+                reactivationTimeout = 500.milliseconds,
+            )
+            try {
+                val read = async { handle.readBytes(0, 3) }
+                probeEntered.await()
+                assertTrue(handle.isReactivating.value)
+                releaseReady.complete(Unit)
+                assertContentEquals(byteArrayOf(9, 8, 7), read.await())
+                assertFalse(handle.isReactivating.value)
+                assertFalse(fixture.client.hostHealth.isBad(URL))
+                assertEquals(listOf("bytes=0-2", "bytes=0-2", null, "bytes=0-0", "bytes=0-0", "bytes=0-2"), fixture.ranges())
+            } finally {
+                releaseReady.complete(Unit)
+                handle.close()
+            }
+        }
+    }
+
     private fun TestScope.fixture(
         handler: suspend MockRequestHandleScope.(HttpRequestData) -> HttpResponseData,
     ): Fixture {

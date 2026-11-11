@@ -57,6 +57,8 @@ data class FileStat(
     val starred: Boolean = false,
     val revision: String = "",
     val writable: Boolean = true,
+    val medias: List<MediaVariant> = emptyList(),
+    val links: Map<String, DownloadLink> = emptyMap(),
 ) {
     val isFolder: Boolean get() = kind == FileKind.FOLDER
 
@@ -256,20 +258,54 @@ data class FileDetail(
     /** The `application/octet-stream` link — the raw file — or an empty one. */
     val octetStream: DownloadLink get() = links[OCTET_STREAM] ?: DownloadLink()
 
-    /** Premium original-media links serve the same bytes with a different service policy. */
+    /**
+     * Premium original-media links serve the raw file with a higher per-connection speed cap,
+     * EXCEPT on large 4K remuxes where PikPak substitutes a transcoded stream (`category=transcoded`
+     * / `t=1` or sharing the exact object path of a non-origin transcode entry) into `is_origin`.
+     */
     val originMediaLink: DownloadLink?
-        get() = medias.firstOrNull { it.isOrigin && it.link.url.isNotBlank() && !it.link.isLimited }?.link
+        get() = medias.firstOrNull { isRawOriginalMedia(it) && !it.link.isLimited }?.link
 
-    /** Prefer unrestricted media, then ordinary download, retaining limited media as a last resort. */
+    /** Prefer unrestricted raw media, then ordinary download, retaining limited raw media as a last resort. */
     val originalLink: DownloadLink
         get() = originMediaLink ?: octetStream.takeIf { it.url.isNotBlank() }
-            ?: medias.firstOrNull { it.isOrigin && it.link.url.isNotBlank() }?.link ?: octetStream
+            ?: medias.firstOrNull { isRawOriginalMedia(it) }?.link ?: octetStream
 
     val downloadUrl: String? get() = originalLink.url.takeIf { it.isNotBlank() }
 
     companion object {
         const val OCTET_STREAM = "application/octet-stream"
     }
+}
+
+internal fun FileDetail.isRawOriginalMedia(variant: MediaVariant): Boolean {
+    val url = variant.link.url
+    if (!variant.isOrigin || url.isBlank()) return false
+    if (io.github.nihildigit.pikpak.internal.HostHealth.poolOf(url) == "transcoded") return false
+    val originPath = urlObjectPath(url)
+    val octetPath = urlObjectPath(octetStream.url)
+    if (
+        originPath != null &&
+        originPath != octetPath &&
+        medias.any { !it.isOrigin && urlObjectPath(it.link.url) == originPath }
+    ) {
+        return false
+    }
+    return true
+}
+
+internal fun urlObjectPath(url: String): String? {
+    val schemeEnd = url.indexOf("://")
+    if (schemeEnd < 0) return null
+    val pathStart = url.indexOf('/', schemeEnd + 3)
+    if (pathStart < 0) return null
+    val queryStart = url.indexOf('?', pathStart).let { if (it < 0) url.length else it }
+    val fragmentStart = url.indexOf('#', pathStart).let { if (it < 0) url.length else it }
+    val end = minOf(queryStart, fragmentStart)
+    val raw = url.substring(pathStart, end)
+    val trimmed = raw.trim('/')
+    if (trimmed.isEmpty() || trimmed.equals("download", ignoreCase = true)) return null
+    return raw
 }
 
 @Serializable

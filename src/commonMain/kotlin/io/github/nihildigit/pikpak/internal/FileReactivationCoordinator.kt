@@ -111,14 +111,23 @@ internal class FileReactivationCoordinator(
                         headers.remove(HttpHeaders.Range)
                     }) { response ->
                         response.bodyAsChannel().cancel(null)
-                        if (response.status.value !in 200..299) {
+                        if (response.status.value !in 200..299 && !response.headers.isColdArchive()) {
                             throw PikPakException(-1, "reactivation wake failed", httpStatus = response.status.value)
                         }
                     }
                 }
                 wakeSent = true
+            } catch (_: FileReactivatingException) {
+                wakeSent = true
             } catch (e: UrlExpiredException) {
                 url = refresh(url)
+            } catch (e: Throwable) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (isEmptyBodyDisconnect(e)) {
+                    wakeSent = true
+                } else {
+                    throw e
+                }
             }
         }
         var attempt = 0
@@ -127,18 +136,31 @@ internal class FileReactivationCoordinator(
             try {
                 client.streamRangeFromUrl(url, 0, 1) { stream ->
                     val byte = ByteArray(1)
-                    check(stream.channel.readAvailable(byte, 0, 1) == 1) { "empty reactivation probe" }
+                    if (stream.channel.readAvailable(byte, 0, 1) < 1) {
+                        throw FileReactivatingException("empty reactivation probe")
+                    }
                 }
                 return
             } catch (_: FileReactivatingException) {
                 // This protocol status neither spends transport retries nor changes host health.
             } catch (e: UrlExpiredException) {
                 url = refresh(url)
+            } catch (e: Throwable) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (!isEmptyBodyDisconnect(e)) throw e
             }
         }
     }
 
     companion object {
         val DEFAULT_POLL_INTERVAL: Duration = 8.seconds
+
+        internal fun isEmptyBodyDisconnect(error: Throwable): Boolean =
+            generateSequence(error) { it.cause }.take(6).any { cause ->
+                val msg = cause.message?.lowercase().orEmpty()
+                msg.contains("unexpected end of stream") ||
+                    msg.contains("prematurely") ||
+                    msg.contains("eof")
+            }
     }
 }

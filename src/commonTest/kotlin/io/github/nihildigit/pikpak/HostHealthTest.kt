@@ -376,4 +376,99 @@ class HostHealthTest {
         assertTrue(health.isBad(flakySibling))
         assertEquals(fastPrimary, health.route(fastPrimary, mayExplore = false))
     }
+
+    @Test
+    fun `stalled host is marked bad across pools and fails over to unmeasured usable sibling`() {
+        val time = TestTimeSource()
+        val health = HostHealth(timeSource = time)
+        val originalStalled = "https://dl-z01a-0054.mypikpak.com/download/?fid=F&category=original"
+        val transcodedStalled = "https://dl-z01a-0054.mypikpak.com/download/?fid=F&t=1"
+        val transcodedClean = "https://dl-z01a-0042.mypikpak.com/download/?fid=F&t=1"
+        health.observe(
+            FileDetail(
+                medias = listOf(
+                    MediaVariant(isOrigin = true, link = DownloadLink(url = originalStalled)),
+                    MediaVariant(mediaId = "720", link = DownloadLink(url = transcodedStalled)),
+                    MediaVariant(mediaId = "1080", link = DownloadLink(url = transcodedClean)),
+                ),
+            ),
+        )
+        health.stalled(originalStalled, deliveredBytes = 128 * 1024L, bodyBytesPerSecond = 20 * 1024L, silenceDuration = 3.seconds)
+        assertTrue(health.isBad(transcodedStalled))
+        assertEquals(transcodedClean, health.route(transcodedStalled, mayExplore = false))
+    }
+
+    @Test
+    fun `sharded archive dl-a10b urls are never rerouted across sibling nodes`() {
+        val health = HostHealth(seeds = listOf("dl-a10b-0861", "dl-a10b-1533"))
+        val shardA = "https://dl-a10b-1556.mypikpak.com/download/?fid=F&t=1"
+        val shardB = "https://dl-a10b-0861.mypikpak.com/download/?fid=F&t=1"
+        health.observe(
+            FileDetail(
+                medias = listOf(
+                    MediaVariant(mediaId = "720", link = DownloadLink(url = shardA)),
+                    MediaVariant(mediaId = "480", link = DownloadLink(url = shardB)),
+                ),
+            ),
+        )
+        health.measure("dl-a10b-0861.mypikpak.com", 10_000_000)
+        assertEquals(shardA, health.route(shardA, mayExplore = true))
+    }
+
+    @Test
+    fun `proven fast host survives first transient body stall as suspect before second stall marks it bad`() {
+        val time = TestTimeSource()
+        val health = HostHealth(timeSource = time, seeds = HostHealth.DEFAULT_DL_Z01A_SEEDS)
+        val fastOctetTranscode = "https://dl-z01a-0048.mypikpak.com/download/?fid=F&t=1"
+        repeat(HostHealth.MIN_SAMPLES) {
+            health.delivered(HostHealth.hostOf(fastOctetTranscode), HostHealth.MIN_SAMPLE_BYTES, 4_000_000, fastOctetTranscode)
+        }
+        health.stalled(
+            fastOctetTranscode,
+            deliveredBytes = 64 * 1024L,
+            bodyBytesPerSecond = 32 * 1024L,
+            silenceDuration = 2.seconds,
+        )
+        assertFalse(health.isBad(fastOctetTranscode))
+        assertEquals(fastOctetTranscode, health.route(fastOctetTranscode, mayExplore = false))
+
+        // After SUSPECT_WINDOW elapses without another stall, a later isolated stall also remains suspect.
+        time += HostHealth.SUSPECT_WINDOW
+        repeat(HostHealth.MIN_SAMPLES) {
+            health.delivered(HostHealth.hostOf(fastOctetTranscode), HostHealth.MIN_SAMPLE_BYTES, 4_000_000, fastOctetTranscode)
+        }
+        health.stalled(
+            fastOctetTranscode,
+            deliveredBytes = 64 * 1024L,
+            bodyBytesPerSecond = 32 * 1024L,
+            silenceDuration = 2.seconds,
+        )
+        assertFalse(health.isBad(fastOctetTranscode))
+
+        // A second stall inside SUSPECT_WINDOW escalates the host to bad and fails over to a clean seed.
+        health.stalled(
+            fastOctetTranscode,
+            deliveredBytes = 64 * 1024L,
+            bodyBytesPerSecond = 32 * 1024L,
+            silenceDuration = 2.seconds,
+        )
+        assertTrue(health.isBad(fastOctetTranscode))
+        assertEquals("https://dl-z01a-0041.mypikpak.com/download/?fid=F&t=1", health.route(fastOctetTranscode, mayExplore = false))
+    }
+
+    @Test
+    fun `unproven congested dl-z01a transcode link proactively steers to non-congested seed unless proven fast`() {
+        val health = HostHealth(seeds = HostHealth.DEFAULT_DL_Z01A_SEEDS)
+        val congestedTranscode = "https://dl-z01a-0054.mypikpak.com/download/?fid=F&t=1"
+        assertEquals(
+            "https://dl-z01a-0041.mypikpak.com/download/?fid=F&t=1",
+            health.route(congestedTranscode, mayExplore = false),
+        )
+
+        // If the congested label itself has proven good throughput on this line, do not force a rewrite.
+        repeat(HostHealth.MIN_SAMPLES) {
+            health.delivered(HostHealth.hostOf(congestedTranscode), HostHealth.MIN_SAMPLE_BYTES, 3_000_000, congestedTranscode)
+        }
+        assertEquals(congestedTranscode, health.route(congestedTranscode, mayExplore = false))
+    }
 }

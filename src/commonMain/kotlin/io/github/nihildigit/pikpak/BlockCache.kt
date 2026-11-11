@@ -86,7 +86,7 @@ import kotlin.time.TimeSource
 internal class BlockCache(
     private val source: RangeSource,
     val size: Long,
-    private val concurrency: Int,
+    private val concurrency: Int = DEFAULT_READ_AHEAD_CONCURRENCY,
     parentCoroutineContext: CoroutineContext,
     /** The account's foreground count. Null for a cache built outside a client, which then only bands priorities. */
     private val foregroundStreams: ForegroundStreams?,
@@ -107,6 +107,8 @@ internal class BlockCache(
     @Volatile private var mediaBytesPerSecond: Long? = null,
     internal val timeSource: TimeSource = scheduler?.timeSource ?: TimeSource.Monotonic,
     memoryBudget: TransportMemoryBudget? = null,
+    /** Default 4-way striping across 256 KiB slots = 1 MiB read-ahead window. */
+    val readAheadConcurrency: Int = DEFAULT_READ_AHEAD_CONCURRENCY,
     /** Live admission ceiling; [concurrency] remains the pre-created worker hard limit. */
     private val workerLimit: () -> Int = { concurrency },
 ) {
@@ -398,6 +400,20 @@ internal class BlockCache(
         @Volatile
         internal var seeking = true
 
+        /**
+         * Suppresses multi-slot read-ahead while a caller probes the file head at offset 0
+         * (`<= 2 * blockSize`, e.g. mpv reading MP4 `ftyp`/`moov` or MKV EBML headers before
+         * seeking to a resume offset) until sequential reading advances past the first slot
+         * (`offset >= blockSize` or cumulative sequential read at `0` exceeds `2 * blockSize`).
+         */
+        @Volatile
+        internal var headHysteresis = blockSize >= PikPakStreamReader.DEFAULT_BLOCK_SIZE
+
+        @Volatile
+        internal var headTargetBytes: Long = blockSize.coerceAtMost(size)
+
+        @Volatile
+        internal var headSequentialBytes: Long = 0L
 
         @Volatile
         internal var closed = false
@@ -411,6 +427,7 @@ internal class BlockCache(
 
     init {
         require(concurrency >= 1) { "concurrency must be >= 1, got $concurrency" }
+        require(readAheadConcurrency >= 1) { "readAheadConcurrency must be >= 1, got $readAheadConcurrency" }
         require(size >= 0) { "size must be >= 0, got $size" }
         require(blockSize in 1..Int.MAX_VALUE.toLong())
         require(size == 0L || (size - 1) / blockSize < Int.MAX_VALUE)
@@ -567,6 +584,9 @@ internal class BlockCache(
     fun setDemand(cursor: Cursor, demand: TransferDemand?) {
         cursor.demandWatch?.cancel()
         cursor.demand = demand
+        if ((demand?.priority ?: 0) >= PikPakStreamReader.BLOCKING_PRIORITY && cursor.position == 0L && cursor.headSequentialBytes == 0L) {
+            cursor.headHysteresis = true
+        }
         cursor.demandWatch = demand?.let { owner -> scope.launch {
             owner.changes.collect { if (owner.isClosed) closeCursor(cursor) else { syncForegroundCount(); bump() } }
         } }
@@ -600,6 +620,9 @@ internal class BlockCache(
         if (cursor.urgent == urgent) return
         cursor.urgent = urgent
         cursor.urgentSince = if (urgent) timeSource.markNow() else null
+        if (urgent && cursor.position == 0L && cursor.headSequentialBytes == 0L) {
+            cursor.headHysteresis = true
+        }
         bump()
     }
 
@@ -621,6 +644,16 @@ internal class BlockCache(
         if (!inNearWindow) {
             cursor.seeking = true
         }
+        if (position == 0L) {
+            cursor.headSequentialBytes = 0L
+            cursor.headTargetBytes = blockSize.coerceAtMost(size)
+            cursor.headHysteresis = blockSize >= PikPakStreamReader.DEFAULT_BLOCK_SIZE ||
+                cursor.urgent ||
+                (cursor.demand?.priority ?: 0) >= PikPakStreamReader.BLOCKING_PRIORITY
+        } else {
+            cursor.headHysteresis = false
+            cursor.headSequentialBytes = -1L
+        }
         cancelUnwanted()
         bump()
     }
@@ -635,6 +668,23 @@ internal class BlockCache(
         val pos = cursor.position
         if (pos >= size) return -1
         if (length == 0) return 0
+        if (pos == 0L) {
+            if (length > 2L * blockSize) {
+                cursor.headHysteresis = false
+            } else if (blockSize >= PikPakStreamReader.DEFAULT_BLOCK_SIZE ||
+                cursor.urgent ||
+                (cursor.demand?.priority ?: 0) >= PikPakStreamReader.BLOCKING_PRIORITY
+            ) {
+                cursor.headHysteresis = true
+                cursor.headTargetBytes = maxOf(blockSize, length.toLong()).coerceAtMost(size)
+            }
+        } else if (cursor.headHysteresis && pos >= blockSize) {
+            cursor.headHysteresis = false
+            if (cursor.seeking && cursor.headSequentialBytes >= blockSize) {
+                cursor.seeking = false
+            }
+            bump()
+        }
         if (!cursor.consuming) {
             cursor.consuming = true
             bump()
@@ -654,7 +704,16 @@ internal class BlockCache(
             if (!cursor.demandActive && !closed) scope.launch { cancelUnwanted() }
             if (cursor.readAhead == 0L || !cursor.demandActive) bump()
         }
-        if (cursor.seeking && (slotOf(pos + available) != slot || slot in cache)) {
+        if (cursor.headSequentialBytes >= 0L) {
+            cursor.headSequentialBytes += available
+        }
+        if (cursor.headHysteresis && (pos + available >= blockSize ||
+                cursor.headSequentialBytes > 2L * blockSize ||
+                (!cursor.urgent && (cursor.demand?.priority ?: 0) < PikPakStreamReader.BLOCKING_PRIORITY && pos + available >= cursor.headTargetBytes))
+        ) {
+            cursor.headHysteresis = false
+        }
+        if (cursor.seeking && !cursor.headHysteresis && (slotOf(pos + available) != slot || slot in cache)) {
             cursor.seeking = false
             bump()
         }
@@ -1019,12 +1078,17 @@ internal class BlockCache(
                 checkOpen(cursor)
                 updateSchedule(liveCursors())
                 inFlight[slot]?.takeIf { it.nextSlot == slot && it.priority < PikPakStreamReader.STREAMING_PRIORITY }?.let { fetch ->
-                    val mark = if (cursor.urgent) null else cursor.feedbackAt
-                    if (mark != null && fetch.deadlineSlot != slot && fetch.deadlineFeedback !== mark) {
+                    val urgentWait = cursor.urgent || (cursor.demand?.priority ?: 0) >= PikPakStreamReader.BLOCKING_PRIORITY
+                    val mark = cursor.feedbackAt
+                    val deadline = when {
+                        urgentWait -> timeSource.markNow() + URGENT_TAKEOVER_DEADLINE
+                        mark != null -> mark + cursor.bufferedDuration
+                        else -> null
+                    }
+                    if (deadline != null && fetch.deadlineSlot != slot && (urgentWait || fetch.deadlineFeedback !== mark)) {
                         fetch.deadlineSlot = slot
                         fetch.deadlineFeedback = mark
-                        fetch.demand.requireBytesBy(slot.toLong() * blockSize + within + 1,
-                            mark + cursor.bufferedDuration)
+                        fetch.demand.requireBytesBy(slot.toLong() * blockSize + within + 1, deadline)
                     }
                 }
                 inFlight[slot]?.takeIf { slot > it.nextSlot }?.let {
@@ -1223,9 +1287,12 @@ internal class BlockCache(
         } else {
             PikPakStreamReader.STREAMING_PRIORITY
         }
+        val effectiveReadAhead = effectiveReadAheadConcurrency()
+        val readAheadHeld = activeFetches.count { !it.durable && it.slots.none { s -> s in wanted } } >= effectiveReadAhead
         for (cursor in live) {
             for (slot in windowOf(cursor)) {
                 if (slot in cache || slot in offered || slot in inFlight || slot in failed || slot in persisting) continue
+                if (readAheadHeld && slot != slotOf(cursor.position)) continue
                 if (scheduler?.isAccountHungry() == true && priorityFor(cursor, slot) < minCursorPriority) continue
                 consider(slot, priorityFor(cursor, slot), cursor.order, cursor)
                 break
@@ -1278,7 +1345,11 @@ internal class BlockCache(
                 (downloadWant != null && !downloadsThrottled()) ||
                 streamWarm != null)
         }
-        val spanWorkers = (if (downloadWant != null) minOf(durableLimit, localLimit) else activeWorkers()).coerceAtLeast(1)
+        val spanWorkers = when {
+            downloadWant != null -> minOf(durableLimit, localLimit)
+            owner != null -> minOf(activeWorkers(), effectiveReadAhead)
+            else -> activeWorkers()
+        }.coerceAtLeast(1)
         val fairShare = when {
             downloadWant != null -> {
                 val remaining = (downloadWant.slots.size - downloadWant.next).coerceAtLeast(1).toLong()
@@ -1291,12 +1362,14 @@ internal class BlockCache(
             }
             else -> 2
         }
+        val highBitrateSpan = if (!blocking) highBitratePlaybackSpan() else 1
         val playbackSpan = owner?.let { cursor ->
-            if (registration == null) {
+            val baseSpan = if (registration == null) {
                 if (wide(cursor)) 4 else 2
             } else {
                 scheduler!!.spanFor(registration!!, spanWorkers)
             }
+            maxOf(baseSpan, highBitrateSpan)
         } ?: (registration?.let { scheduler!!.spanFor(it, spanWorkers) } ?: 2)
         val maxSpan = when {
             owner != null && targetPriority == PikPakStreamReader.READ_AHEAD_PRIORITY && comfortable(owner) -> 1
@@ -1394,6 +1467,11 @@ internal class BlockCache(
     private fun windowOf(cursor: Cursor): IntRange {
         if (!cursor.demandActive && !cursor.reading) return IntRange.EMPTY
         if (cursor.readAhead == 0L) return if (cursor.reading && cursor.position < size) slotOf(cursor.position)..slotOf(cursor.position) else IntRange.EMPTY
+        if (cursor.headHysteresis) {
+            if (size <= 0L || cursor.position >= size) return IntRange.EMPTY
+            val endByte = minOf(size - 1, maxOf(cursor.position, cursor.headTargetBytes - 1))
+            return slotOf(cursor.position)..slotOf(endByte)
+        }
         if (cursor.effectiveRole == StreamRole.FOREGROUND && cursor.seeking && (cursor.urgent || (cursor.demand?.priority ?: 0) >= PikPakStreamReader.BLOCKING_PRIORITY)) {
             return if (cursor.position < size) slotOf(cursor.position)..slotOf(cursor.position) else IntRange.EMPTY
         }
@@ -1912,12 +1990,35 @@ internal class BlockCache(
         covered.coerceAtMost(windowEnd) - pos
     }
 
+    private fun effectiveReadAheadConcurrency(): Int {
+        if (readAheadConcurrency != DEFAULT_READ_AHEAD_CONCURRENCY) return readAheadConcurrency
+        val rate = mediaBytesPerSecond ?: return readAheadConcurrency
+        if (rate < HIGH_BITRATE_READ_AHEAD_THRESHOLD_BYTES_PER_SEC) return readAheadConcurrency
+        val scaled = ((rate + BYTES_PER_SEC_PER_READ_AHEAD_WORKER - 1L) / BYTES_PER_SEC_PER_READ_AHEAD_WORKER).toInt()
+        return scaled.coerceIn(readAheadConcurrency, concurrency)
+    }
+
+    private fun highBitratePlaybackSpan(): Int {
+        val rate = mediaBytesPerSecond ?: return 1
+        if (rate < HIGH_BITRATE_READ_AHEAD_THRESHOLD_BYTES_PER_SEC) return 1
+        val targetSpanBytes = (rate / 4L).coerceIn(blockSize, 4L * blockSize)
+        return (targetSpanBytes / blockSize).toInt().coerceIn(1, 4)
+    }
+
     // Tests may claim a not-yet-started fetch while all actual workers are occupied.
     internal suspend fun claimForTest(): Fetch? = locked { claimNext(enforceWorkerLimit = false) }
 
     internal suspend fun abandonForTest(fetch: Fetch): Unit = abandon(fetch)
 
     internal companion object {
+        /** Default 4-way striping across 256 KiB slots = 1 MiB read-ahead window. */
+        const val DEFAULT_READ_AHEAD_CONCURRENCY = 4
+        private const val HIGH_BITRATE_READ_AHEAD_THRESHOLD_BYTES_PER_SEC = 3L * 1024 * 1024
+        private const val BYTES_PER_SEC_PER_READ_AHEAD_WORKER = 2L * 1024 * 1024
+
+        /** Deadline before an urgent foreground read takes over an already in-flight low-priority slot. */
+        val URGENT_TAKEOVER_DEADLINE: Duration = 1500.milliseconds
+
         /** Attempts per block. RangeReader already retries transport failures and refreshes expired links. */
         const val MAX_ATTEMPTS = 2
 
