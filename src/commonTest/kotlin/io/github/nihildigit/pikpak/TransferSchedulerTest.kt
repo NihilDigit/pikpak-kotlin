@@ -29,7 +29,12 @@ class TransferSchedulerTest {
         val scheduler = TransferScheduler(16, 8, BandwidthLimiter())
         val file = scheduler.register {}
         assertEquals(4096, scheduler.spanFor(file, 4, durable = true))
-        assertEquals(1, scheduler.spanFor(file, 4, durable = false))
+        assertEquals(4, scheduler.spanFor(file, 4, durable = false))
+        scheduler.concurrencyMode = ConcurrencyMode.Fixed(2)
+        assertEquals(4, scheduler.spanFor(file, 2, durable = false))
+        scheduler.concurrencyMode = ConcurrencyMode.Serial
+        assertEquals(1, scheduler.spanFor(file, 1, durable = false))
+        assertEquals(4096, scheduler.spanFor(file, 1, durable = true))
         scheduler.unregister(file)
     }
 }

@@ -5,6 +5,7 @@ import io.github.nihildigit.pikpak.internal.DemandWithdrawnException
 import io.github.nihildigit.pikpak.internal.ForegroundStreams
 import io.github.nihildigit.pikpak.internal.LiveSignedPriority
 import io.github.nihildigit.pikpak.internal.ReadTelemetry
+import io.github.nihildigit.pikpak.internal.RecoveryPolicy
 import io.github.nihildigit.pikpak.internal.RequestOrder
 import io.github.nihildigit.pikpak.internal.TransferPreempted
 import io.github.nihildigit.pikpak.internal.TransferScheduler
@@ -51,10 +52,11 @@ import kotlin.time.TimeSource
  * The bytes of one remote file, fetched on demand and shared by every reader, prefetch, and
  * durable download over it.
  *
- * All byte scheduling flows through a single pure [planLocked] projection over four explicit
- * claim kinds ([ByteClaim.Required], [ByteClaim.LookAhead], [ByteClaim.FinishInFlight], and
- * [ByteClaim.StoreRange]) derived from per-consumer [TransferDemand] snapshots, open [ReadTicket]s,
- * per-`(owner, epoch)` [ReadLane] read evidence, and active warms/downloads.
+ * All byte scheduling flows through a single pure [planLocked] projection over five explicit
+ * claim kinds ([ByteClaim.Required], [ByteClaim.Continuation], [ByteClaim.LookAhead],
+ * [ByteClaim.FinishInFlight], and [ByteClaim.StoreRange]) derived from per-consumer
+ * [TransferDemand] snapshots, open [ReadTicket]s, active [ReadWaiter]s, per-`(owner, epoch)`
+ * [ReadLane] read evidence, and active warms/downloads.
  */
 internal class BlockCache(
     private val source: RangeSource,
@@ -95,8 +97,17 @@ internal class BlockCache(
             val foreground: Boolean,
             override val priority: Int,
             override val order: Long,
-            val deadlineAt: TimeMark?,
-            val deadlineEpisode: SlotDeadlineEpisode? = null,
+        ) : ByteClaim
+
+        data class Continuation(
+            val owner: TransferDemand,
+            val epoch: Long,
+            val slot: Int,
+            val fetch: Fetch,
+            val exchangeId: Long,
+            val foreground: Boolean,
+            override val priority: Int,
+            override val order: Long,
         ) : ByteClaim
 
         data class LookAhead(
@@ -137,6 +148,7 @@ internal class BlockCache(
 
     internal class PlanSnapshot(
         val required: List<ByteClaim.Required>,
+        val continuation: List<ByteClaim.Continuation>,
         val lookAhead: List<ByteClaim.LookAhead>,
         val finishInFlight: List<ByteClaim.FinishInFlight>,
         val storeWants: List<Want>,
@@ -152,6 +164,13 @@ internal class BlockCache(
         }
     }
 
+    internal class ReadWaiter(
+        val slot: Int,
+        val endByteExclusive: Long,
+        val readEpoch: Long,
+        @Volatile var waitingWithin: Int = -1,
+    )
+
     internal class ReadLane(
         val epoch: Long,
         var speculationStamp: Long,
@@ -160,6 +179,7 @@ internal class BlockCache(
         var lastOrder: Long,
     ) {
         var contiguousBytesRead: Long = 0L
+        var crossedBlockBoundary: Boolean = false
     }
 
     private class FinishInFlightEntry(
@@ -171,18 +191,10 @@ internal class BlockCache(
         val order: Long,
     )
 
-    internal class SlotDeadlineEpisode(
-        val epoch: Long,
-        val slot: Int,
-        var at: TimeMark,
-        val consumed: MutableStateFlow<Boolean> = MutableStateFlow(false),
-    )
-
     private inner class OwnerState(val owner: TransferDemand) {
         var observedEpoch: Long = owner.intent.epoch
         val lanes = ArrayList<ReadLane>(4)
         val finishInFlightBySlot = LinkedHashMap<Int, FinishInFlightEntry>()
-        val slotDeadlines = HashMap<Int, SlotDeadlineEpisode>()
         @Volatile var lastForegroundActiveAt: TimeMark? = null
         val listenerHandle: AutoCloseable = owner.addListener { onOwnerChanged() }
 
@@ -190,7 +202,6 @@ internal class BlockCache(
             listenerHandle.close()
             lanes.clear()
             finishInFlightBySlot.clear()
-            slotDeadlines.clear()
             lastForegroundActiveAt = null
         }
     }
@@ -204,6 +215,7 @@ internal class BlockCache(
     ) : ReadTicket {
         val effectiveEnd: Long = minOf(endExclusive, size).coerceAtLeast(startOffset.coerceAtMost(size))
         val order: Long = RequestOrder.Sequence.next()
+        internal val activeReadGuard = MutableStateFlow(false)
         var registered: Boolean = false
             internal set
         var lane: ReadLane? = null
@@ -212,15 +224,23 @@ internal class BlockCache(
             internal set
         @Volatile var roleOverride: StreamRole? = initialRoleOverride
             internal set
-        @Volatile var reading: Boolean = false
+        @Volatile var activeWaiter: ReadWaiter? = null
             internal set
-        @Volatile var waitingSlot: Int = -1
-            internal set
-        @Volatile var waitingWithin: Int = 0
+        @Volatile var continuationSlot: Int = -1
             internal set
         @Volatile var bytesDelivered: Long = 0L
             internal set
+        @Volatile var lastReadEpoch: Long = Long.MIN_VALUE
+            internal set
         @Volatile var lastReadSpeculationStamp: Long = Long.MIN_VALUE
+            internal set
+        var postEpochObserved: Long = epoch
+            internal set
+        var postEpochAnchorOffset: Long = startOffset
+            internal set
+        var postEpochFrontierOffset: Long = startOffset
+            internal set
+        var postEpochContiguousBytes: Long = 0L
             internal set
         @Volatile var ended: Boolean = false
             private set
@@ -239,11 +259,14 @@ internal class BlockCache(
         override suspend fun readSome(buffer: ByteArray, offset: Int, length: Int): Int =
             this@BlockCache.readTicketSome(this, buffer, offset, length)
 
-        override fun endRead(allowFinishInFlight: Boolean) {
+        override fun endRead(reason: ReadEndReason) {
             if (ended) return
             ended = true
+            activeWaiter = null
+            continuationSlot = -1
             closing.complete(Unit)
             if (closed) return
+            val allowFinishInFlight = reason.allowsFinishInFlight
             scope.launch(start = CoroutineStart.UNDISPATCHED) {
                 var toCancelWithdrawn: List<Fetch>? = null
                 var toCancelPreempted: List<Fetch>? = null
@@ -252,12 +275,14 @@ internal class BlockCache(
                     val state = owners[owner]
                     if (state != null) {
                         syncOwnerEpochLocked(state)
+                        val curEpoch = owner.intent.epoch
+                        val canSeedFif = (epoch == curEpoch || lane?.epoch == curEpoch) && lastReadEpoch == curEpoch
                         if (allowFinishInFlight &&
                             !closed &&
                             !owner.isClosed &&
                             bytesDelivered > 0L &&
+                            canSeedFif &&
                             lastReadSpeculationStamp == owner.speculationRevision &&
-                            owner.intent.epoch == epoch &&
                             owner.intent.service != ServiceIntent.PAUSED &&
                             position > 0L
                         ) {
@@ -268,7 +293,7 @@ internal class BlockCache(
                                     state,
                                     FinishInFlightEntry(
                                         owner = owner,
-                                        epoch = epoch,
+                                        epoch = curEpoch,
                                         speculationStamp = owner.speculationRevision,
                                         slot = lastConsumedSlot,
                                         fetch = fetch!!,
@@ -280,12 +305,16 @@ internal class BlockCache(
                             }
                         } else if (!allowFinishInFlight && size > 0L) {
                             if (state.finishInFlightBySlot.isNotEmpty()) {
+                                val targetEpoch = if (lastReadEpoch >= 0L) lastReadEpoch else epoch
                                 val firstTouched = slotOf(startOffset.coerceIn(0L, size - 1L))
                                 val lastTouched = slotOf((position - 1L).coerceAtLeast(startOffset).coerceIn(0L, size - 1L))
                                 val iter = state.finishInFlightBySlot.entries.iterator()
                                 while (iter.hasNext()) {
                                     val entry = iter.next()
-                                    if (entry.value.epoch == epoch && entry.key in firstTouched..lastTouched) {
+                                    if ((entry.value.order == order || bytesDelivered > 0L) &&
+                                        entry.value.epoch == targetEpoch &&
+                                        entry.key in firstTouched..lastTouched
+                                    ) {
                                         iter.remove()
                                     }
                                 }
@@ -317,6 +346,9 @@ internal class BlockCache(
     // Guarded by mutex. Additions and LRU hits cannot orphan an owned array.
     private var ownershipDirty = false
     private var ownershipSweeps = 0L
+    private var recoveryRevisionSeq = 0L
+    private var completedMultiBlockFetches = 0L
+    @Volatile private var recentTtfbMillis = 1_100L
     private val durableWrites = Channel<PersistTask>(1)
     private val owners = LinkedHashMap<TransferDemand, OwnerState>()
     private val openTickets = ArrayList<TicketHandle>()
@@ -327,7 +359,12 @@ internal class BlockCache(
                 val protected = HashSet<Int>()
                 for (i in 0 until openTickets.size) {
                     val t = openTickets[i]
-                    if (t.reading && t.position < size) protected.add(slotOf(t.position))
+                    val waiterSlot = t.activeWaiter?.slot
+                    val contSlot = t.continuationSlot.takeIf {
+                        !t.ended && !t.owner.isClosed && it >= 0 && t.position < t.effectiveEnd && slotOf(t.position) == it
+                    }
+                    if (waiterSlot != null) protected.add(waiterSlot)
+                    if (contSlot != null) protected.add(contSlot)
                 }
                 val victims = cache.keys.filter { it !in protected && it !in persisting }
                 for (slot in victims) evict(slot)
@@ -929,12 +966,12 @@ internal class BlockCache(
         if (owner.isClosed) {
             state.lanes.clear()
             state.finishInFlightBySlot.clear()
-            state.slotDeadlines.clear()
             state.lastForegroundActiveAt = null
             for (i in 0 until openTickets.size) {
                 val t = openTickets[i]
                 if (t.owner === owner && !t.ended) {
-                    t.waitingSlot = -1
+                    t.activeWaiter?.waitingWithin = -1
+                    t.continuationSlot = -1
                     t.closing.complete(Unit)
                 }
             }
@@ -943,12 +980,11 @@ internal class BlockCache(
         val intent = owner.intent
         if (intent.epoch != state.observedEpoch) {
             state.observedEpoch = intent.epoch
-            state.lanes.removeAll { it.epoch != intent.epoch }
-            state.finishInFlightBySlot.values.removeAll { it.epoch != intent.epoch }
-            state.slotDeadlines.values.removeAll { it.epoch != intent.epoch }
+            state.lanes.clear()
+            state.finishInFlightBySlot.clear()
             for (i in 0 until openTickets.size) {
                 val t = openTickets[i]
-                if (t.owner === owner && t.epoch < intent.epoch) {
+                if (t.owner === owner) {
                     t.lane = null
                 }
             }
@@ -993,6 +1029,18 @@ internal class BlockCache(
             fetch.buffered > 0 &&
             liveEx > 0L &&
             fetch.lastByteExchangeId == liveEx
+    }
+
+    private fun isContinuationEligibleLocked(slot: Int, fetch: Fetch?): Boolean {
+        if (fetch == null) return false
+        val liveEx = fetch.claimControl.liveExchangeId
+        return slot !in cache &&
+            inFlight[slot] === fetch &&
+            !fetch.cancelled &&
+            !fetch.released &&
+            fetch.nextSlot == slot &&
+            fetch.networkStarted &&
+            liveEx > 0L
     }
 
     private fun pruneOwnerIfIdleLocked(state: OwnerState) {
@@ -1060,60 +1108,59 @@ internal class BlockCache(
         offset: Int,
         length: Int,
     ): Int {
-        checkTicketOpen(ticket)
-        require(offset >= 0 && length >= 0 && offset <= buffer.size - length) {
-            "invalid buffer slice offset=$offset length=$length size=${buffer.size}"
+        if (!ticket.activeReadGuard.compareAndSet(false, true)) {
+            throw IllegalStateException("Concurrent readSome on the same ReadTicket is not supported")
         }
-        val pos = ticket.position
-        if (pos >= ticket.effectiveEnd) return -1
-        if (length == 0) return 0
-        val clampedLength = minOf(length.toLong(), ticket.effectiveEnd - pos).toInt()
-        val slot = slotOf(pos)
-        ticket.reading = true
-        locked {
-            ensureTicketRegisteredLocked(ticket)
-            owners[ticket.owner]?.let { state ->
-                syncOwnerEpochLocked(state)
-                if (ticket.effectiveRole == StreamRole.FOREGROUND && ticket.epoch == ticket.owner.intent.epoch && !ticket.owner.isClosed) {
-                    state.lastForegroundActiveAt = timeSource.markNow()
-                }
-                pruneOwnerIfIdleLocked(state)
-            }
-        }
-        syncForegroundCount()
-        idleSignal.bump()
-        bump()
-        var available = 0
-        var shouldBump = false
-        var withdrawn: List<Fetch>? = null
-        var preempted: List<Fetch>? = null
         try {
-            available = awaitTicketSlot(ticket, slot, (pos - slot.toLong() * blockSize).toInt(), buffer, offset, clampedLength)
-        } finally {
-            ticket.reading = false
+            checkTicketOpen(ticket)
+            require(offset >= 0 && length >= 0 && offset <= buffer.size - length) {
+                "invalid buffer slice offset=$offset length=$length size=${buffer.size}"
+            }
+            val pos = ticket.position
+            if (pos >= ticket.effectiveEnd) return -1
+            if (length == 0) return 0
+            val clampedLength = minOf(length.toLong(), ticket.effectiveEnd - pos).toInt()
+            val slot = slotOf(pos)
+            val endByte = minOf(ticket.effectiveEnd, (slot + 1L) * blockSize)
+            lateinit var waiter: ReadWaiter
             locked {
-                if (available > 0) {
-                    val nextPos = pos + available
-                    ticket.position = nextPos
-                    ticket.bytesDelivered += available
-                    if (ticket.epoch == ticket.owner.intent.epoch) {
-                        ticket.lastReadSpeculationStamp = ticket.owner.speculationRevision
-                        val lane = ticket.lane
-                        if (lane != null && lane.epoch == ticket.owner.intent.epoch) {
-                            lane.speculationStamp = ticket.owner.speculationRevision
-                            if (nextPos > lane.frontierOffset) {
-                                val delta = nextPos - maxOf(pos, lane.frontierOffset)
-                                lane.contiguousBytesRead += delta
-                                lane.frontierOffset = nextPos
-                            }
+                checkTicketOpen(ticket)
+                ensureTicketRegisteredLocked(ticket)
+                val state = owners[ticket.owner]
+                if (state != null) {
+                    syncOwnerEpochLocked(state)
+                    val curEpoch = state.observedEpoch
+                    if (ticket.epoch < curEpoch && ticket.lane == null) {
+                        if (ticket.postEpochObserved != curEpoch) {
+                            ticket.postEpochObserved = curEpoch
+                            ticket.postEpochAnchorOffset = pos
+                            ticket.postEpochFrontierOffset = pos
+                            ticket.postEpochContiguousBytes = 0L
                         }
-                        owners[ticket.owner]?.slotDeadlines?.remove(slot)
+                        if (ticket.postEpochContiguousBytes > 0L &&
+                            pos <= ticket.postEpochFrontierOffset &&
+                            slot > slotOf(ticket.postEpochAnchorOffset)
+                        ) {
+                            val reattached = attachOrCreateLaneLocked(state, curEpoch, ticket.postEpochAnchorOffset, ticket.order)
+                            reattached.frontierOffset = maxOf(reattached.frontierOffset, ticket.postEpochFrontierOffset)
+                            reattached.contiguousBytesRead = maxOf(reattached.contiguousBytesRead, ticket.postEpochContiguousBytes)
+                            reattached.crossedBlockBoundary = true
+                            ticket.lane = reattached
+                        }
                     }
-                }
-                owners[ticket.owner]?.let { state ->
+                    val lane = ticket.lane
+                    if (lane != null &&
+                        lane.epoch == curEpoch &&
+                        lane.speculationStamp == ticket.owner.speculationRevision &&
+                        lane.contiguousBytesRead > 0L &&
+                        pos <= lane.frontierOffset &&
+                        slot > slotOf(lane.anchorOffset)
+                    ) {
+                        lane.crossedBlockBoundary = true
+                    }
                     if (ticket.effectiveRole == StreamRole.FOREGROUND &&
                         !ticket.owner.isClosed &&
-                        ticket.epoch == ticket.owner.intent.epoch &&
+                        (ticket.epoch == curEpoch || ticket.lane?.epoch == curEpoch) &&
                         ticket.owner.intent.service != ServiceIntent.PAUSED &&
                         ticket.owner.intent.service != ServiceIntent.PREFETCH
                     ) {
@@ -1121,25 +1168,147 @@ internal class BlockCache(
                     }
                     pruneOwnerIfIdleLocked(state)
                 }
-                val actions = reconcileClaimsLocked()
-                withdrawn = actions.withdrawn
-                preempted = actions.preempted
-                if (available > 0) {
-                    val nextPos = ticket.position
-                    val lane = ticket.lane
-                    shouldBump = slotOf(nextPos.coerceAtMost((size - 1).coerceAtLeast(0L))) != slot ||
-                        (lane != null && lane.contiguousBytesRead >= blockSize) ||
-                        actions.withdrawn != null ||
-                        actions.preempted != null ||
-                        planHasUncachedLookAheadLocked(ticket.owner)
-                }
+                waiter = ReadWaiter(
+                    slot = slot,
+                    endByteExclusive = endByte,
+                    readEpoch = ticket.owner.intent.epoch,
+                )
+                ticket.activeWaiter = waiter
             }
-            cancelFetches(withdrawn, preempted)
             syncForegroundCount()
             idleSignal.bump()
-            if (shouldBump) bump()
+            bump()
+            var available = 0
+            var shouldBump = false
+            var withdrawn: List<Fetch>? = null
+            var preempted: List<Fetch>? = null
+            try {
+                available = awaitTicketSlot(
+                    ticket = ticket,
+                    waiter = waiter,
+                    slot = slot,
+                    within = (pos - slot.toLong() * blockSize).toInt(),
+                    destination = buffer,
+                    offset = offset,
+                    length = clampedLength,
+                )
+            } finally {
+                locked {
+                    if (ticket.activeWaiter === waiter) {
+                        ticket.activeWaiter = null
+                    }
+                    val state = owners[ticket.owner]
+                    if (state != null) {
+                        syncOwnerEpochLocked(state)
+                    }
+                    if (available > 0) {
+                        val nextPos = pos + available
+                        ticket.position = nextPos
+                        ticket.bytesDelivered += available
+                        val curEpoch = ticket.owner.intent.epoch
+                        ticket.lastReadEpoch = curEpoch
+                        ticket.lastReadSpeculationStamp = ticket.owner.speculationRevision
+
+                        if (nextPos < ticket.effectiveEnd && slotOf(nextPos) == slot) {
+                            ticket.continuationSlot = slot
+                        } else {
+                            ticket.continuationSlot = -1
+                        }
+
+                        if (state != null && !ticket.owner.isClosed) {
+                            if (ticket.epoch < curEpoch && ticket.lane == null) {
+                                if (ticket.postEpochObserved != curEpoch) {
+                                    ticket.postEpochObserved = curEpoch
+                                    ticket.postEpochAnchorOffset = pos
+                                    ticket.postEpochFrontierOffset = pos
+                                    ticket.postEpochContiguousBytes = 0L
+                                }
+                                if (nextPos > ticket.postEpochFrontierOffset) {
+                                    val delta = nextPos - maxOf(pos, ticket.postEpochFrontierOffset)
+                                    ticket.postEpochContiguousBytes += delta
+                                    ticket.postEpochFrontierOffset = nextPos
+                                }
+                                val crossed = slotOf(nextPos - 1L) > slotOf(ticket.postEpochAnchorOffset)
+                                if (crossed || ticket.postEpochContiguousBytes >= blockSize) {
+                                    val reattached = attachOrCreateLaneLocked(state, curEpoch, ticket.postEpochAnchorOffset, ticket.order)
+                                    reattached.frontierOffset = maxOf(reattached.frontierOffset, ticket.postEpochFrontierOffset)
+                                    reattached.contiguousBytesRead = maxOf(reattached.contiguousBytesRead, ticket.postEpochContiguousBytes)
+                                    if (crossed) reattached.crossedBlockBoundary = true
+                                    ticket.lane = reattached
+                                }
+                            } else {
+                                val lane = ticket.lane
+                                if (lane != null && lane.epoch == curEpoch) {
+                                    lane.speculationStamp = ticket.owner.speculationRevision
+                                    if (nextPos > lane.frontierOffset) {
+                                        val delta = nextPos - maxOf(pos, lane.frontierOffset)
+                                        lane.contiguousBytesRead += delta
+                                        lane.frontierOffset = nextPos
+                                    }
+                                    if (slotOf(nextPos - 1L) > slotOf(lane.anchorOffset)) {
+                                        lane.crossedBlockBoundary = true
+                                    }
+                                }
+                            }
+
+                            val canSeedFif = ticket.epoch == curEpoch || ticket.lane?.epoch == curEpoch
+                            if (canSeedFif &&
+                                nextPos >= ticket.effectiveEnd &&
+                                nextPos > 0L &&
+                                (nextPos % blockSize) != 0L &&
+                                ticket.owner.intent.service != ServiceIntent.PAUSED
+                            ) {
+                                val lastConsumedSlot = slotOf(nextPos - 1L)
+                                val fetch = inFlight[lastConsumedSlot]
+                                if (isFinishInFlightEligibleLocked(lastConsumedSlot, fetch)) {
+                                    upsertFinishInFlightLocked(
+                                        state,
+                                        FinishInFlightEntry(
+                                            owner = ticket.owner,
+                                            epoch = curEpoch,
+                                            speculationStamp = ticket.owner.speculationRevision,
+                                            slot = lastConsumedSlot,
+                                            fetch = fetch!!,
+                                            order = ticket.order,
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    if (state != null) {
+                        if (ticket.effectiveRole == StreamRole.FOREGROUND &&
+                            !ticket.owner.isClosed &&
+                            (ticket.epoch == ticket.owner.intent.epoch || ticket.lane?.epoch == ticket.owner.intent.epoch) &&
+                            ticket.owner.intent.service != ServiceIntent.PAUSED &&
+                            ticket.owner.intent.service != ServiceIntent.PREFETCH
+                        ) {
+                            state.lastForegroundActiveAt = timeSource.markNow()
+                        }
+                        pruneOwnerIfIdleLocked(state)
+                    }
+                    val actions = reconcileClaimsLocked()
+                    withdrawn = actions.withdrawn
+                    preempted = actions.preempted
+                    if (available > 0) {
+                        val nextPos = ticket.position
+                        val lane = ticket.lane
+                        shouldBump = slotOf(nextPos.coerceAtMost((size - 1).coerceAtLeast(0L))) != slot ||
+                            (lane != null && (lane.crossedBlockBoundary || lane.contiguousBytesRead >= blockSize)) ||
+                            actions.withdrawn != null ||
+                            actions.preempted != null ||
+                            planHasUncachedLookAheadLocked(ticket.owner)
+                    }
+                }
+                cancelFetches(withdrawn, preempted)
+                syncForegroundCount()
+                idleSignal.bump()
+                if (shouldBump) bump()
+            }
+            return available
+        } finally {
+            ticket.activeReadGuard.value = false
         }
-        return available
     }
 
     private fun planHasUncachedLookAheadLocked(owner: TransferDemand): Boolean {
@@ -1157,6 +1326,20 @@ internal class BlockCache(
         return false
     }
 
+    private fun ticketClaimPriorityLocked(ticket: TicketHandle, intent: ConsumerIntent): Int {
+        val currentEpoch = ticket.epoch == intent.epoch || ticket.lane?.epoch == intent.epoch
+        val basePriority = when (ticket.effectiveRole) {
+            StreamRole.BACKGROUND -> PikPakStreamReader.BACKGROUND_BLOCKING_PRIORITY
+            StreamRole.FOREGROUND -> when (intent.service) {
+                ServiceIntent.WAITING -> PikPakStreamReader.BLOCKING_PRIORITY
+                ServiceIntent.PLAYING -> PikPakStreamReader.STREAMING_PRIORITY
+                ServiceIntent.PREFETCH -> PikPakStreamReader.MICRO_PROBE_PRIORITY
+                ServiceIntent.PAUSED -> PikPakStreamReader.BACKGROUND_BLOCKING_PRIORITY
+            }
+        }
+        return if (currentEpoch) basePriority else minOf(basePriority, PikPakStreamReader.STREAMING_PRIORITY)
+    }
+
     ///////////////////////////////////////////////////////////////////////////
     // single planner: planLocked()
     ///////////////////////////////////////////////////////////////////////////
@@ -1166,64 +1349,68 @@ internal class BlockCache(
      */
     internal fun planLocked(): PlanSnapshot {
         if (closed || size <= 0L) {
-            return PlanSnapshot(emptyList(), emptyList(), emptyList(), emptyList())
+            return PlanSnapshot(emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
         }
         for (state in owners.values) {
             syncOwnerEpochLocked(state)
         }
 
         val requiredClaims = ArrayList<ByteClaim.Required>(openTickets.size)
+        val continuationClaims = ArrayList<ByteClaim.Continuation>(openTickets.size)
         val lookAheadClaims = ArrayList<ByteClaim.LookAhead>(owners.size)
         val finishClaims = ArrayList<ByteClaim.FinishInFlight>(owners.size)
 
-        // 1. Required claims from open tickets actively awaiting bytes in readSome.
-        //    Older-epoch tickets (ticket.epoch < intent.epoch) emit Required ONLY for their
-        //    single active readSome block (0 LookAhead, 0 FinishInFlight, 0 deadline episode)
-        //    so reconnect=0 loopback HTTP clients never hit premature EOF before closing the old socket.
+        // 1. Required claims (active ReadWaiter) & Continuation claims (open mid-block reader between readSome calls).
         for (i in 0 until openTickets.size) {
             val ticket = openTickets[i]
-            if (ticket.ended || ticket.owner.isClosed || !ticket.reading || ticket.position >= ticket.effectiveEnd) continue
+            if (ticket.ended || ticket.owner.isClosed || ticket.position >= ticket.effectiveEnd) continue
             val intent = ticket.owner.intent
-            val currentEpoch = ticket.epoch == intent.epoch
-            val slot = slotOf(ticket.position)
             val fg = ticket.effectiveRole == StreamRole.FOREGROUND
-            val basePriority = when (ticket.effectiveRole) {
-                StreamRole.BACKGROUND -> PikPakStreamReader.BACKGROUND_BLOCKING_PRIORITY
-                StreamRole.FOREGROUND -> when (intent.service) {
-                    ServiceIntent.WAITING -> PikPakStreamReader.BLOCKING_PRIORITY
-                    ServiceIntent.PLAYING -> PikPakStreamReader.STREAMING_PRIORITY
-                    ServiceIntent.PREFETCH -> PikPakStreamReader.MICRO_PROBE_PRIORITY
-                    ServiceIntent.PAUSED -> PikPakStreamReader.BACKGROUND_BLOCKING_PRIORITY
+            val priority = ticketClaimPriorityLocked(ticket, intent)
+            val waiter = ticket.activeWaiter
+            if (waiter != null) {
+                requiredClaims.add(
+                    ByteClaim.Required(
+                        owner = ticket.owner,
+                        epoch = waiter.readEpoch,
+                        slot = waiter.slot,
+                        endByteExclusive = waiter.endByteExclusive,
+                        foreground = fg,
+                        priority = priority,
+                        order = ticket.order,
+                    ),
+                )
+            } else {
+                val curSlot = slotOf(ticket.position)
+                if (ticket.continuationSlot == curSlot) {
+                    val fetch = inFlight[curSlot]
+                    if (isContinuationEligibleLocked(curSlot, fetch)) {
+                        continuationClaims.add(
+                            ByteClaim.Continuation(
+                                owner = ticket.owner,
+                                epoch = intent.epoch,
+                                slot = curSlot,
+                                fetch = fetch!!,
+                                exchangeId = fetch.claimControl.liveExchangeId,
+                                foreground = fg,
+                                priority = priority,
+                                order = ticket.order,
+                            ),
+                        )
+                    }
                 }
             }
-            val priority = if (currentEpoch) basePriority else minOf(basePriority, PikPakStreamReader.STREAMING_PRIORITY)
-            val deadlineEpisode = if (currentEpoch) computeOrGetDeadlineLocked(ticket, slot) else null
-            val endByte = minOf(ticket.effectiveEnd, (slot + 1L) * blockSize)
-            requiredClaims.add(
-                ByteClaim.Required(
-                    owner = ticket.owner,
-                    epoch = ticket.epoch,
-                    slot = slot,
-                    endByteExclusive = endByte,
-                    foreground = fg,
-                    priority = priority,
-                    order = ticket.order,
-                    deadlineAt = deadlineEpisode?.at,
-                    deadlineEpisode = deadlineEpisode,
-                ),
-            )
         }
 
-        // 2. Owner-aggregated LookAhead claims & single-block FinishInFlight claims.
+        // 2. Owner-aggregated LookAhead claims & ended-reader single-block FinishInFlight claims.
         for (state in owners.values) {
             val owner = state.owner
             if (owner.isClosed) continue
             val intent = owner.intent
             val epoch = intent.epoch
 
-            // Collect open current-epoch tickets grouped by ReadLane.
             val currentTickets = openTickets.filter {
-                !it.ended && it.lane != null && it.owner === owner && it.epoch == epoch && it.position < it.effectiveEnd
+                !it.ended && it.lane?.epoch == epoch && it.owner === owner && it.position < it.effectiveEnd
             }
             if (currentTickets.isNotEmpty() && intent.service != ServiceIntent.PAUSED) {
                 val ownerByteCeiling = effectiveOwnerBudgetBytesLocked(intent)
@@ -1240,7 +1427,7 @@ internal class BlockCache(
                     val ticketsByLane = currentTickets.groupBy { it.lane!! }
                     for ((lane, laneTickets) in ticketsByLane) {
                         if (lane.epoch != epoch || lane.speculationStamp != owner.speculationRevision) continue
-                        val provenSequential = lane.contiguousBytesRead >= blockSize
+                        val provenSequential = lane.crossedBlockBoundary || lane.contiguousBytesRead >= blockSize
                         val qualifies = when (intent.service) {
                             ServiceIntent.WAITING, ServiceIntent.PREFETCH -> provenSequential
                             ServiceIntent.PLAYING -> provenSequential || lane === primaryLane
@@ -1277,13 +1464,21 @@ internal class BlockCache(
                             val laneBudget = when (intent.service) {
                                 ServiceIntent.WAITING -> {
                                     val streamRate = ownerMediaRateLocked(intent)
+                                    val baseWaitingCeiling = if (q.lane.contiguousBytesRead >= 2L * blockSize) {
+                                        maxOf(
+                                            8L * blockSize,
+                                            minOf(perLaneCeiling, effectiveReadAheadConcurrency().toLong() * 4L * blockSize),
+                                        )
+                                    } else {
+                                        8L * blockSize
+                                    }
                                     val waitingCeiling = if (
                                         streamRate != null &&
                                         streamRate >= HIGH_BITRATE_READ_AHEAD_THRESHOLD_BYTES_PER_SEC
                                     ) {
-                                        maxOf(8L * blockSize, streamRate)
+                                        maxOf(baseWaitingCeiling, streamRate)
                                     } else {
-                                        8L * blockSize
+                                        baseWaitingCeiling
                                     }
                                     minOf(
                                         perLaneCeiling,
@@ -1297,8 +1492,9 @@ internal class BlockCache(
                             val endByteExclusive = minOf(q.activePos + laneBudget, q.maxEndExclusive, size)
                             if (endByteExclusive <= q.activePos) continue
                             val headSlot = slotOf(q.activePos)
-                            val hasReadingAtHead = requiredClaims.any { it.owner === owner && it.slot == headSlot }
-                            val firstLaSlot = if (hasReadingAtHead) headSlot + 1 else headSlot
+                            val hasActiveAtHead = requiredClaims.any { it.owner === owner && it.slot == headSlot } ||
+                                continuationClaims.any { it.owner === owner && it.slot == headSlot }
+                            val firstLaSlot = if (hasActiveAtHead) headSlot + 1 else headSlot
                             val endSlotInclusive = if (multiLane) {
                                 minOf(slotOf(endByteExclusive - 1L), firstLaSlot + laneMaxBlocks - 1)
                             } else {
@@ -1337,40 +1533,8 @@ internal class BlockCache(
                 }
             }
 
-            // Retain single-block FinishInFlight per active lane (bounded by MAX_LANES_PER_OWNER) when any open
-            // current-epoch ticket paused or completed a short range mid-block without withdrawing speculation.
+            // Retain single-block FinishInFlight strictly for ended/completed range tickets.
             if (intent.service != ServiceIntent.PAUSED) {
-                for (i in 0 until openTickets.size) {
-                    val t = openTickets[i]
-                    if (!t.ended &&
-                        t.owner === owner &&
-                        t.epoch == epoch &&
-                        t.bytesDelivered > 0L &&
-                        t.lastReadSpeculationStamp == owner.speculationRevision &&
-                        t.lane?.speculationStamp == owner.speculationRevision &&
-                        !t.reading &&
-                        t.position > 0L
-                    ) {
-                        val midSlot = slotOf(t.position - 1L)
-                        val midFetch = inFlight[midSlot]
-                        if (isFinishInFlightEligibleLocked(midSlot, midFetch) &&
-                            requiredClaims.none { it.slot == midSlot } &&
-                            lookAheadClaims.none { it.containsSlot(midSlot) }
-                        ) {
-                            upsertFinishInFlightLocked(
-                                state,
-                                FinishInFlightEntry(
-                                    owner = owner,
-                                    epoch = epoch,
-                                    speculationStamp = owner.speculationRevision,
-                                    slot = midSlot,
-                                    fetch = midFetch!!,
-                                    order = t.order,
-                                ),
-                            )
-                        }
-                    }
-                }
                 if (state.finishInFlightBySlot.isNotEmpty()) {
                     val iter = state.finishInFlightBySlot.values.iterator()
                     while (iter.hasNext()) {
@@ -1381,6 +1545,7 @@ internal class BlockCache(
                         ) {
                             iter.remove()
                         } else if (requiredClaims.none { it.slot == fif.slot } &&
+                            continuationClaims.none { it.slot == fif.slot } &&
                             lookAheadClaims.none { it.containsSlot(fif.slot) }
                         ) {
                             finishClaims.add(
@@ -1402,6 +1567,7 @@ internal class BlockCache(
         val activeStoreWants = wants.filter { it.demand == null || !it.demand.isClosed }
         return PlanSnapshot(
             required = requiredClaims,
+            continuation = continuationClaims,
             lookAhead = lookAheadClaims,
             finishInFlight = finishClaims,
             storeWants = activeStoreWants,
@@ -1451,55 +1617,54 @@ internal class BlockCache(
         return true
     }
 
-    private fun isEarlierMark(a: TimeMark, b: TimeMark): Boolean = a.elapsedNow() > b.elapsedNow()
-
-    private fun computeOrGetDeadlineLocked(ticket: TicketHandle, slot: Int): SlotDeadlineEpisode? {
-        val fetch = inFlight[slot]?.takeIf { it.nextSlot == slot && !it.cancelled && !it.released } ?: return null
-        if (fetch.initialPriority >= PikPakStreamReader.STREAMING_PRIORITY) return null
-        val state = owners[ticket.owner] ?: return null
-        val intent = ticket.owner.intent
-        val existing = state.slotDeadlines[slot]?.takeIf { it.epoch == intent.epoch }
-        if (existing != null && existing.consumed.value) {
-            return null
+    private fun isNearPrefixCoveredLocked(position: Long, blocks: Int): Boolean {
+        if (size <= position || blocks <= 0) return false
+        val thresholdBlocks = ((wideBlockThresholdBytes.coerceAtLeast(blockSize) + blockSize - 1L) / blockSize).toInt()
+        val count = minOf(blocks, thresholdBlocks).coerceAtLeast(1)
+        val first = slotOf(position)
+        val last = minOf(slotOf(size - 1L), first + count - 1)
+        for (slot in first..last) {
+            if (slot !in cache && slot !in inFlight) return false
         }
-        val sample = intent.playbackSample?.takeIf { it.generation == intent.epoch && it.bufferedDuration != null }
-        val sampleBuffered = sample?.bufferedDuration
-        val urgentWait = intent.service == ServiceIntent.WAITING
-        val candidate: TimeMark? = when {
-            urgentWait && fetch.initialPriority < PikPakStreamReader.READ_AHEAD_PRIORITY -> timeSource.markNow()
-            urgentWait -> {
-                val runway = if (sample != null && sampleBuffered != null) sampleBuffered - sample.sampledAt.elapsedNow() else null
-                if (sample != null && sampleBuffered != null && runway != null && runway < URGENT_TAKEOVER_DEADLINE) {
-                    sample.sampledAt + sampleBuffered
-                } else {
-                    timeSource.markNow() + URGENT_TAKEOVER_DEADLINE
-                }
-            }
-            sample != null && sampleBuffered != null -> sample.sampledAt + sampleBuffered
-            else -> null
-        }
-        if (existing != null) {
-            if (candidate != null && isEarlierMark(candidate, existing.at)) {
-                existing.at = candidate
-            }
-            return existing
-        }
-        if (candidate == null) return null
-        return SlotDeadlineEpisode(epoch = intent.epoch, slot = slot, at = candidate).also {
-            state.slotDeadlines[slot] = it
-        }
+        return true
     }
+
+    private fun isNearPrefixCommittedLocked(position: Long, blocks: Int): Boolean {
+        if (size <= position || blocks <= 0) return false
+        val thresholdBlocks = ((wideBlockThresholdBytes.coerceAtLeast(blockSize) + blockSize - 1L) / blockSize).toInt()
+        val count = minOf(blocks, thresholdBlocks).coerceAtLeast(1)
+        val first = slotOf(position)
+        val last = minOf(slotOf(size - 1L), first + count - 1)
+        for (slot in first..last) {
+            val bytes = cache[slot] ?: return false
+            val expectedEnd = minOf(size, (slot + 1L) * blockSize)
+            if (slot.toLong() * blockSize + bytes.size < expectedEnd) return false
+        }
+        return true
+    }
+
+    private fun isEarlierMark(a: TimeMark, b: TimeMark): Boolean = a.elapsedNow() > b.elapsedNow()
 
     private fun PlanSnapshot.hasAnyClaim(slot: Int): Boolean {
         for (i in 0 until required.size) if (required[i].slot == slot) return true
+        for (i in 0 until continuation.size) if (continuation[i].slot == slot) return true
         for (i in 0 until lookAhead.size) if (lookAhead[i].containsSlot(slot)) return true
         for (i in 0 until finishInFlight.size) if (finishInFlight[i].slot == slot) return true
         if (slot in wanted) return true
         return false
     }
 
+    private fun PlanSnapshot.hasRequiredInRange(firstSlotInclusive: Int, endSlotExclusive: Int): Boolean {
+        for (i in 0 until required.size) {
+            val s = required[i].slot
+            if (s in firstSlotInclusive until endSlotExclusive) return true
+        }
+        return false
+    }
+
     private fun PlanSnapshot.hasNonDurableClaim(slot: Int): Boolean {
         for (i in 0 until required.size) if (required[i].slot == slot) return true
+        for (i in 0 until continuation.size) if (continuation[i].slot == slot) return true
         for (i in 0 until lookAhead.size) if (lookAhead[i].containsSlot(slot)) return true
         for (i in 0 until finishInFlight.size) if (finishInFlight[i].slot == slot) return true
         for (i in 0 until storeWants.size) {
@@ -1511,6 +1676,7 @@ internal class BlockCache(
 
     private fun PlanSnapshot.isProtectedWindowSlot(slot: Int): Boolean {
         for (i in 0 until required.size) if (required[i].slot == slot) return true
+        for (i in 0 until continuation.size) if (continuation[i].slot == slot) return true
         for (i in 0 until lookAhead.size) if (lookAhead[i].containsSlot(slot)) return true
         for (i in 0 until finishInFlight.size) if (finishInFlight[i].slot == slot) return true
         return false
@@ -1518,9 +1684,14 @@ internal class BlockCache(
 
     private fun PlanSnapshot.isStoppingHead(slot: Int): Boolean {
         for (i in 0 until required.size) if (required[i].slot == slot) return true
+        for (i in 0 until continuation.size) if (continuation[i].slot == slot) return true
         for (i in 0 until openTickets.size) {
             val t = openTickets[i]
-            if (!t.ended && !t.owner.isClosed && t.epoch == t.owner.intent.epoch && t.position < t.effectiveEnd && slotOf(t.position) == slot) return true
+            if (!t.ended && !t.owner.isClosed &&
+                (t.epoch == t.owner.intent.epoch || t.lane?.epoch == t.owner.intent.epoch) &&
+                t.position < t.effectiveEnd &&
+                slotOf(t.position) == slot
+            ) return true
         }
         return false
     }
@@ -1529,6 +1700,10 @@ internal class BlockCache(
         var best = Int.MIN_VALUE
         for (i in 0 until required.size) {
             val c = required[i]
+            if (c.slot == slot && c.priority > best) best = c.priority
+        }
+        for (i in 0 until continuation.size) {
+            val c = continuation[i]
             if (c.slot == slot && c.priority > best) best = c.priority
         }
         for (i in 0 until lookAhead.size) {
@@ -1549,25 +1724,56 @@ internal class BlockCache(
         return best
     }
 
-    private fun PlanSnapshot.isFinishInFlightOnly(slot: Int): Boolean {
-        var hasFif = false
-        for (i in 0 until finishInFlight.size) {
-            if (finishInFlight[i].slot == slot) {
-                hasFif = true
+    private fun PlanSnapshot.isSingleExchangeOnly(slot: Int): Boolean {
+        var hasSingleEx = false
+        for (i in 0 until continuation.size) {
+            if (continuation[i].slot == slot) {
+                hasSingleEx = true
                 break
             }
         }
-        if (!hasFif) return false
+        if (!hasSingleEx) {
+            for (i in 0 until finishInFlight.size) {
+                if (finishInFlight[i].slot == slot) {
+                    hasSingleEx = true
+                    break
+                }
+            }
+        }
+        if (!hasSingleEx) return false
         for (i in 0 until required.size) if (required[i].slot == slot) return false
         for (i in 0 until lookAhead.size) if (lookAhead[i].containsSlot(slot)) return false
         if (slot in wanted) return false
         return true
     }
 
+    private fun PlanSnapshot.allowedProductionEndOffsetFor(fetch: Fetch): Long {
+        val limitSlot = fetch.endSlot
+        var endSlotExclusive = fetch.nextSlot
+        while (endSlotExclusive < limitSlot) {
+            val slot = endSlotExclusive
+            val claimed = hasAnyClaim(slot) || hasRequiredInRange(slot, limitSlot)
+            if (!claimed) break
+            if (slot > fetch.nextSlot) {
+                val bgOnly = !hasNonDurableClaim(slot) &&
+                    !hasRequiredInRange(slot, limitSlot) &&
+                    (fetch.durable || fetch.issuedPriority == PikPakStreamReader.BACKGROUND_READ_AHEAD_PRIORITY)
+                if (fetch.durable && fetch.servedForegroundHead && !hasNonDurableClaim(slot) && !hasRequiredInRange(slot, limitSlot)) break
+                if (bgOnly && (downloadsThrottled() || countBackgroundActiveLocked(exclude = fetch) >= durableWorkerLimitLocked())) break
+            }
+            endSlotExclusive++
+        }
+        return (endSlotExclusive.toLong() * blockSize).coerceAtMost(size)
+    }
+
     private fun PlanSnapshot.hasPendingUncachedWork(): Boolean {
         for (i in 0 until required.size) {
             val slot = required[i].slot
             if (slot !in cache && slot !in offered && slot !in persisting && slot !in failed) return true
+        }
+        for (i in 0 until continuation.size) {
+            val slot = continuation[i].slot
+            if (slot !in cache && slot in inFlight) return true
         }
         for (i in 0 until lookAhead.size) {
             val la = lookAhead[i]
@@ -1610,96 +1816,123 @@ internal class BlockCache(
             // Check if a Required claim targets a future slot (slot > fetch.nextSlot) of this fetch.
             var tailRequiredSlot = Int.MAX_VALUE
             var tailRequiredPrio = Int.MIN_VALUE
+            var tailRequiredMaxEndSlot = 0
             for (j in 0 until plan.required.size) {
                 val req = plan.required[j]
                 if (req.slot > fetch.nextSlot && req.slot < fetch.endSlot) {
                     if (req.slot < tailRequiredSlot) tailRequiredSlot = req.slot
                     if (req.priority > tailRequiredPrio) tailRequiredPrio = req.priority
+                    if (req.slot + 1 > tailRequiredMaxEndSlot) tailRequiredMaxEndSlot = req.slot + 1
                 }
             }
 
             val headPrio = plan.strongestClaimPriority(fetch.nextSlot)
             if (headPrio == Int.MIN_VALUE || (!fetch.networkStarted && !fetch.durable && !plan.hasNonDurableClaim(fetch.nextSlot))) {
+                val alreadyStoppingAtBoundary = fetch.networkStarted &&
+                    fetch.nextSlot > fetch.firstSlot &&
+                    fetch.buffered == 0 &&
+                    fetch.claimControl.allowedProductionEndOffset <= fetch.nextSlot.toLong() * blockSize
+                if (alreadyStoppingAtBoundary) {
+                    // RangeReader already hit allowedProductionEndOffset at the block boundary and is unwinding
+                    // BoundaryStop cleanly; do not overwrite BoundaryStop with DemandWithdrawnException.
+                    fetch.claimControl.inBlockQuantum = false
+                    fetch.claimControl.recoveryGoalEndOffset = 0L
+                    fetch.updateLivePriority(FINISH_IN_FLIGHT_PRIORITY)
+                    continue
+                }
                 // Current nextSlot is no longer claimed (or lost all non-durable claims before network start):
                 // cancel immediately so durable downloads re-claim cleanly under durableLimit & single-block throttling.
                 fetch.cancelled = true
                 fetch.updateLivePriority(Int.MIN_VALUE)
-                fetch.deadlineFlow.value = null
+                fetch.claimControl.inBlockQuantum = false
+                fetch.claimControl.recoveryGoalEndOffset = 0L
                 (withdrawn ?: ArrayList<Fetch>(4).also { withdrawn = it }).add(fetch)
                 continue
             }
 
+            var effectivePrio = headPrio
             if (tailRequiredSlot != Int.MAX_VALUE && tailRequiredPrio > headPrio) {
                 if (!fetch.networkStarted) {
-                    fetch.endSlot = tailRequiredSlot
-                } else {
-                    // Never fake-shorten an already-sent HTTP Range: cancel cleanly (saving partials[nextSlot])
-                    // so a worker immediately starts at tailRequiredSlot without downloading the tail twice.
+                    fetch.plannedEndSlot = tailRequiredSlot
+                } else if (fetch.networkBytesOnCurrentRequest <= 0L) {
+                    // Predecessor has not delivered a single byte yet: never hold a higher-priority
+                    // Required reader behind a stalled or unproven lower-priority predecessor.
                     fetch.cancelled = true
                     fetch.updateLivePriority(Int.MIN_VALUE)
-                    fetch.deadlineFlow.value = null
+                    fetch.claimControl.inBlockQuantum = false
+                    fetch.claimControl.recoveryGoalEndOffset = 0L
                     (preempted ?: ArrayList<Fetch>(4).also { preempted = it }).add(fetch)
                     continue
+                } else {
+                    val currentStreamPos = fetch.nextSlot.toLong() * blockSize + fetch.buffered
+                    val interveningBytes = (tailRequiredSlot.toLong() * blockSize - currentStreamPos).coerceAtLeast(0L)
+                    val urgentStart = tailRequiredSlot.toLong() * blockSize
+                    val urgentEnd = (tailRequiredMaxEndSlot.toLong() * blockSize).coerceAtMost(size)
+                    val urgentRequiredBytes = (urgentEnd - urgentStart).coerceAtLeast(blockSize.coerceAtMost(size))
+                    val inFlightRate = fetch.observedBodyRateBytesPerSecLocked()
+                    val decision = RecoveryPolicy.evaluateInFlightContinuationOrReposition(
+                        interveningBytes = interveningBytes,
+                        urgentRequiredBytes = urgentRequiredBytes,
+                        inFlightBytesPerSecond = inFlightRate,
+                        repositionTtfbMillis = recentTtfbMillis,
+                    )
+                    if (decision.shouldReposition) {
+                        fetch.cancelled = true
+                        fetch.updateLivePriority(Int.MIN_VALUE)
+                        fetch.claimControl.inBlockQuantum = false
+                        fetch.claimControl.recoveryGoalEndOffset = 0L
+                        (preempted ?: ArrayList<Fetch>(4).also { preempted = it }).add(fetch)
+                        continue
+                    } else {
+                        effectivePrio = maxOf(effectivePrio, tailRequiredPrio)
+                    }
                 }
             }
 
-            fetch.claimControl.finishInFlightOnly = plan.isFinishInFlightOnly(fetch.nextSlot)
-            fetch.updateLivePriority(headPrio)
-            if (plan.required.any { it.slot == fetch.nextSlot && it.foreground }) {
+            val hasReaderQuantum = plan.required.any { it.slot == fetch.nextSlot } ||
+                plan.continuation.any { it.slot == fetch.nextSlot }
+            fetch.claimControl.inBlockQuantum = hasReaderQuantum
+            fetch.claimControl.finishInFlightOnly = plan.isSingleExchangeOnly(fetch.nextSlot)
+            fetch.claimControl.allowedProductionEndOffset = plan.allowedProductionEndOffsetFor(fetch)
+            fetch.updateLivePriority(effectivePrio)
+            if (plan.required.any { it.slot == fetch.nextSlot && it.foreground } ||
+                plan.continuation.any { it.slot == fetch.nextSlot && it.foreground }
+            ) {
                 fetch.servedForegroundHead = true
             }
 
-            // Monotonic single-fire byte deadline per (owner, epoch, slot); cleared when no unconsumed Required deadline remains.
-            if (fetch.initialPriority < PikPakStreamReader.STREAMING_PRIORITY) {
-                var earliestAt: TimeMark? = null
-                var earliestEpisode: SlotDeadlineEpisode? = null
-                var maxEndByte = 0L
-                var matchingEpisodes: ArrayList<SlotDeadlineEpisode>? = null
-                for (j in 0 until plan.required.size) {
-                    val req = plan.required[j]
-                    val ep = req.deadlineEpisode
-                    if (req.slot == fetch.nextSlot && ep != null && !ep.consumed.value) {
-                        val reqDeadline = ep.at
-                        if (earliestAt == null || isEarlierMark(reqDeadline, earliestAt)) {
-                            earliestAt = reqDeadline
-                            earliestEpisode = ep
-                        }
-                        if (req.endByteExclusive > maxEndByte) maxEndByte = req.endByteExclusive
-                        (matchingEpisodes ?: ArrayList<SlotDeadlineEpisode>(2).also { matchingEpisodes = it }).add(ep)
+            // Populate finite recovery goal and monotonic revision per (slot, maxEpoch) for RangeReader RecoveryPolicy.
+            var hasUrgentRequired = false
+            var maxUrgentEpoch = Long.MIN_VALUE
+            for (j in 0 until plan.required.size) {
+                val req = plan.required[j]
+                if (req.slot == fetch.nextSlot && req.priority >= PikPakStreamReader.STREAMING_PRIORITY) {
+                    hasUrgentRequired = true
+                    if (req.epoch > maxUrgentEpoch) maxUrgentEpoch = req.epoch
+                }
+            }
+            var hasUrgentContinuation = false
+            if (!hasUrgentRequired && fetch.lastRecoveryGoalSlot == fetch.nextSlot) {
+                for (j in 0 until plan.continuation.size) {
+                    val cont = plan.continuation[j]
+                    if (cont.slot == fetch.nextSlot && cont.priority >= PikPakStreamReader.STREAMING_PRIORITY) {
+                        hasUrgentContinuation = true
+                        break
                     }
                 }
-                if (earliestAt != null && earliestEpisode != null && maxEndByte > 0L && matchingEpisodes != null) {
-                    val chosenAt = earliestAt
-                    val chosenEpisode = earliestEpisode
-                    val episodes = matchingEpisodes
-                    val coConsumed = if (episodes.size <= 1) {
-                        emptyList()
-                    } else {
-                        episodes.mapNotNull { ep ->
-                            if (ep !== chosenEpisode && !isEarlierMark(chosenAt, ep.at)) ep.consumed else null
-                        }
-                    }
-                    val existing = fetch.deadlineFlow.value
-                    val shouldPublish = existing == null ||
-                        existing.slot != fetch.nextSlot ||
-                        existing.consumed !== chosenEpisode.consumed ||
-                        existing.coConsumed != coConsumed ||
-                        existing.at != chosenAt ||
-                        existing.endExclusive != maxEndByte
-                    if (shouldPublish) {
-                        fetch.deadlineFlow.value = ByteDeadline(
-                            slot = fetch.nextSlot,
-                            endExclusive = maxEndByte,
-                            at = chosenAt,
-                            consumed = chosenEpisode.consumed,
-                            coConsumed = coConsumed,
-                        )
-                    }
-                } else if (fetch.deadlineFlow.value != null) {
-                    fetch.deadlineFlow.value = null
+            }
+            if (hasUrgentRequired) {
+                if (fetch.lastRecoveryGoalSlot != fetch.nextSlot || maxUrgentEpoch > fetch.lastRecoveryGoalMaxEpoch) {
+                    fetch.lastRecoveryGoalSlot = fetch.nextSlot
+                    fetch.lastRecoveryGoalMaxEpoch = maxUrgentEpoch
+                    fetch.lastRecoveryGoalRevision = ++recoveryRevisionSeq
+                    fetch.claimControl.recoveryGoalRevision = fetch.lastRecoveryGoalRevision
                 }
-            } else if (fetch.deadlineFlow.value != null) {
-                fetch.deadlineFlow.value = null
+                fetch.claimControl.recoveryGoalEndOffset = minOf(size, (fetch.nextSlot + 1L) * blockSize)
+            } else if (hasUrgentContinuation) {
+                fetch.claimControl.recoveryGoalEndOffset = minOf(size, (fetch.nextSlot + 1L) * blockSize)
+            } else {
+                fetch.claimControl.recoveryGoalEndOffset = 0L
             }
         }
 
@@ -1716,8 +1949,8 @@ internal class BlockCache(
                         f.livePriorityValue == PikPakStreamReader.BACKGROUND_READ_AHEAD_PRIORITY ||
                         f.issuedPriority == PikPakStreamReader.BACKGROUND_READ_AHEAD_PRIORITY)
                 if (isBgOnly) {
-                    if (!f.networkStarted && f.endSlot > f.nextSlot + 1) {
-                        f.endSlot = f.nextSlot + 1
+                    if (!f.networkStarted && f.plannedEndSlot > f.nextSlot + 1) {
+                        f.plannedEndSlot = f.nextSlot + 1
                     }
                     (bgCandidates ?: ArrayList<Fetch>(activeFetches.size).also { bgCandidates = it }).add(f)
                 }
@@ -1734,15 +1967,15 @@ internal class BlockCache(
                     val victim = candidates[i]
                     victim.cancelled = true
                     victim.updateLivePriority(Int.MIN_VALUE)
-                    victim.deadlineFlow.value = null
+                    victim.claimControl.inBlockQuantum = false
+                    victim.claimControl.recoveryGoalEndOffset = 0L
                     (preempted ?: ArrayList<Fetch>(excess).also { preempted = it }).add(victim)
                 }
             }
         }
 
-        // Worker-pool priority preemption (0ms grace):
-        // - Any unclaimed claim >= 0 preempts FinishInFlight (-1) when worker pool is full.
-        // - Any unclaimed Required (>= STREAMING_PRIORITY) preempts lower-priority active Fetch when worker pool is full.
+        // Worker-pool priority preemption (0ms grace for strictly higher tiers & FinishInFlight;
+        // same-tier in-block reader quantum finishes its current 256 KiB block without ping-pong):
         val maxWorkers = activeWorkers()
         if (maxWorkers > 0) {
             var activeCount = 0
@@ -1754,8 +1987,8 @@ internal class BlockCache(
                 val bestUnclaimedPrio = highestUnclaimedPriorityLocked(plan)
                 if (bestUnclaimedPrio >= 0) {
                     val maxVictimPrio = when {
-                        bestUnclaimedPrio >= PikPakStreamReader.BLOCKING_PRIORITY -> bestUnclaimedPrio - 1
-                        bestUnclaimedPrio >= PikPakStreamReader.STREAMING_PRIORITY -> PikPakStreamReader.READ_AHEAD_PRIORITY - 1
+                        bestUnclaimedPrio >= PikPakStreamReader.BLOCKING_PRIORITY -> PikPakStreamReader.BLOCKING_PRIORITY - 1
+                        bestUnclaimedPrio >= PikPakStreamReader.STREAMING_PRIORITY -> PikPakStreamReader.STREAMING_PRIORITY - 1
                         else -> FINISH_IN_FLIGHT_PRIORITY
                     }
                     var victim: Fetch? = null
@@ -1764,7 +1997,11 @@ internal class BlockCache(
                         if (f.cancelled || f.released || f.livePriorityValue > maxVictimPrio) continue
                         if (victim == null ||
                             f.livePriorityValue < victim.livePriorityValue ||
-                            (f.livePriorityValue == victim.livePriorityValue && f.order > victim.order)
+                            (f.livePriorityValue == victim.livePriorityValue &&
+                                !f.claimControl.inBlockQuantum && victim.claimControl.inBlockQuantum) ||
+                            (f.livePriorityValue == victim.livePriorityValue &&
+                                f.claimControl.inBlockQuantum == victim.claimControl.inBlockQuantum &&
+                                f.order > victim.order)
                         ) {
                             victim = f
                         }
@@ -1772,6 +2009,8 @@ internal class BlockCache(
                     if (victim != null) {
                         victim.cancelled = true
                         victim.updateLivePriority(Int.MIN_VALUE)
+                        victim.claimControl.inBlockQuantum = false
+                        victim.claimControl.recoveryGoalEndOffset = 0L
                         (preempted ?: ArrayList<Fetch>(2).also { preempted = it }).add(victim)
                     }
                 }
@@ -2026,7 +2265,7 @@ internal class BlockCache(
         for (i in 0 until openTickets.size) {
             val t = openTickets[i]
             if (!t.ended && !t.owner.isClosed && t.effectiveRole == StreamRole.FOREGROUND) {
-                if (t.reading) {
+                if (t.activeWaiter != null) {
                     readingFg = true
                 }
                 val state = owners[t.owner]
@@ -2081,7 +2320,9 @@ internal class BlockCache(
             val seen = idleSignal.value
             val nextIdle: Duration? = locked {
                 var earliest: Duration? = null
-                val anyReadingFg = openTickets.any { !it.ended && !it.owner.isClosed && it.reading && it.effectiveRole == StreamRole.FOREGROUND }
+                val anyReadingFg = openTickets.any {
+                    !it.ended && !it.owner.isClosed && it.activeWaiter != null && it.effectiveRole == StreamRole.FOREGROUND
+                }
                 if (!anyReadingFg) {
                     for (state in owners.values) {
                         val last = state.lastForegroundActiveAt ?: continue
@@ -2154,6 +2395,7 @@ internal class BlockCache(
 
     private suspend fun awaitTicketSlot(
         ticket: TicketHandle,
+        waiter: ReadWaiter,
         slot: Int,
         within: Int,
         destination: ByteArray,
@@ -2199,18 +2441,13 @@ internal class BlockCache(
                     val bytes = complete ?: fetch?.buffer ?: partial?.bytes
                     val end = complete?.size ?: fetch?.buffered ?: partial?.length ?: 0
                     if (bytes != null && end > within) {
-                        ticket.waitingSlot = -1
+                        waiter.waitingWithin = -1
                         val count = minOf(end - within, length)
                         bytes.copyInto(destination, offset, within, within + count)
                         if (complete == null) fetch?.prefixServedToReader = true
                         count
                     } else {
-                        if (failure == null) {
-                            ticket.waitingSlot = slot
-                            ticket.waitingWithin = within
-                        } else {
-                            ticket.waitingSlot = -1
-                        }
+                        waiter.waitingWithin = if (failure == null) within else -1
                         null
                     }
                 }
@@ -2220,7 +2457,7 @@ internal class BlockCache(
                 readSignal.awaitChange(seen)
             }
         } finally {
-            ticket.waitingSlot = -1
+            waiter.waitingWithin = -1
         }
     }
 
@@ -2256,7 +2493,7 @@ internal class BlockCache(
 
     internal inner class Fetch(
         val firstSlot: Int,
-        slotCount: Int,
+        initialSlotCount: Int,
         val initialPriority: Int,
         val order: Long,
         val durable: Boolean = false,
@@ -2266,14 +2503,7 @@ internal class BlockCache(
         var livePriorityValue: Int = initialPriority
             private set
 
-        val deadlineFlow = MutableStateFlow<ByteDeadline?>(null)
-        val claimControl = FetchClaimControl(
-            priorityFlow = mutableLivePriority,
-            deadlineFlow = deadlineFlow,
-            authorizeDeadline = { target, deliveredEndOffset ->
-                authorizeFetchDeadline(this, target, deliveredEndOffset)
-            },
-        )
+        val claimControl = FetchClaimControl(priorityFlow = mutableLivePriority)
 
         val done = CompletableDeferred<Unit>(scope.coroutineContext[Job])
 
@@ -2283,21 +2513,37 @@ internal class BlockCache(
         var servedForegroundHead = false
         var lastProgressAt = timeSource.markNow()
         @Volatile var nextSlot = firstSlot
-        @Volatile var endSlot = firstSlot + slotCount
+        @Volatile var plannedEndSlot = firstSlot + initialSlotCount
+        @Volatile var issuedEndSlot = firstSlot + initialSlotCount
         @Volatile var waitingForLimiter = false
-        var networkStarted = false
+        @Volatile var networkStarted = false
         var issuedPriority = Int.MIN_VALUE
         var lastByteExchangeId = 0L
+        var firstNetworkByteAt: TimeMark? = null
+        var networkBytesOnCurrentRequest = 0L
+        var lastRecoveryGoalSlot = -1
+        var lastRecoveryGoalMaxEpoch = Long.MIN_VALUE
+        var lastRecoveryGoalRevision = 0L
         var buffer: ByteArray? = null
         var buffered = 0
         var prefixServedToReader = false
         var reserved = 0L
         var transportReserved = 0L
+        val endSlot: Int get() = if (networkStarted) issuedEndSlot else plannedEndSlot
         val slotCount: Int get() = endSlot - firstSlot
         val startOffset: Long get() = firstSlot.toLong() * blockSize
         val endOffset: Long get() = (endSlot.toLong() * blockSize).coerceAtMost(size)
         val slots: IntRange get() = nextSlot until endSlot
         fun containsSlot(slot: Int): Boolean = slot >= nextSlot && slot < endSlot
+
+        fun observedBodyRateBytesPerSecLocked(): Long? {
+            if (claimControl.liveExchangeId <= 0L) return null
+            val firstMark = firstNetworkByteAt ?: return null
+            if (networkBytesOnCurrentRequest < 16L * 1024L) return null
+            val elapsedNs = firstMark.elapsedNow().inWholeNanoseconds
+            if (elapsedNs < 50_000_000L) return null
+            return (networkBytesOnCurrentRequest * 1_000_000_000L) / elapsedNs
+        }
 
         fun updateLivePriority(priority: Int) {
             if (livePriorityValue != priority) {
@@ -2350,7 +2596,8 @@ internal class BlockCache(
 
     /**
      * Claims the highest-priority unclaimed slot from [planLocked].
-     * Note: [ByteClaim.FinishInFlight] NEVER creates a new [Fetch] (`0` new HTTP requests).
+     * Note: [ByteClaim.Continuation] and [ByteClaim.FinishInFlight] NEVER create a new [Fetch]
+     * (`0` new HTTP requests).
      *
      * Must be called under [mutex].
      */
@@ -2380,7 +2627,14 @@ internal class BlockCache(
             la: ByteClaim.LookAhead?,
             want: Want?,
         ) {
-            if (priority > targetPriority || (priority == targetPriority && order < targetOrder)) {
+            val targetIsReq = targetRequired != null
+            val candIsReq = req != null
+            val beats = when {
+                priority != targetPriority -> priority > targetPriority
+                candIsReq != targetIsReq -> candIsReq
+                else -> order < targetOrder
+            }
+            if (beats) {
                 target = slot
                 targetPriority = priority
                 targetOrder = order
@@ -2396,7 +2650,10 @@ internal class BlockCache(
         for (i in 0 until activeFetches.size) {
             val f = activeFetches[i]
             if (f.cancelled || f.released || f.durable) continue
-            if (!wanted.overlapsRange(f.nextSlot, f.endSlot) && plan.required.none { it.slot == f.nextSlot }) {
+            if (!wanted.overlapsRange(f.nextSlot, f.endSlot) &&
+                plan.required.none { it.slot == f.nextSlot } &&
+                plan.continuation.none { it.slot == f.nextSlot }
+            ) {
                 readAheadActive++
             }
         }
@@ -2441,11 +2698,11 @@ internal class BlockCache(
             var donorSpan = 1
             for (i in 0 until activeFetches.size) {
                 val f = activeFetches[i]
-                val span = f.endSlot - f.nextSlot
+                val span = f.plannedEndSlot - f.nextSlot
                 if (f.durable && !f.released && !f.cancelled && !f.networkStarted && span > donorSpan &&
                     f.lastProgressAt.elapsedNow() > Duration.ZERO
                 ) {
-                    val split = f.endSlot - span / 2
+                    val split = f.plannedEndSlot - span / 2
                     if (wanted.hasDurable(split)) {
                         donor = f
                         donorSpan = span
@@ -2453,7 +2710,7 @@ internal class BlockCache(
                 }
             }
             if (donor != null) {
-                val split = donor.endSlot - (donor.endSlot - donor.nextSlot) / 2
+                val split = donor.plannedEndSlot - (donor.plannedEndSlot - donor.nextSlot) / 2
                 val durableStrongest = wanted.strongestOrNull(split, durableOnly = true)
                 if (durableStrongest != null) {
                     target = split
@@ -2497,8 +2754,21 @@ internal class BlockCache(
                 ((remaining + spanWorkers - 1) / spanWorkers).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
             }
             blocking || streamLa != null -> {
-                val winCount = (windowLastSlot - target + 1).coerceAtLeast(1).toLong()
-                ((winCount + spanWorkers - 1) / spanWorkers).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+                var unreservedSlots = 0L
+                for (s in target..windowLastSlot) {
+                    if (s.toLong() * blockSize >= size) break
+                    if (s !in cache && s !in inFlight && s !in offered && s !in persisting && s !in failed) {
+                        unreservedSlots++
+                    }
+                }
+                val activePoolWorkers = nonCancelledActive.coerceAtMost((spanWorkers - 1).coerceAtLeast(0))
+                val remainingWorkers = minOf(
+                    (maxWorkers - nonCancelledActive).coerceAtLeast(1),
+                    (spanWorkers - activePoolWorkers).coerceAtLeast(1),
+                )
+                ((unreservedSlots.coerceAtLeast(1L) + remainingWorkers - 1L) / remainingWorkers)
+                    .coerceIn(1L, Int.MAX_VALUE.toLong())
+                    .toInt()
             }
             else -> 2
         }
@@ -2506,7 +2776,7 @@ internal class BlockCache(
         val highBitrateSpan = if (!blocking) highBitratePlaybackSpan() else 1
         val activeHeadOffset = streamLa?.activeHeadOffset ?: (target.toLong() * blockSize)
         val maxSpan = when {
-            tailDonor != null -> tailDonor.endSlot - target
+            tailDonor != null -> tailDonor.plannedEndSlot - target
             throttled() -> 1
             downloadWant != null && downloadsThrottled() -> 1
             blocking -> {
@@ -2518,15 +2788,28 @@ internal class BlockCache(
                 }
             }
             streamLa != null -> {
-                if (targetPriority == PikPakStreamReader.READ_AHEAD_PRIORITY && isNearWindowCommittedLocked(streamLa.activeHeadOffset)) {
-                    1
-                } else {
-                    val baseSpan = if (registration == null) {
-                        if (isNearWindowCoveredLocked(streamLa.activeHeadOffset)) 4 else 2
+                if (registration == null) {
+                    if (targetPriority == PikPakStreamReader.READ_AHEAD_PRIORITY &&
+                        isNearWindowCommittedLocked(streamLa.activeHeadOffset)
+                    ) {
+                        1
                     } else {
-                        scheduler!!.spanFor(registration!!, spanWorkers, durable = false)
+                        val baseSpan = if (isNearWindowCoveredLocked(streamLa.activeHeadOffset)) 4 else 2
+                        minOf(fairShare, maxOf(baseSpan, highBitrateSpan))
                     }
-                    minOf(fairShare, maxOf(baseSpan, highBitrateSpan))
+                } else {
+                    val schedulerCeiling = scheduler!!.spanFor(registration!!, spanWorkers, durable = false)
+                    val waveBlocks = minOf(4, spanWorkers).coerceAtLeast(1)
+                    val ownerBudgetBytes = effectiveOwnerBudgetBytesLocked(streamLa.owner.intent)
+                    val budgetSupports1MiB = ownerBudgetBytes >= spanWorkers.toLong() * 4L * blockSize
+                    val progressiveSpan = when {
+                        !isNearPrefixCoveredLocked(streamLa.activeHeadOffset, waveBlocks) -> 1
+                        !isNearPrefixCommittedLocked(streamLa.activeHeadOffset, waveBlocks) ||
+                            (completedMultiBlockFetches == 0L && highBitrateSpan < 4) ||
+                            !budgetSupports1MiB -> 2
+                        else -> 4
+                    }
+                    minOf(schedulerCeiling, fairShare, progressiveSpan)
                 }
             }
             streamWarm != null -> 2
@@ -2621,7 +2904,7 @@ internal class BlockCache(
 
         val fetch = Fetch(target, slotCount, targetPriority, targetOrder, durable = downloadWant != null)
         if (blocking && targetRequired!!.foreground) fetch.servedForegroundHead = true
-        tailDonor?.let { it.endSlot = target }
+        tailDonor?.let { it.plannedEndSlot = target }
         activeFetches.add(fetch)
         return fetch
     }
@@ -2702,45 +2985,6 @@ internal class BlockCache(
         return count
     }
 
-    private suspend fun authorizeFetchDeadline(
-        fetch: Fetch,
-        target: ByteDeadline,
-        deliveredEndOffset: Long,
-    ): Boolean = locked {
-        if (closed ||
-            fetch.cancelled ||
-            fetch.released ||
-            fetch.nextSlot != target.slot ||
-            deliveredEndOffset >= target.endExclusive ||
-            fetch.deadlineFlow.value !== target
-        ) {
-            fetch.deadlineFlow.compareAndSet(target, null)
-            return@locked false
-        }
-        val plan = planLocked()
-        var matchedActive = false
-        for (i in 0 until plan.required.size) {
-            val req = plan.required[i]
-            val ep = req.deadlineEpisode
-            if (req.slot == target.slot &&
-                req.endByteExclusive > deliveredEndOffset &&
-                ep != null &&
-                !ep.consumed.value &&
-                (ep.consumed === target.consumed || target.coConsumed.any { it === ep.consumed })
-            ) {
-                ep.consumed.value = true
-                matchedActive = true
-            }
-        }
-        if (!matchedActive) {
-            fetch.deadlineFlow.compareAndSet(target, null)
-            return@locked false
-        }
-        target.tryConsume()
-        fetch.deadlineFlow.value = null
-        true
-    }
-
     private fun activeReservedBytes(): Long {
         var total = 0L
         for (i in 0 until activeFetches.size) {
@@ -2783,6 +3027,8 @@ internal class BlockCache(
                 try {
                     val firstLimitedSlot = fetch.nextSlot
                     limitBlock(fetch, firstLimitedSlot)
+                    var preStartWithdrawn: List<Fetch>? = null
+                    var preStartPreempted: List<Fetch>? = null
                     val (offset, length, callPriority) = locked {
                         if (fetch.cancelled || fetch.released || closed) {
                             Triple(0L, 0L, Int.MIN_VALUE)
@@ -2795,22 +3041,37 @@ internal class BlockCache(
                             if (headPrio == Int.MIN_VALUE || nonDurableGone || backgroundOverCap) {
                                 fetch.cancelled = true
                                 fetch.updateLivePriority(Int.MIN_VALUE)
-                                fetch.deadlineFlow.value = null
+                                fetch.claimControl.inBlockQuantum = false
+                                fetch.claimControl.recoveryGoalEndOffset = 0L
                                 Triple(0L, 0L, Int.MIN_VALUE)
                             } else {
-                                if (fetch.durable && downloadsThrottled() && fetch.endSlot > fetch.nextSlot + 1) {
-                                    fetch.endSlot = fetch.nextSlot + 1
+                                if (fetch.durable && downloadsThrottled() && fetch.plannedEndSlot > fetch.nextSlot + 1) {
+                                    fetch.plannedEndSlot = fetch.nextSlot + 1
                                 }
-                                // Once issued, fetch.endSlot is never fake-shortened; block-boundary exit
-                                // closes the socket cleanly when downstream claims disappear.
+                                for (j in 0 until plan.required.size) {
+                                    val req = plan.required[j]
+                                    if (req.slot > fetch.nextSlot && req.slot < fetch.plannedEndSlot && req.priority > headPrio) {
+                                        fetch.plannedEndSlot = req.slot
+                                    }
+                                }
+                                fetch.issuedEndSlot = fetch.plannedEndSlot
                                 fetch.networkStarted = true
+                                fetch.firstNetworkByteAt = null
+                                fetch.networkBytesOnCurrentRequest = 0L
                                 fetch.issuedPriority = headPrio
-                                fetch.updateLivePriority(headPrio)
-                                val startOff = fetch.nextSlot.toLong() * blockSize + fetch.buffered
-                                Triple(startOff, fetch.endOffset - startOff, headPrio)
+                                val actions = reconcileClaimsLocked()
+                                preStartWithdrawn = actions.withdrawn
+                                preStartPreempted = actions.preempted
+                                if (fetch.cancelled) {
+                                    Triple(0L, 0L, Int.MIN_VALUE)
+                                } else {
+                                    val startOff = fetch.nextSlot.toLong() * blockSize + fetch.buffered
+                                    Triple(startOff, fetch.endOffset - startOff, fetch.livePriorityValue)
+                                }
                             }
                         }
                     }
+                    cancelFetches(preStartWithdrawn, preStartPreempted)
                     if (length <= 0L || callPriority == Int.MIN_VALUE) return
                     val tracksOwnExchange = source is RangeReader || source is PikPakFileHandle
                     val localExchangeId = if (!tracksOwnExchange) fetch.claimControl.beginExchange() else 0L
@@ -2830,10 +3091,12 @@ internal class BlockCache(
                                                 true
                                             } else {
                                                 val snapshot = planLocked()
+                                                val hasTailReq = snapshot.hasRequiredInRange(slot, fetch.endSlot)
                                                 val bgOnly = !snapshot.hasNonDurableClaim(slot) &&
+                                                    !hasTailReq &&
                                                     (fetch.durable || fetch.issuedPriority == PikPakStreamReader.BACKGROUND_READ_AHEAD_PRIORITY)
-                                                !snapshot.hasAnyClaim(slot) ||
-                                                    (fetch.durable && fetch.servedForegroundHead && !snapshot.hasNonDurableClaim(slot)) ||
+                                                (!snapshot.hasAnyClaim(slot) && !hasTailReq) ||
+                                                    (fetch.durable && fetch.servedForegroundHead && !snapshot.hasNonDurableClaim(slot) && !hasTailReq) ||
                                                     (bgOnly && (downloadsThrottled() || countBackgroundActiveLocked(exclude = fetch) >= durableWorkerLimitLocked()))
                                             }
                                         }
@@ -2857,6 +3120,10 @@ internal class BlockCache(
                                     while (fetch.buffered < expected) {
                                         val count = channel.readAvailable(bytes, fetch.buffered, expected - fetch.buffered)
                                         if (count < 0) {
+                                            if (slot > firstLimitedSlot && fetch.buffered == 0) {
+                                                retired = true
+                                                return@read
+                                            }
                                             throw PikPakException(
                                                 -1,
                                                 "stream: got ${fetch.buffered} of $expected bytes at offset ${slot.toLong() * blockSize}",
@@ -2864,6 +3131,10 @@ internal class BlockCache(
                                         }
                                         if (count == 0) continue
                                         locked {
+                                            if (fetch.firstNetworkByteAt == null) {
+                                                fetch.firstNetworkByteAt = timeSource.markNow()
+                                            }
+                                            fetch.networkBytesOnCurrentRequest += count
                                             fetch.buffered += count
                                             if (!tracksOwnExchange) {
                                                 fetch.claimControl.markExchangeDelivered(localExchangeId)
@@ -2876,9 +3147,9 @@ internal class BlockCache(
                                             if (fetch.buffered < expected) {
                                                 var wakeReaders = false
                                                 for (i in 0 until openTickets.size) {
-                                                    val t = openTickets[i]
-                                                    if (t.waitingSlot == slot && fetch.buffered > t.waitingWithin) {
-                                                        t.waitingSlot = -1
+                                                    val w = openTickets[i].activeWaiter
+                                                    if (w != null && w.slot == slot && w.waitingWithin >= 0 && fetch.buffered > w.waitingWithin) {
+                                                        w.waitingWithin = -1
                                                         wakeReaders = true
                                                     }
                                                 }
@@ -2905,7 +3176,7 @@ internal class BlockCache(
                     throw e
                 } catch (e: Throwable) {
                     if (fetch.claimControl.finishInFlightOnly) {
-                        // FinishInFlight issues zero retries and does not poison failed[slot].
+                        // Continuation / FinishInFlight issues zero retries and does not poison failed[slot].
                         return
                     }
                     sourceFailures++
@@ -2917,9 +3188,15 @@ internal class BlockCache(
                     locked {
                         fetch.networkStarted = false
                         fetch.lastByteExchangeId = 0L
-                        fetch.endSlot = fetch.nextSlot + 1
+                        fetch.firstNetworkByteAt = null
+                        fetch.networkBytesOnCurrentRequest = 0L
+                        fetch.plannedEndSlot = fetch.nextSlot + 1
+                        fetch.issuedEndSlot = fetch.plannedEndSlot
                     }
                 } finally {
+                    telemetry.timeToFirstByte?.let { ttfb ->
+                        recentTtfbMillis = ttfb.inWholeMilliseconds.coerceIn(20L, 10_000L)
+                    }
                     telemetry.networkDuration = (telemetry.networkDuration - telemetry.uncoveredLimiterWait).coerceAtLeast(Duration.ZERO)
                 }
             }
@@ -2985,7 +3262,6 @@ internal class BlockCache(
             val claimMask = wanted.completeSlot(slot)
             failed.remove(slot)
             for (state in owners.values) {
-                state.slotDeadlines.remove(slot)
                 state.finishInFlightBySlot.remove(slot)
             }
             val downloadOnly = claimMask == 3 && !plan.hasNonDurableClaim(slot)
@@ -3005,6 +3281,9 @@ internal class BlockCache(
             }
             if (fromNetwork) {
                 deliveredBytes += bytes.size
+                if (slot > fetch.firstSlot) {
+                    completedMultiBlockFetches++
+                }
                 if (!durable && storeWrites != null && slot !in optionalWrites) {
                     offered[slot] = bytes
                     val write = StoreWrite(slot, slot.toLong() * blockSize, bytes)
@@ -3022,9 +3301,7 @@ internal class BlockCache(
             fetch.buffered = 0
             fetch.lastByteExchangeId = 0L
             fetch.prefixServedToReader = false
-            if (fetch.deadlineFlow.value?.slot == slot) {
-                fetch.deadlineFlow.value = null
-            }
+            reconcileClaimsLocked()
             for (state in owners.values.toList()) pruneOwnerIfIdleLocked(state)
             bump()
         }
@@ -3273,17 +3550,8 @@ internal class BlockCache(
         }
     }
 
-    internal suspend fun activeDeadlineForTest(slot: Int): ByteDeadline? = locked {
-        inFlight[slot]?.deadlineFlow?.value
-    }
-
-    internal suspend fun authorizeDeadlineForTest(
-        slot: Int,
-        target: ByteDeadline,
-        deliveredEndOffset: Long,
-    ): Boolean {
-        val fetch = locked { inFlight[slot] } ?: return false
-        return authorizeFetchDeadline(fetch, target, deliveredEndOffset)
+    internal suspend fun activeClaimControlForTest(slot: Int): FetchClaimControl? = locked {
+        inFlight[slot]?.claimControl
     }
 
     internal suspend fun awaitClosedForTest() {
@@ -3374,9 +3642,6 @@ internal class BlockCache(
         const val DEFAULT_READ_AHEAD_CONCURRENCY = 4
         private const val HIGH_BITRATE_READ_AHEAD_THRESHOLD_BYTES_PER_SEC = 3L * 1024 * 1024
         private const val BYTES_PER_SEC_PER_READ_AHEAD_WORKER = 2L * 1024 * 1024
-
-        /** Deadline before an urgent foreground read takes over an already in-flight low-priority slot. */
-        val URGENT_TAKEOVER_DEADLINE: Duration = 1500.milliseconds
 
         /** Attempts per block. RangeReader already retries transport failures and refreshes expired links. */
         const val MAX_ATTEMPTS = 2

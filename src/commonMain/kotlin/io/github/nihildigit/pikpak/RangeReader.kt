@@ -4,7 +4,9 @@ import io.github.nihildigit.pikpak.internal.FileReactivationCoordinator
 import io.github.nihildigit.pikpak.internal.HostHealth
 import io.github.nihildigit.pikpak.internal.PriorityGate
 import io.github.nihildigit.pikpak.internal.ReadTelemetry
+import io.github.nihildigit.pikpak.internal.RecoveryPolicy
 import io.github.nihildigit.pikpak.internal.RequestOrder
+import io.github.nihildigit.pikpak.internal.SignedUrlGates
 import io.github.nihildigit.pikpak.internal.isThrottlePressure
 import io.github.nihildigit.pikpak.internal.retryAfter
 import io.ktor.utils.io.ByteChannel
@@ -33,7 +35,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
@@ -310,7 +311,6 @@ class RangeReader internal constructor(
 
     private class BodySilence(val limit: Duration, val afterBytes: Long) :
         Exception("stream went silent for $limit after $afterBytes bytes")
-    private class DemandDeadline : Exception("required byte prefix missed its deadline")
 
     /**
      * Reads a range into memory. Only for ranges small enough to hold; [read] is the general
@@ -400,7 +400,7 @@ class RangeReader internal constructor(
         length: Long?,
         priority: Int,
         telemetry: ReadTelemetry?,
-    ) {
+    ) = client.signedUrlGates.withReplacementHandoff { handoff ->
         val outerClaimControl = currentCoroutineContext()[FetchClaimControl]
         var attemptsStarted = 0
         var offset = start
@@ -413,26 +413,52 @@ class RangeReader internal constructor(
         var sizeMismatchRefreshes = 0
         val failedReroutes = HashSet<String>()
         var chunkBuffer: ByteArray? = null
+        var forcedAttemptUrl: String? = null
 
         while ((remaining == null || remaining > 0) && !state.draining) {
+            if (outerClaimControl != null && offset >= outerClaimControl.allowedProductionEndOffset) {
+                return@withReplacementHandoff
+            }
             if (attemptsStarted > 0 && outerClaimControl?.finishInFlightOnly == true) {
                 throw PikPakException(-1, "RangeReader: FinishInFlight forbids follow-up request at offset $offset")
             }
             attemptsStarted++
+            val pendingReplacementUrl = forcedAttemptUrl.also { forcedAttemptUrl = null }
             // The link is what refreshes and expiry are about; the attempt may go to a sibling
             // host with the same path and signature, see HostHealth.route. Every refresh below
             // is keyed on linkUrl, so a reroute never looks like a changed link.
             val observedGeneration = coordinator.generation
             val linkUrl = currentUrl()
+            val validReplacementUrl = if (pendingReplacementUrl != null) {
+                if (SignedUrlGates.identityOf(pendingReplacementUrl) == SignedUrlGates.identityOf(linkUrl)) {
+                    pendingReplacementUrl
+                } else {
+                    client.signedUrlGates.releaseHandoff(handoff)
+                    null
+                }
+            } else {
+                null
+            }
             val started = telemetry?.let { timeSource.markNow() }
             // A reader parked on the block is not the place to try an unproven host, whether or not
             // its caller called it urgent: a player filling its buffer still stops if that block is late
             val mayExplore = priority < PikPakStreamReader.READ_AHEAD_PRIORITY
-            val routedUrl = client.hostHealth.route(linkUrl, mayExplore = mayExplore, requestedBytes = remaining ?: HostHealth.MIN_SAMPLE_BYTES, priority = priority)
-            val routedHost = HostHealth.hostOf(routedUrl)
-            val attemptUrl = if (routedHost != null && routedHost in failedReroutes) linkUrl else routedUrl
+            val attemptUrl = validReplacementUrl ?: run {
+                val routedUrl = client.hostHealth.route(
+                    linkUrl,
+                    mayExplore = mayExplore,
+                    requestedBytes = remaining ?: HostHealth.MIN_SAMPLE_BYTES,
+                    priority = priority,
+                )
+                val rh = HostHealth.hostOf(routedUrl)
+                if (rh != null && rh in failedReroutes) linkUrl else routedUrl
+            }
+            val routedHost = HostHealth.hostOf(attemptUrl)
             val rerouted = attemptUrl != linkUrl
-            var delivered = 0L
+            var wireDelivered = 0L
+            var forwardedBytes = 0L
+            var stoppedAtBoundary = false
+            var replacementTargetUrl: String? = null
             var announced: Long? = null
             var clippedAtEof = false
             var headersAnswered = false
@@ -481,28 +507,7 @@ class RangeReader internal constructor(
                             statusesSeen = statuses
                         }
                     }
-                    val demandWatch = claimControl?.let { ctrl -> launch {
-                        ctrl.deadlineFlow.collectLatest { target ->
-                            if (target != null) {
-                                if (target.consumed.value) {
-                                    ctrl.deadlineFlow.compareAndSet(target, null)
-                                } else {
-                                    delay((-target.at.elapsedNow()).coerceAtLeast(Duration.ZERO))
-                                    val fired = ctrl.authorizeDeadline?.invoke(target, offset + delivered)
-                                        ?: (offset + delivered < target.endExclusive &&
-                                            ctrl.deadlineFlow.value === target &&
-                                            target.tryConsume().also { ctrl.deadlineFlow.compareAndSet(target, null) })
-                                    if (fired) {
-                                        throw DemandDeadline()
-                                    } else {
-                                        ctrl.deadlineFlow.compareAndSet(target, null)
-                                    }
-                                }
-                            }
-                        }
-                    } }
                     val remainingSnap = remaining
-                    try {
                     client.streamRangeFromUrl(attemptUrl, offset, remaining) { stream ->
                         validateTotal(stream.totalSize)
                         headersAnswered = true
@@ -528,6 +533,11 @@ class RangeReader internal constructor(
                         clippedAtEof = stream.endsBeforeRequested(offset, remaining)
                         val buffer = chunkBuffer ?: ByteArray(READ_CHUNK).also { chunkBuffer = it }
                         var firstByteAt: TimeMark? = null
+                        var shortWindowMark: TimeMark? = null
+                        var shortWindowBytes = 0L
+                        var shortWindowSinkWait = Duration.ZERO
+                        var consecutiveQualifying = 0
+                        var observedGoalRevision = Long.MIN_VALUE
                         coroutineScope {
                             val bodyWatchdog = launch {
                                 var observedSeq = state.readSeq
@@ -564,42 +574,81 @@ class RangeReader internal constructor(
                             }
                             try {
                                 while (true) {
+                                    val ceilingBeforeRead = claimControl?.allowedProductionEndOffset ?: Long.MAX_VALUE
+                                    val preReadForwardedOffset = offset + forwardedBytes
+                                    if (!state.draining && preReadForwardedOffset >= ceilingBeforeRead) {
+                                        stoppedAtBoundary = true
+                                        state.announced = -1L
+                                        break
+                                    }
+                                    val maxChunk = if (!state.draining && ceilingBeforeRead < Long.MAX_VALUE) {
+                                        minOf(buffer.size.toLong(), (ceilingBeforeRead - preReadForwardedOffset).coerceAtLeast(1L)).toInt()
+                                    } else {
+                                        buffer.size
+                                    }
                                     val bodySilence = currentBodySilence()
                                     state.activeSilenceNanos = if (bodySilence.isFinite()) bodySilence.inWholeNanoseconds else Long.MAX_VALUE
                                     state.readStartedAt = timeSource.markNow()
                                     state.readSeq += 1L
                                     val n = try {
-                                        stream.channel.readAvailable(buffer, 0, buffer.size)
+                                        stream.channel.readAvailable(buffer, 0, maxChunk)
                                     } finally {
                                         state.readSeq += 1L
                                     }
                                     if (n == -1) {
-                                        if (announced == null || delivered >= announced!!) {
+                                        if (announced == null || wireDelivered >= announced!!) {
                                             client.hostHealth.onSocketReturned(attemptUrl)
                                         }
                                         break
                                     }
                                     if (n > 0) {
-                                        if (firstByteAt == null) firstByteAt = timeSource.markNow()
-                                        if (announced != null && n.toLong() > announced!! - delivered) {
+                                        if (announced != null && n.toLong() > announced!! - wireDelivered) {
                                             throw PikPakException(-1, "RangeReader: body exceeds Content-Range")
                                         }
-                                        claimControl?.markExchangeDelivered(exchangeId)
+                                        val wasFirstByte = firstByteAt == null
+                                        if (wasFirstByte) {
+                                            val nowMark = timeSource.markNow()
+                                            firstByteAt = nowMark
+                                            shortWindowMark = nowMark
+                                            shortWindowBytes = 0L
+                                            shortWindowSinkWait = Duration.ZERO
+                                        }
                                         attempt.record(n)
+                                        if (wasFirstByte) {
+                                            val cleanFirstByte = attempt.retries.statuses == 0 && attempt.retries.transport == 0
+                                            attempt.firstByteElapsed()?.takeIf { cleanFirstByte }?.let { ttfb ->
+                                                client.hostHealth.recordFirstByteLatency(attemptUrl, ttfb)
+                                            }
+                                        }
                                         if (telemetry != null && telemetry.timeToFirstByte == null) {
                                             telemetry.timeToFirstByte = started?.elapsedNow()?.minus(attempt.gateWait)
                                         }
                                         telemetry?.recordBytes(n)
                                         addBytes(n.toLong())
-                                        delivered += n
-                                        state.delivered = delivered
-                                        if (!state.draining) {
+                                        wireDelivered += n
+                                        state.delivered = wireDelivered
+
+                                        val ceilingAfterRead = claimControl?.allowedProductionEndOffset ?: Long.MAX_VALUE
+                                        val preWriteOffset = offset + forwardedBytes
+                                        val toWrite = if (!state.draining && ceilingAfterRead < Long.MAX_VALUE) {
+                                            (ceilingAfterRead - preWriteOffset).coerceIn(0L, n.toLong()).toInt()
+                                        } else {
+                                            n
+                                        }
+                                        var chunkSinkWait = Duration.ZERO
+                                        if (!state.draining && toWrite > 0) {
                                             val sinkStarted = timeSource.markNow()
                                             telemetry?.beginSinkWait()
                                             try {
                                                 if (sink.isClosedForWrite) throw sink.closedCause
                                                     ?: IllegalStateException("consumer channel closed before draining")
-                                                sink.writeFully(buffer, 0, n)
+                                                // ByteWriteChannel.writeFully copies [0, toWrite) into writeBuffer
+                                                // synchronously before flushIfNeeded/flush can suspend on consumer
+                                                // backpressure, so the channel owns these bytes as soon as writeFully
+                                                // begins and a preemption during flush must resume after them.
+                                                forwardedBytes += toWrite.toLong()
+                                                claimControl?.markExchangeDelivered(exchangeId)
+                                                sink.writeFully(buffer, 0, toWrite)
                                                 sink.flush()
                                             } catch (e: CancellationException) {
                                                 if (!state.draining && currentCoroutineContext().isActive) throw SinkFailure(e)
@@ -608,23 +657,88 @@ class RangeReader internal constructor(
                                                 if (!state.draining) throw SinkFailure(t)
                                             } finally {
                                                 telemetry?.endSinkWait()
-                                                val waited = sinkStarted.elapsedNow()
-                                                attempt.recordSinkWait(waited)
-                                                if (telemetry != null) telemetry.sinkWait += waited
+                                                chunkSinkWait = sinkStarted.elapsedNow()
+                                                attempt.recordSinkWait(chunkSinkWait)
+                                                if (telemetry != null) telemetry.sinkWait += chunkSinkWait
                                             }
                                         }
-                                        // A throttled "drip" edge sending a few KiB every 1–2 s resets per-read
-                                        // bodySilence forever and drags a 256 KiB block to 9+ s. Cut over once
-                                        // bodySilence has elapsed below viable rate on an unproven host.
-                                        val bodyElapsed = (firstByteAt.elapsedNow() - attempt.sinkWait).coerceAtLeast(Duration.ZERO)
-                                        if (announced == null || delivered < announced!!) {
+
+                                        val forwardedOffset = offset + forwardedBytes
+                                        val postFlushCeiling = claimControl?.allowedProductionEndOffset ?: Long.MAX_VALUE
+                                        if (!state.draining && forwardedOffset >= postFlushCeiling) {
+                                            if (announced != null && wireDelivered >= announced!!) {
+                                                client.hostHealth.onSocketReturned(attemptUrl)
+                                            } else {
+                                                stoppedAtBoundary = true
+                                                state.announced = -1L
+                                            }
+                                            break
+                                        }
+
+                                        val bodyElapsed = (firstByteAt!!.elapsedNow() - attempt.sinkWait).coerceAtLeast(Duration.ZERO)
+                                        if (announced == null || wireDelivered < announced!!) {
                                             val bodyRate = attempt.bodyBytesPerSecond()
                                             onBodyProgress?.invoke(bodyElapsed, bodyRate)
-                                            if (bodyElapsed >= bodySilence &&
-                                                tailSilenceDeadline(bodySilence, delivered, announced) == bodySilence &&
-                                                bodyRate < MIN_VIABLE_BODY_BYTES_PER_SEC
-                                            ) {
-                                                throw BodySilence(bodySilence, delivered)
+
+                                            if (!wasFirstByte && !state.draining && claimControl != null) {
+                                                shortWindowBytes += toWrite.toLong()
+                                                shortWindowSinkWait += chunkSinkWait
+                                                val rawWindowElapsed = shortWindowMark?.elapsedNow() ?: Duration.ZERO
+                                                val netWindowElapsed = (rawWindowElapsed - shortWindowSinkWait).coerceAtLeast(Duration.ZERO)
+                                                if (netWindowElapsed >= RecoveryPolicy.MIN_SHORT_WINDOW_MS.milliseconds) {
+                                                    val shortWindowRate = if (shortWindowBytes > 0L) {
+                                                        (shortWindowBytes * 1_000_000_000L) / netWindowElapsed.inWholeNanoseconds.coerceAtLeast(1L)
+                                                    } else {
+                                                        0L
+                                                    }
+                                                    val hasSinkBackpressure = shortWindowSinkWait >= 50.milliseconds ||
+                                                        (rawWindowElapsed > Duration.ZERO && shortWindowSinkWait * 4 >= rawWindowElapsed)
+                                                    val rev = claimControl.recoveryGoalRevision
+                                                    val goalEnd = claimControl.recoveryGoalEndOffset
+                                                    if (rev != observedGoalRevision) {
+                                                        observedGoalRevision = rev
+                                                        consecutiveQualifying = 0
+                                                    }
+                                                    val urgentActive = !claimControl.finishInFlightOnly &&
+                                                        claimControl.priorityFlow.value >= PikPakStreamReader.STREAMING_PRIORITY &&
+                                                        goalEnd > forwardedOffset &&
+                                                        claimControl.consumedRecoveryRevision != rev
+                                                    if (urgentActive) {
+                                                        val candidate = client.hostHealth.bestReplacementCandidate(
+                                                            currentUrl = attemptUrl,
+                                                            excludedHosts = failedReroutes,
+                                                            remainingBytes = goalEnd - forwardedOffset,
+                                                        )
+                                                        val decision = RecoveryPolicy.evaluateSameOffsetSwitchover(
+                                                            forwardedOffset = forwardedOffset,
+                                                            goalEndOffset = goalEnd,
+                                                            goalRevision = rev,
+                                                            consumedGoalRevision = claimControl.consumedRecoveryRevision,
+                                                            currentUrl = attemptUrl,
+                                                            currentShortWindowBytesPerSecond = shortWindowRate,
+                                                            hasSinkBackpressure = hasSinkBackpressure,
+                                                            candidate = candidate,
+                                                            previousConsecutiveQualifying = consecutiveQualifying,
+                                                            admissionQueueMillis = 0L,
+                                                        )
+                                                        consecutiveQualifying = decision.nextConsecutiveQualifying
+                                                        if (decision.shouldSwitch &&
+                                                            decision.candidate != null &&
+                                                            claimControl.recoveryGoalRevision == rev &&
+                                                            !claimControl.finishInFlightOnly
+                                                        ) {
+                                                            claimControl.consumedRecoveryRevision = rev
+                                                            replacementTargetUrl = decision.candidate.url
+                                                            handoff.armFor(decision.candidate.url)
+                                                            break
+                                                        }
+                                                    } else {
+                                                        consecutiveQualifying = 0
+                                                    }
+                                                    shortWindowMark = timeSource.markNow()
+                                                    shortWindowBytes = 0L
+                                                    shortWindowSinkWait = Duration.ZERO
+                                                }
                                             }
                                         }
                                     }
@@ -634,17 +748,22 @@ class RangeReader internal constructor(
                             }
                         }
                         } finally {
-                            val fullRangeInSink = (remainingSnap != null && delivered >= remainingSnap) || clippedAtEof
+                            val fullRangeInSink = (remainingSnap != null && forwardedBytes >= remainingSnap) ||
+                                (clippedAtEof && (announced == null || forwardedBytes >= announced!!)) ||
+                                stoppedAtBoundary
                             if (!fullRangeInSink) {
                                 claimControl?.endExchange(exchangeId)
                             }
                         }
                     }
-                    } finally { demandWatch?.cancel() }
                   }
                 }
                 }
             } catch (t: Throwable) {
+                handoff.disarm()
+                withContext(NonCancellable) {
+                    client.signedUrlGates.releaseHandoff(handoff)
+                }
                 val claimControl = currentCoroutineContext()[FetchClaimControl]
                 claimControl?.clearExchange()
                 if (telemetry != null && started != null) {
@@ -654,7 +773,7 @@ class RangeReader internal constructor(
                     }
                 }
                 if (t is io.github.nihildigit.pikpak.internal.DemandWithdrawnException) {
-                    val whole = announced != null && delivered >= announced!!
+                    val whole = announced != null && wireDelivered >= announced!!
                     report(
                         attempt,
                         attemptUrl,
@@ -663,39 +782,16 @@ class RangeReader internal constructor(
                     )
                     throw t
                 }
-                if (t is io.github.nihildigit.pikpak.internal.TransferPreempted || t is DemandDeadline) {
+                if (t is io.github.nihildigit.pikpak.internal.TransferPreempted) {
                     telemetry?.let { it.preemptions++ }
-                    report(attempt, attemptUrl, RangeAttempt.Outcome.Cancelled,
-                        if (t is DemandDeadline) RangeAttempt.EndReason.DemandDeadline else RangeAttempt.EndReason.Preempted)
+                    report(attempt, attemptUrl, RangeAttempt.Outcome.Cancelled, RangeAttempt.EndReason.Preempted)
                     if (!currentCoroutineContext().isActive || claimControl?.finishInFlightOnly == true) throw t
-                    if (t is DemandDeadline && (delivered == 0L || attempt.bodyBytesPerSecond() < MIN_VIABLE_BODY_BYTES_PER_SEC)) {
-                        val waited = if (delivered == 0L && attempt.admission.granted.isCompleted && started != null) {
-                            (started.elapsedNow() - attempt.gateWait).coerceAtLeast(Duration.ZERO).takeIf { it >= 1.seconds }
-                        } else null
-                        if (rerouted) {
-                            routedHost?.let { failedReroutes += it }
-                            if (waited != null) client.hostHealth.markSilent(attemptUrl, waited)
-                        } else {
-                            runRetryStep(claimControl, offset) {
-                                switchHost(linkUrl, silentFor = waited)
-                            }
-                        }
-                    }
-                    offset += delivered
-                    remaining = remaining?.minus(delivered)
+                    offset += forwardedBytes
+                    remaining = remaining?.minus(forwardedBytes)
                     continue
                 }
                 if (t is CancellationException) {
-                    // An attempt is reported when it stops delivering, and that can be the
-                    // consumer's doing: read() cancels the pump the moment its block has the
-                    // bytes it wanted, which lands while this attempt is suspended in the one
-                    // more channel read it takes to see EOF. Whether the pump reaches the
-                    // report below first is then a race -- one the JVM wins, because there
-                    // the last read returns -1 without suspending, and Kotlin/Native loses.
-                    // So a cancelled attempt that had everything is Complete; one cut short
-                    // is Cancelled, not Failed: nothing went wrong on the wire, and calling it
-                    // a failure made every seek look like a flaky host.
-                    val whole = announced != null && delivered >= announced!!
+                    val whole = announced != null && wireDelivered >= announced!!
                     report(attempt, attemptUrl, if (whole) RangeAttempt.Outcome.Complete else RangeAttempt.Outcome.Cancelled)
                     throw t
                 }
@@ -707,8 +803,9 @@ class RangeReader internal constructor(
                     val endReason = when {
                         t is UnresponsiveHost -> RangeAttempt.EndReason.HeaderTimeout
                         t is BodySilence -> RangeAttempt.EndReason.BodyStall
-                        headersAnswered && announced != null && delivered < announced!! -> RangeAttempt.EndReason.Truncated
-                        else -> RangeAttempt.EndReason.TransportFailure
+                        t is UrlExpiredException || (t is PikPakException && t.httpStatus != null) -> RangeAttempt.EndReason.HttpStatus
+                        headersAnswered && announced != null && wireDelivered < announced!! -> RangeAttempt.EndReason.Truncated
+                        else -> RangeAttempt.EndReason.TransportError
                     }
                     val outcome = when {
                         t is UrlExpiredException -> RangeAttempt.Outcome.Expired
@@ -716,13 +813,20 @@ class RangeReader internal constructor(
                         t is PikPakException && t.httpStatus in 400..499 -> RangeAttempt.Outcome.Rejected
                         else -> RangeAttempt.Outcome.Failed
                     }
-                    report(attempt, attemptUrl, outcome, if (outcome == RangeAttempt.Outcome.Failed) endReason else null)
+                    if (t is BodySilence) {
+                        client.hostHealth.stalled(attemptUrl, attempt.delivered, attempt.bodyElapsed(t.limit))
+                    } else if (t is UnresponsiveHost) {
+                        client.hostHealth.markSilent(attemptUrl, t.limit)
+                    }
+                    report(attempt, attemptUrl, outcome, endReason)
                     throw t
                 }
-                offset += delivered
-                remaining = remaining?.minus(delivered)
+                offset += forwardedBytes
+                remaining = remaining?.minus(forwardedBytes)
+                if (forwardedBytes > 0L) emptyBodies = 0
 
                 if (t is FileReactivatingException) {
+                    report(attempt, attemptUrl, RangeAttempt.Outcome.Rejected, RangeAttempt.EndReason.HttpStatus)
                     runRetryStep(claimControl, offset) {
                         coordinator.awaitReady(observedGeneration, linkUrl) {
                             refreshUrl(UrlRequest.Expired(it), it)
@@ -731,33 +835,12 @@ class RangeReader internal constructor(
                     continue
                 }
 
-                val throttled = t is PikPakException && t.isThrottlePressure
-                if (state.draining) return
-                if (rerouted && !throttled && t !is RepresentationSizeMismatch) {
-                    // The sibling failed, not the link: an expiry, a 404 or a refused handshake
-                    // there says nothing about the link's own host. So no refresh and no failure
-                    // counted up to MAX_FREE_REROUTES; once multiple siblings fail on the same
-                    // read, count further failures so a dead cluster cannot spin through learned hosts.
-                    routedHost?.let { failedReroutes += it }
-                    val rejected = t is UrlExpiredException || (t is PikPakException && t.httpStatus in 400..499)
-                    report(attempt, attemptUrl, if (rejected) RangeAttempt.Outcome.Rejected else RangeAttempt.Outcome.Failed)
-                    if (t is BodySilence) {
-                        client.hostHealth.stalled(attemptUrl, attempt.delivered, attempt.bodyBytesPerSecond(), t.limit)
-                    } else if (t is UnresponsiveHost) {
-                        client.hostHealth.markSilent(attemptUrl, t.limit)
-                    }
-                    if (rejected || (t !is BodySilence && t !is UnresponsiveHost && delivered == 0L)) {
-                        client.hostHealth.refused(attemptUrl)
-                    }
-                    if (failedReroutes.size <= MAX_FREE_REROUTES) {
-                        continue
-                    }
-                }
+                if (state.draining) return@withReplacementHandoff
 
-                runRetryStep(claimControl, offset) {
-                    when {
-                        t is RepresentationSizeMismatch -> {
-                            report(attempt, attemptUrl, RangeAttempt.Outcome.Rejected)
+                when {
+                    t is RepresentationSizeMismatch -> {
+                        report(attempt, attemptUrl, RangeAttempt.Outcome.Rejected, RangeAttempt.EndReason.HttpStatus)
+                        runRetryStep(claimControl, offset) {
                             sizeMismatchRefreshes++
                             if (sizeMismatchRefreshes > 2) {
                                 throw PikPakException(-1, t.message ?: "representation size mismatch", cause = t)
@@ -768,13 +851,10 @@ class RangeReader internal constructor(
                                 throw PikPakException(-1, t.message ?: "representation size mismatch", cause = t)
                             }
                         }
-                        t is UrlExpiredException -> {
-                            report(attempt, attemptUrl, RangeAttempt.Outcome.Expired)
-                            if (telemetry != null) telemetry.refreshed = true
-                            refreshUrl(UrlRequest.Expired(linkUrl), linkUrl)
-                        }
-                        t is PikPakException && t.isThrottlePressure -> {
-                            report(attempt, attemptUrl, RangeAttempt.Outcome.Throttled)
+                    }
+                    t is PikPakException && t.isThrottlePressure -> {
+                        report(attempt, attemptUrl, RangeAttempt.Outcome.Throttled, RangeAttempt.EndReason.HttpStatus)
+                        runRetryStep(claimControl, offset) {
                             // Over the URL's connection cap. Somebody else's read
                             // will finish; this is a queue, not a failure.
                             throttles++
@@ -782,43 +862,97 @@ class RangeReader internal constructor(
                             bumpThrottled()
                             delay(t.retryAfter() ?: throttleBackoff(throttles))
                         }
-                        t is PikPakException && t.httpStatus in 400..499 -> {
-                            report(attempt, attemptUrl, RangeAttempt.Outcome.Rejected)
-                            if (rejectionRefreshed) throw t
-                            rejectionRefreshed = true
-                            if (telemetry != null) telemetry.refreshed = true
-                            refreshUrl(UrlRequest.Rejected(linkUrl, t.httpStatus!!), linkUrl)
+                    }
+                    t is UrlExpiredException -> {
+                        if (rerouted) {
+                            routedHost?.let { failedReroutes += it }
+                            client.hostHealth.refused(attemptUrl)
+                            report(attempt, attemptUrl, RangeAttempt.Outcome.Rejected, RangeAttempt.EndReason.HttpStatus)
+                            if (failedReroutes.size <= MAX_FREE_REROUTES) continue
+                            runRetryStep(claimControl, offset) {
+                                failures++
+                                if (failures >= maxAttempts) throw t
+                                bumpRetries()
+                            }
+                        } else {
+                            report(attempt, attemptUrl, RangeAttempt.Outcome.Expired, RangeAttempt.EndReason.HttpStatus)
+                            runRetryStep(claimControl, offset) {
+                                if (telemetry != null) telemetry.refreshed = true
+                                refreshUrl(UrlRequest.Expired(linkUrl), linkUrl)
+                            }
                         }
-                        t is UnresponsiveHost -> {
-                            report(attempt, attemptUrl, RangeAttempt.Outcome.Failed, RangeAttempt.EndReason.HeaderTimeout)
+                    }
+                    t is PikPakException && t.httpStatus in 400..499 -> {
+                        if (rerouted) {
+                            routedHost?.let { failedReroutes += it }
+                            client.hostHealth.refused(attemptUrl)
+                            report(attempt, attemptUrl, RangeAttempt.Outcome.Rejected, RangeAttempt.EndReason.HttpStatus)
+                            if (failedReroutes.size <= MAX_FREE_REROUTES) continue
+                            runRetryStep(claimControl, offset) {
+                                failures++
+                                if (failures >= maxAttempts) throw t
+                                bumpRetries()
+                            }
+                        } else {
+                            report(attempt, attemptUrl, RangeAttempt.Outcome.Rejected, RangeAttempt.EndReason.HttpStatus)
+                            runRetryStep(claimControl, offset) {
+                                if (rejectionRefreshed) throw t
+                                rejectionRefreshed = true
+                                if (telemetry != null) telemetry.refreshed = true
+                                refreshUrl(UrlRequest.Rejected(linkUrl, t.httpStatus!!), linkUrl)
+                            }
+                        }
+                    }
+                    t is UnresponsiveHost -> {
+                        report(attempt, attemptUrl, RangeAttempt.Outcome.Failed, RangeAttempt.EndReason.HeaderTimeout)
+                        client.hostHealth.markSilent(attemptUrl, t.limit)
+                        if (rerouted) {
+                            routedHost?.let { failedReroutes += it }
+                            if (failedReroutes.size <= MAX_FREE_REROUTES) continue
+                        }
+                        runRetryStep(claimControl, offset) {
                             failures++
                             if (failures >= maxAttempts) throw PikPakException(-1, "RangeReader: no host answered at offset $offset", cause = t)
                             bumpRetries()
-                            switchHost(linkUrl, silentFor = t.limit)
+                            selectAlternateRoute(linkUrl, failedReroutes)
                         }
-                        t is BodySilence -> {
-                            report(attempt, attemptUrl, RangeAttempt.Outcome.Failed, RangeAttempt.EndReason.BodyStall)
+                    }
+                    t is BodySilence -> {
+                        report(attempt, attemptUrl, RangeAttempt.Outcome.Failed, RangeAttempt.EndReason.BodyStall)
+                        client.hostHealth.stalled(attemptUrl, attempt.delivered, attempt.bodyElapsed(t.limit))
+                        if (rerouted) {
+                            routedHost?.let { failedReroutes += it }
+                            if (failedReroutes.size <= MAX_FREE_REROUTES) continue
+                        }
+                        runRetryStep(claimControl, offset) {
                             bodyStalls++
-                            client.hostHealth.stalled(attemptUrl, attempt.delivered, attempt.bodyBytesPerSecond(), t.limit)
-                            if (delivered < MIN_VIABLE_BODY_BYTES_PER_SEC || bodyStalls >= maxAttempts) {
+                            if (forwardedBytes < MIN_VIABLE_BODY_BYTES_PER_SEC || bodyStalls >= maxAttempts) {
                                 failures++
                                 if (failures >= maxAttempts || bodyStalls >= maxAttempts) {
                                     throw PikPakException(-1, "RangeReader: body silent at offset $offset", cause = t)
                                 }
                             }
                             bumpRetries()
-                            switchHost(linkUrl, silentFor = t.limit)
+                            selectAlternateRoute(linkUrl, failedReroutes)
                         }
-                        else -> {
-                            val truncatedAfterHeaders = headersAnswered && announced != null && delivered < announced!!
-                            report(
-                                attempt,
-                                attemptUrl,
-                                RangeAttempt.Outcome.Failed,
-                                if (truncatedAfterHeaders) RangeAttempt.EndReason.Truncated else RangeAttempt.EndReason.TransportFailure,
-                            )
-                            if (delivered > 0L) emptyBodies = 0
-                            if (!rerouted && headersAnswered && delivered == 0L && (announced == null || announced!! > 0L)) {
+                    }
+                    else -> {
+                        val truncatedAfterHeaders = headersAnswered && announced != null && wireDelivered < announced!!
+                        report(
+                            attempt,
+                            attemptUrl,
+                            RangeAttempt.Outcome.Failed,
+                            if (truncatedAfterHeaders) RangeAttempt.EndReason.Truncated else RangeAttempt.EndReason.TransportError,
+                        )
+                        if (rerouted) {
+                            routedHost?.let { failedReroutes += it }
+                            if (!headersAnswered && wireDelivered == 0L) {
+                                client.hostHealth.refused(attemptUrl)
+                            }
+                            if (failedReroutes.size <= MAX_FREE_REROUTES) continue
+                        }
+                        runRetryStep(claimControl, offset) {
+                            if (!rerouted && headersAnswered && wireDelivered == 0L && (announced == null || announced!! > 0L)) {
                                 emptyBodies++
                                 if (allowEmptyBodyReactivation) {
                                     if (emptyBodies >= 2) {
@@ -843,7 +977,7 @@ class RangeReader internal constructor(
                                 !client.hostHealth.hasGoodHistory(attemptUrl) ||
                                 failures >= 2
                             if (canSwitch) {
-                                switchHost(linkUrl)
+                                selectAlternateRoute(linkUrl, failedReroutes)
                             }
                         }
                     }
@@ -851,38 +985,61 @@ class RangeReader internal constructor(
                 continue
             }
 
-            // A body that stopped short of its own Content-Length ends this
-            // attempt the same way a transport error does; only the loop below
-            // knows that yet, so the outcome is decided here and not in catch.
             if (telemetry != null && started != null) {
                 telemetry.gateWait += attempt.gateWait
                 telemetry.networkDuration += (started.elapsedNow() - attempt.sinkWait - attempt.gateWait).coerceAtLeast(Duration.ZERO)
             }
-            report(attempt, attemptUrl, outcomeFor(announced, delivered),
-                if (announced != null && delivered < announced!!) RangeAttempt.EndReason.Truncated else null)
 
-            offset += delivered
-            remaining = remaining?.minus(delivered)
-            if (delivered > 0L) emptyBodies = 0
+            if (replacementTargetUrl != null) {
+                report(attempt, attemptUrl, RangeAttempt.Outcome.Cancelled, RangeAttempt.EndReason.OptimizedReplacement)
+                offset += forwardedBytes
+                remaining = remaining?.minus(forwardedBytes)
+                if (forwardedBytes > 0L) emptyBodies = 0
+                forcedAttemptUrl = replacementTargetUrl
+                continue
+            }
 
-            val truncated = announced != null && delivered < announced!!
+            client.signedUrlGates.releaseHandoff(handoff)
+
+            if (stoppedAtBoundary) {
+                val wholeWire = announced != null && wireDelivered >= announced!!
+                report(
+                    attempt,
+                    attemptUrl,
+                    if (wholeWire) RangeAttempt.Outcome.Complete else RangeAttempt.Outcome.Cancelled,
+                    RangeAttempt.EndReason.BoundaryStop,
+                )
+                return@withReplacementHandoff
+            }
+
+            // A body that stopped short of its own Content-Length ends this
+            // attempt the same way a transport error does; only the loop below
+            // knows that yet, so the outcome is decided here and not in catch.
+            report(attempt, attemptUrl, outcomeFor(announced, wireDelivered),
+                if (announced != null && wireDelivered < announced!!) RangeAttempt.EndReason.Truncated else null)
+
+            offset += forwardedBytes
+            remaining = remaining?.minus(forwardedBytes)
+            if (forwardedBytes > 0L) emptyBodies = 0
+
+            val truncated = announced != null && wireDelivered < announced!!
             if (!truncated) {
                 // An open-ended read is done when the server's own
                 // Content-Length has been delivered in full. A closed range
                 // that the server clipped at EOF is done too: asking for the
                 // rest would be a request entirely past the end, which the
                 // CDN answers with 416 and no amount of retrying changes.
-                if (remaining == null || remaining <= 0L || clippedAtEof) return
+                if (remaining == null || remaining <= 0L || clippedAtEof) return@withReplacementHandoff
             }
             outerClaimControl?.clearExchange()
             if (outerClaimControl?.finishInFlightOnly == true) {
                 throw PikPakException(-1, "RangeReader: FinishInFlight stopped short at offset $offset")
             }
             runRetryStep(outerClaimControl, offset) {
-                if (delivered == 0L && rerouted) {
+                if (wireDelivered == 0L && rerouted) {
                     routedHost?.let { failedReroutes += it }
                     client.hostHealth.refused(attemptUrl)
-                } else if (delivered == 0L) {
+                } else if (wireDelivered == 0L) {
                     if (headersAnswered && (announced == null || announced!! > 0L)) {
                         emptyBodies++
                         if (allowEmptyBodyReactivation) {
@@ -908,13 +1065,12 @@ class RangeReader internal constructor(
                     }
                     bumpRetries()
                     delay(client.retryPolicy.delayFor(failures - 1))
-                    switchHost(linkUrl)
+                    selectAlternateRoute(linkUrl, failedReroutes)
                 } else if (truncated) {
                     bumpRetries()
                     failures++
                     if (failures >= maxAttempts) throw PikPakException(-1, "truncated range at offset $offset")
-                    client.hostHealth.refused(attemptUrl)
-                    switchHost(linkUrl)
+                    selectAlternateRoute(linkUrl, failedReroutes)
                 } else {
                     bumpRetries()
                 }
@@ -970,40 +1126,24 @@ class RangeReader internal constructor(
     private var hostChangeFailedAt: TimeMark? = null
 
     /**
-     * Moves this reader, and every read on it after this one, off [stale]'s edge host.
+     * Selects an alternate route after a transport failure on [stale] without mutating [HostHealth].
      *
-     * PikPak signs each link for a host picked anew, so a fresh link is usually elsewhere.
-     * Retrying the same link instead is what the transport failures here defeat: measured
-     * 2026-09-26, a host that stops answering does it for every request, and one that cuts
-     * transfers short does it again on the retry, while the rest of the pool answers in
-     * 300–500 ms. A failed refresh keeps [stale] rather than failing the read — the
-     * failure may be the network, not the host, and then the old link is as good as any.
-     *
-     * A host that sent nothing for [silentFor], the first-response deadline, is also
-     * reported to the client, so links other files mint for it are replaced before a read
-     * ever lands there; see [HostHealth] for the corroboration it asks for first. A body
-     * cut short is not reported: a dropped Wi-Fi or a suspended laptop does that to every
-     * connection at once, and would mark the whole pool.
-     *
-     * A link is minted only when no measured sibling can take the next attempt instead. A mint
-     * is a detail lookup, and for a leased handle also a create charged 15 % of the file's size
-     * to the upload allowance; a 594 MB file on a slow line was leased 59 times in ten minutes.
-     *
-     * After a mint fails, the readers queued behind it do not try again for
-     * [HOST_CHANGE_COOLDOWN]. A mint fails that way when the client's network is down, and then
-     * every read on the file fails at once and asks: measured, 62 detail lookups in 16 seconds.
+     * Health facts (`markSilent`, `stalled`, `refused`) are recorded by the caller solely on the
+     * executed `attemptUrl`. If [HostHealth] already offers a usable sibling not in [excludedHosts],
+     * the next iteration routes there directly without minting a fresh link.
      */
-    private suspend fun switchHost(stale: String, silentFor: Duration? = null) {
-        val telemetry = currentCoroutineContext()[ReadTelemetry]
-        if (telemetry != null) telemetry.refreshed = true
-        if (silentFor != null) {
-            client.hostHealth.markSilent(stale, silentFor)
-            if (client.hostHealth.route(stale, mayExplore = false) != stale) return
+    private suspend fun selectAlternateRoute(stale: String, excludedHosts: Set<String> = emptySet()) {
+        val routed = client.hostHealth.route(stale, mayExplore = false)
+        val routedHost = HostHealth.hostOf(routed)
+        if (routed != stale && (routedHost == null || routedHost !in excludedHosts)) {
+            return
         }
+        val telemetry = currentCoroutineContext()[ReadTelemetry]
         try {
             urlMutex.withLock {
                 if (url != stale) return
                 if (hostChangeFailedAt?.let { it.elapsedNow() < HOST_CHANGE_COOLDOWN } == true) return
+                if (telemetry != null) telemetry.refreshed = true
                 val fresh = try {
                     urlProvider(UrlRequest.Unresponsive(stale))
                 } catch (e: Exception) {
@@ -1042,10 +1182,18 @@ class RangeReader internal constructor(
             if (outcome == RangeAttempt.Outcome.Throttled) telemetry.throttled++
             if (outcome == RangeAttempt.Outcome.Cancelled) telemetry.rightCensored = true
         }
-        // Only completed attempts reflect the host's steady throughput; cancelled partial reads
-        // on seek or close are often cut off mid-slow-start and would overwrite clean figures.
-        if (outcome == RangeAttempt.Outcome.Complete) {
-            client.hostHealth.delivered(recorder.host, recorder.delivered, recorder.bodyBytesPerSecond(), url)
+        when {
+            outcome == RangeAttempt.Outcome.Complete -> {
+                client.hostHealth.delivered(recorder.host, recorder.delivered, recorder.bodyBytesPerSecond(), url)
+            }
+            endReason == RangeAttempt.EndReason.BoundaryStop || endReason == RangeAttempt.EndReason.OptimizedReplacement -> {
+                client.hostHealth.recordBodyRate(
+                    url = url,
+                    bytes = recorder.delivered,
+                    bodyDuration = recorder.activeBodyDuration(),
+                    bytesPerSecond = recorder.bodyBytesPerSecond(),
+                )
+            }
         }
         client.accountState.flushDownstreamBytes()
         val observer = onAttempt ?: return

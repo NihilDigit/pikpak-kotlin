@@ -64,7 +64,10 @@ internal class TransferScheduler(
     fun connectionAllowanceFor(reg: Registration): Int =
         minOf(accountBudget, CapacityPolicy.ceiling(concurrencyMode, reg.connectionBudget))
 
-    // Non-durable playback fetches stay within the 256 KiB CDN burst-safe window for 4-way playhead striping.
-    fun spanFor(reg: Registration, workers: Int, durable: Boolean = false): Int =
-        ((if (durable) 1024L * 1024 * 1024 else 256L * 1024) / reg.blockSize).toInt().coerceAtLeast(1)
+    // Non-durable streaming fetches remain 1 block in Serial mode and allow up to 1 MiB (4 × 256 KiB) otherwise.
+    fun spanFor(reg: Registration, workers: Int, durable: Boolean = false): Int {
+        if (!durable && concurrencyMode == ConcurrencyMode.Serial) return 1
+        val ceilingBytes = if (durable) 1024L * 1024 * 1024 else 1024L * 1024
+        return (ceilingBytes / reg.blockSize).toInt().coerceAtLeast(1)
+    }
 }

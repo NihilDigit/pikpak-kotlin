@@ -115,7 +115,17 @@ class RangeAttempt(
     /** Why an incomplete attempt ended; cancellation is not evidence of a bad route. */
     val endReason: EndReason? = null,
 ) {
-    enum class EndReason { Preempted, DemandDeadline, Withdrawn, HeaderTimeout, BodyStall, Truncated, TransportFailure }
+    enum class EndReason {
+        Withdrawn,
+        Preempted,
+        BoundaryStop,
+        OptimizedReplacement,
+        HeaderTimeout,
+        BodyStall,
+        Truncated,
+        HttpStatus,
+        TransportError,
+    }
     val rightCensored: Boolean get() = outcome == Outcome.Cancelled
     val networkDuration: Duration get() = (duration - sinkWait).coerceAtLeast(Duration.ZERO)
 
@@ -258,6 +268,20 @@ internal class RangeAttemptRecorder(
         val first = firstByteAt ?: return 0
         val last = lastByteAt ?: return 0
         return delivered * 1000 / (last - first - sinkWaitAtLastByte).inWholeMilliseconds.coerceAtLeast(1)
+    }
+
+    fun firstByteElapsed(): Duration? = firstByteAt
+
+    fun activeBodyDuration(): Duration {
+        val first = firstByteAt ?: return Duration.ZERO
+        val last = lastByteAt ?: return Duration.ZERO
+        return (last - first - sinkWaitAtLastByte).coerceAtLeast(Duration.ZERO)
+    }
+
+    fun bodyElapsed(minSilence: Duration = Duration.ZERO): Duration {
+        val floor = minSilence.coerceAtLeast(Duration.ZERO)
+        val bodyStart = firstByteAt ?: headersAt ?: return floor
+        return (mark.elapsedNow() - bodyStart - sinkWait).coerceAtLeast(floor)
     }
 
     /**

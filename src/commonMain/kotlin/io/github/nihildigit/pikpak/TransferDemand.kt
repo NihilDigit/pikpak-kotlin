@@ -3,10 +3,10 @@ package io.github.nihildigit.pikpak
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.concurrent.Volatile
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration
-import kotlin.time.TimeMark
 
 /** Coarse service importance of a logical media or prefetch consumer. */
 enum class ServiceIntent {
@@ -56,28 +56,20 @@ data class ConsumerIntent(
     }
 }
 
-internal class ByteDeadline(
-    val slot: Int,
-    val endExclusive: Long,
-    val at: TimeMark,
-    val consumed: MutableStateFlow<Boolean> = MutableStateFlow(false),
-    val coConsumed: List<MutableStateFlow<Boolean>> = emptyList(),
-) {
-    fun tryConsume(): Boolean {
-        val won = consumed.compareAndSet(false, true)
-        if (won) {
-            for (i in 0 until coConsumed.size) {
-                coConsumed[i].value = true
-            }
-        }
-        return won
-    }
+/** Protocol/consumer fact describing why a [ReadTicket] ended. */
+enum class ReadEndReason {
+    RangeCompleted,
+    ConsumerClosed,
+    Repositioned,
+    Cancelled,
+    SourceFailed;
+
+    val allowsFinishInFlight: Boolean
+        get() = this == RangeCompleted || this == ConsumerClosed
 }
 
 internal class FetchClaimControl(
     val priorityFlow: StateFlow<Int>,
-    val deadlineFlow: MutableStateFlow<ByteDeadline?>,
-    val authorizeDeadline: (suspend (ByteDeadline, Long) -> Boolean)? = null,
 ) : AbstractCoroutineContextElement(Key) {
     companion object Key : CoroutineContext.Key<FetchClaimControl>
 
@@ -89,6 +81,21 @@ internal class FetchClaimControl(
         set(value) {
             mutableFinishInFlightOnly.value = value
         }
+
+    @Volatile
+    var inBlockQuantum: Boolean = false
+
+    @Volatile
+    var allowedProductionEndOffset: Long = Long.MAX_VALUE
+
+    @Volatile
+    var recoveryGoalEndOffset: Long = 0L
+
+    @Volatile
+    var recoveryGoalRevision: Long = 0L
+
+    @Volatile
+    var consumedRecoveryRevision: Long = -1L
 
     private val exchangeSeq = MutableStateFlow(0L)
     private val liveExchangeState = MutableStateFlow(0L)
@@ -340,12 +347,16 @@ interface ReadTicket : AutoCloseable {
     /**
      * Non-suspending release of ONLY this ticket (never closes [owner]).
      *
-     * If [allowFinishInFlight] is `true` (default) and the single currently-issued block (`<= 256 KiB`)
-     * has started on network and buffered `> 0` bytes while [owner] is open, at [epoch], and
-     * `service != PAUSED`, transitions that 1 block to `FinishInFlight` (`0` new HTTP requests,
-     * `0` retries, `0` next-block extension, `0ms` preemption).
+     * If [reason] satisfies [ReadEndReason.allowsFinishInFlight] and the single currently-issued
+     * block (`<= 256 KiB`) has started on network and buffered `> 0` bytes while [owner] is open,
+     * at current speculation epoch, and `service != PAUSED`, transitions that 1 block to
+     * `FinishInFlight` (`0` new HTTP requests, `0` retries, `0` next-block extension, `0ms` preemption).
      */
-    fun endRead(allowFinishInFlight: Boolean = true)
+    fun endRead(reason: ReadEndReason = ReadEndReason.RangeCompleted)
 
-    override fun close() = endRead(allowFinishInFlight = true)
+    fun endRead(allowFinishInFlight: Boolean) = endRead(
+        if (allowFinishInFlight) ReadEndReason.RangeCompleted else ReadEndReason.Cancelled,
+    )
+
+    override fun close() = endRead(ReadEndReason.ConsumerClosed)
 }

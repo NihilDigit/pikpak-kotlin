@@ -6,6 +6,7 @@ import kotlin.concurrent.Volatile
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeMark
 import kotlin.time.TimeSource
@@ -31,6 +32,7 @@ internal class HostHealth(
         val epoch: Long = 0,
         val rates: Map<String, List<RateSample>> = emptyMap(),
         val hostLatencies: Map<String, List<LatencySample>> = emptyMap(),
+        val hostFirstByteLatencies: Map<String, List<LatencySample>> = emptyMap(),
         val latencies: List<LatencySample> = emptyList(),
         val cleanLatencies: List<LatencySample> = emptyList(),
         val silences: Map<String, TimeMark> = emptyMap(),
@@ -206,7 +208,27 @@ internal class HostHealth(
     }
 
     /**
-     * [url]'s host answered headers promptly, then stalled mid-body for [silenceDuration].
+     * Records clean time-to-first-body-byte ([ttfb]) on [url]'s service-isolated host key, distinct
+     * from response-header latency so [RecoveryPolicy] models actual first-byte arrival.
+     */
+    fun recordFirstByteLatency(url: String, ttfb: Duration) {
+        if (!ttfb.isFinite() || ttfb < Duration.ZERO) return
+        val host = keyOf(url) ?: return
+        val now = timeSource.markNow()
+        val sample = LatencySample(ttfb, now)
+        health.update { current ->
+            val kept = current.hostFirstByteLatencies[host].orEmpty()
+                .filter { it.at.elapsedNow() < memory }
+                .takeLast(MAX_SAMPLES - 1)
+            current.copy(
+                hostFirstByteLatencies = current.hostFirstByteLatencies + (host to (kept + sample)),
+            )
+        }
+    }
+
+    /**
+     * [url]'s host answered headers promptly, then stalled mid-body over total active+silence
+     * [bodyElapsed] duration after delivering [deliveredBytes].
      *
      * Such hosts (e.g. an edge throttled to 10–40 KB/s after a 100 KiB initial burst) beat the
      * first-response deadline and fail short of [MIN_SAMPLE_BYTES], escaping both [markSilent]
@@ -214,14 +236,11 @@ internal class HostHealth(
      * connectivity is proven and concurrent header arrivals on the same host must not clear or
      * suppress the mid-body stall evidence. It expires with the evidence window or a route epoch change.
      */
-    fun stalled(url: String, deliveredBytes: Long, bodyBytesPerSecond: Long, silenceDuration: Duration) {
+    fun stalled(url: String, deliveredBytes: Long, bodyElapsed: Duration) {
         val host = keyOf(url) ?: return
         val bareHost = hostOf(url)
         val now = timeSource.markNow()
-        val activeSeconds = if (deliveredBytes > 0L && bodyBytesPerSecond > 0L) {
-            deliveredBytes.toDouble() / bodyBytesPerSecond.toDouble()
-        } else 0.0
-        val totalSeconds = activeSeconds + silenceDuration.inWholeNanoseconds / 1e9
+        val totalSeconds = bodyElapsed.coerceAtLeast(Duration.ZERO).inWholeNanoseconds / 1e9
         val effectiveRate = if (deliveredBytes > 0L && totalSeconds > 0.0) {
             (deliveredBytes / totalSeconds).toLong().coerceAtLeast(1L)
         } else 1L
@@ -255,6 +274,13 @@ internal class HostHealth(
                 updated.copy(stalls = newStalls, suspects = clearedSuspects)
             }
         }
+    }
+
+    fun stalled(url: String, deliveredBytes: Long, bodyBytesPerSecond: Long, silenceDuration: Duration) {
+        val activeNanos = if (deliveredBytes > 0L && bodyBytesPerSecond > 0L) {
+            ((deliveredBytes.toDouble() / bodyBytesPerSecond.toDouble()) * 1e9).toLong().coerceAtLeast(0L)
+        } else 0L
+        stalled(url, deliveredBytes, activeNanos.nanoseconds + silenceDuration.coerceAtLeast(Duration.ZERO))
     }
 
     private class LatencySample(val wait: Duration, val at: TimeMark)
@@ -345,6 +371,100 @@ internal class HostHealth(
                 updated
             }
         }
+    }
+
+    /**
+     * Records controlled post-first-byte body throughput for clean non-fault stops (such as
+     * `BoundaryStop` or `OptimizedReplacement`) without applying any failure penalty.
+     */
+    fun recordBodyRate(url: String, bytes: Long, bodyDuration: Duration, bytesPerSecond: Long) {
+        if (bytes <= 0L || bytesPerSecond <= 0L) return
+        if (bytes < MIN_SAMPLE_BYTES && bodyDuration < MIN_CONTROLLED_RATE_DURATION) return
+        val key = keyOf(url) ?: return
+        val bareHost = hostOf(url)
+        val sample = RateSample(bytesPerSecond, timeSource.markNow())
+        health.update { current ->
+            val updated = current.withRate(key, sample)
+            if (bytes >= MIN_SAMPLE_BYTES && bytesPerSecond >= GOOD_RATE_BYTES_PER_SEC) {
+                val cleared = if (bareHost != null) updated.silences - key - bareHost else updated.silences - key
+                updated.copy(silences = cleared)
+            } else {
+                updated
+            }
+        }
+    }
+
+    /**
+     * Returns the best verified replacement candidate in the same edge cluster, service pool and
+     * route epoch as [currentUrl], using conservative `(ttfbMillis, bodyBytesPerSecond)` estimates.
+     * Returns `null` when steering is disabled, [currentUrl] is non-rewritable (e.g. `dl-a10b`
+     * sharded cold storage), or no sibling has at least [MIN_SAMPLES] clean rate observations.
+     */
+    fun bestReplacementCandidate(
+        currentUrl: String,
+        candidateUrls: Collection<String> = emptyList(),
+        excludedHosts: Set<String> = emptySet(),
+        remainingBytes: Long = MIN_SAMPLE_BYTES,
+    ): RecoveryPolicy.CandidateEstimate? =
+        health.value.bestReplacementCandidate(currentUrl, candidateUrls, excludedHosts, remainingBytes)
+
+    private fun HealthState.bestReplacementCandidate(
+        currentUrl: String,
+        candidateUrls: Collection<String>,
+        excludedHosts: Set<String>,
+        remainingBytes: Long,
+    ): RecoveryPolicy.CandidateEstimate? {
+        if (!steering) return null
+        val currentEdge = Edge.parse(currentUrl) ?: return null
+        learn(currentEdge)
+        val extraEdges = candidateUrls.mapNotNull { candUrl ->
+            Edge.parse(candUrl)?.takeIf { it.cluster == currentEdge.cluster && it.label != currentEdge.label }
+                ?.also(::learn)
+        }
+        val candidates = (siblingsOf(currentEdge) + extraEdges)
+            .distinctBy { it.label }
+            .filter { it.host !in excludedHosts && usable(it) && !isSuspect(it) }
+        if (candidates.isEmpty()) return null
+
+        val targetBytes = remainingBytes.coerceAtLeast(1L).toDouble()
+        return candidates.mapNotNull { cand ->
+            val rate = medianRate(cand.key)?.takeIf { it > 0L } ?: return@mapNotNull null
+            val ttfbMs = conservativeTtfbMillis(cand.key)
+            RecoveryPolicy.CandidateEstimate(
+                hostKey = cand.key,
+                url = currentEdge.rewrite(currentUrl, cand),
+                ttfbMillis = ttfbMs,
+                bodyBytesPerSecond = rate,
+            )
+        }.minByOrNull { est ->
+            est.ttfbMillis.toDouble() + (targetBytes * 1000.0) / est.bodyBytesPerSecond.toDouble()
+        }
+    }
+
+    private fun HealthState.conservativeTtfbMillis(hostKey: String): Long {
+        val recentTtfb = hostFirstByteLatencies[hostKey].orEmpty()
+            .filter { it.at.elapsedNow() < memory }
+            .map { it.wait.inWholeMilliseconds.coerceAtLeast(0L) }
+            .sorted()
+        if (recentTtfb.isNotEmpty()) {
+            return recentTtfb[((recentTtfb.size * 3) / 4).coerceIn(0, recentTtfb.lastIndex)]
+        }
+        val recentHeaders = hostLatencies[hostKey].orEmpty()
+            .filter { it.at.elapsedNow() < memory }
+            .map { it.wait.inWholeMilliseconds.coerceAtLeast(0L) }
+            .sorted()
+        if (recentHeaders.isNotEmpty()) {
+            return recentHeaders[((recentHeaders.size * 3) / 4).coerceIn(0, recentHeaders.lastIndex)]
+        }
+        val accountRecent = latencies
+            .filter { it.at.elapsedNow() < LATENCY_MEMORY }
+            .map { it.wait.inWholeMilliseconds.coerceAtLeast(0L) }
+            .sorted()
+        if (accountRecent.isNotEmpty()) {
+            return accountRecent[((accountRecent.size * 3) / 4).coerceIn(0, accountRecent.lastIndex)]
+                .coerceAtLeast(DEFAULT_CONSERVATIVE_TTFB_MS)
+        }
+        return DEFAULT_CONSERVATIVE_TTFB_MS
     }
 
     private fun HealthState.withRate(host: String, sample: RateSample): HealthState {
@@ -541,6 +661,8 @@ internal class HostHealth(
         const val MIN_SAMPLES = 2
         const val MAX_SAMPLES = 6
         const val MIN_SAMPLE_BYTES = 256L * 1024
+        val MIN_CONTROLLED_RATE_DURATION: Duration = 500.milliseconds
+        const val DEFAULT_CONSERVATIVE_TTFB_MS = 1_100L
 
         /** Hosts per family with figures before exploring stops: enough that one slow host stands out. */
         const val EXPLORE_TARGET = 3

@@ -531,4 +531,109 @@ class DemandTransportTest {
             assertContentEquals(data.copyOfRange(0, 64), out)
         } finally { owner.close(); cache.close(); cache.awaitClosedForTest() }
     }
+
+    @Test fun readEndReasonAllowsFinishInFlightOnlyForCleanCompletionAndConsumerClose() {
+        assertTrue(ReadEndReason.RangeCompleted.allowsFinishInFlight)
+        assertTrue(ReadEndReason.ConsumerClosed.allowsFinishInFlight)
+        assertFalse(ReadEndReason.Repositioned.allowsFinishInFlight)
+        assertFalse(ReadEndReason.Cancelled.allowsFinishInFlight)
+        assertFalse(ReadEndReason.SourceFailed.allowsFinishInFlight)
+    }
+
+    @Test fun singleBlockQuantumProtectsActiveSlotFromSameTierPreemptionWhileAllowingHigherTier() = runTest {
+        val admission = SignedUrlGates(1)
+        val quantumPriority = kotlinx.coroutines.flow.MutableStateFlow(50)
+        val quantumControl = FetchClaimControl(quantumPriority).apply { inBlockQuantum = true }
+        val releaseQuantum = CompletableDeferred<Unit>()
+        var quantumPreempted = false
+
+        val holder = async(quantumControl + LiveSignedPriority(quantumPriority)) {
+            try {
+                admission.withSlot("https://cdn/a?sign=1") {
+                    releaseQuantum.await()
+                }
+            } catch (_: TransferPreempted) {
+                quantumPreempted = true
+            }
+        }
+        runCurrent()
+
+        // Same-tier (50..99) must queue behind an active single-block quantum rather than preempting it.
+        val sameTier = async { admission.withSlot("https://cdn/b?sign=2", 80) { "same-tier" } }
+        runCurrent()
+        assertFalse(quantumPreempted, "same-tier 80 must not preempt active single-block quantum at 50")
+        assertFalse(sameTier.isCompleted)
+        sameTier.cancelAndJoin()
+
+        // Same-tier 100 vs 100 in quantum also does not preempt.
+        quantumPriority.value = 100
+        runCurrent()
+        val equalBlocking = async { admission.withSlot("https://cdn/b?sign=2", 120) { "equal-blocking" } }
+        runCurrent()
+        assertFalse(quantumPreempted, "blocking 120 must not preempt active single-block quantum at 100")
+        assertFalse(equalBlocking.isCompleted)
+        equalBlocking.cancelAndJoin()
+
+        // Demoting back to 50 and challenging from strictly higher tier (100) preempts immediately.
+        quantumPriority.value = 50
+        runCurrent()
+        val higherTier = async { admission.withSlot("https://cdn/b?sign=2", 100) { "higher-tier" } }
+        runCurrent()
+        assertTrue(quantumPreempted, "strictly higher tier 100 preempts tier 50 even inside quantum")
+        assertEquals("higher-tier", higherTier.await())
+        holder.await()
+        assertEquals(0, admission.inUse)
+    }
+
+    @Test fun replacementPermitHandoffTransfersSameSignatureSlotOnceRevokesOnHigherTierAndNeverLeaks() = runTest {
+        val admission = SignedUrlGates(1)
+        val fileIdentity = Any()
+        val order = mutableListOf<String>()
+
+        val handoffFlow = async {
+            admission.withReplacementHandoff { handoff ->
+                withContext(FileAdmission(fileIdentity, 1)) {
+                    admission.withSlot("https://dl-z01a-0001.mypikpak.com/download/?fid=1&sign=s", 50) {
+                        order += "attempt1"
+                        handoff.armFor("https://dl-z01a-0002.mypikpak.com/download/?fid=1&sign=s")
+                    }
+                }
+                // Enqueue an equal-priority competitor while between attempt 1 and attempt 2:
+                val competitor = async(FileAdmission(Any(), 1)) {
+                    admission.withSlot("https://dl-z01a-0003.mypikpak.com/download/?fid=2&sign=other", 50) {
+                        order += "competitor"
+                    }
+                }
+                runCurrent()
+                assertFalse(competitor.isCompleted, "placeholder keeps slot for 1-shot replacement")
+
+                withContext(FileAdmission(fileIdentity, 1)) {
+                    admission.withSlot("https://dl-z01a-0002.mypikpak.com/download/?fid=1&sign=s", 50) {
+                        order += "attempt2"
+                    }
+                }
+                competitor.await()
+            }
+        }
+        handoffFlow.await()
+        assertEquals(listOf("attempt1", "attempt2", "competitor"), order)
+        assertEquals(0, admission.inUse)
+
+        // Higher-priority preemption during idle handoff revokes placeholder in 0ms without leaking.
+        val revokedEvents = mutableListOf<String>()
+        admission.withReplacementHandoff { handoff ->
+            admission.withSlot("https://dl-z01a-0001.mypikpak.com/download/?fid=1&sign=s", 50) {
+                handoff.armFor("https://dl-z01a-0002.mypikpak.com/download/?fid=1&sign=s")
+            }
+            val urgent = async {
+                admission.withSlot("https://dl-z01a-0009.mypikpak.com/download/?fid=9&sign=u", 100) {
+                    revokedEvents += "urgent"
+                }
+            }
+            runCurrent()
+            urgent.await()
+            assertEquals(listOf("urgent"), revokedEvents)
+        }
+        assertEquals(0, admission.inUse)
+    }
 }

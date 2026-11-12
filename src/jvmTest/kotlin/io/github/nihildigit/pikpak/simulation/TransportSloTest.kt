@@ -7,6 +7,7 @@ import io.ktor.client.request.prepareGet
 import io.ktor.client.request.header
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.HttpStatusCode
+import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.*
 import kotlinx.coroutines.test.*
 import kotlin.test.*
@@ -159,16 +160,92 @@ class TransportSimulationTest {
     }
 
     @Test fun seekRescuesAnOwnedStragglerWithoutCorruption() = runTest(timeout = 5.minutes) {
-        val early = rescueStraggler(250)
-        val late = rescueStraggler(1000)
-        assertTrue(late - early >= 700, "rescue timing did not follow playback feedback: $early vs $late")
+        val degradedEdge = "dl-a0b-0001.mypikpak.com"
+        val fastSibling = "dl-a0b-0002.mypikpak.com"
+        val size = 128 * MIB
+        val network = VirtualNetwork(this, size, NetworkProfile(degradedHost = degradedEdge, degradedRate = 32 * 1024))
+        val http = HttpClient(network.engine)
+        val client = PikPakClient("simulation", { "unused" }, sessionStore = InMemorySessionStore(),
+            retryPolicy = RetryPolicy.None, httpClient = http, steerEdgeHosts = true,
+            transportMemoryBudgetBytes = 16 * MIB, timeSource = testScheduler.timeSource)
+        client.hostHealth.observe(FileDetail(
+            webContentLink = "https://$degradedEdge/file?signature=same",
+            medias = listOf(MediaVariant(link = DownloadLink(url = "https://$fastSibling/file?signature=variant"))),
+        ))
+        val attempts = mutableListOf<RangeAttempt>()
+        val source = RangeReader(client, { "https://$degradedEdge/file?signature=same" }, onAttempt = { attempts += it })
+        val trainer = RangeReader(client, { "https://$fastSibling/file?signature=same" })
+        val cache = BlockCache(source, size, 8, backgroundScope.coroutineContext, client.foregroundStreams,
+            VirtualDisk(), blockSize = 256 * 1024, readAheadBytes = 4 * MIB, memoryCapBytes = 16 * MIB,
+            scheduler = client.scheduler, memoryBudget = client.transportMemoryBudget, timeSource = testScheduler.timeSource)
+        var failure: Throwable? = null
+        try {
+            // Train fastSibling with 2 clean 256 KiB samples so HostHealth has verified RTT + body rate evidence:
+            for (trainOff in listOf(size - 512 * 1024, size - 256 * 1024)) {
+                trainer.read(trainOff, 256 * 1024L, PikPakStreamReader.STREAMING_PRIORITY) { ch ->
+                    val buf = ByteArray(256 * 1024)
+                    var read = 0
+                    while (read < buf.size) {
+                        val n = ch.readAvailable(buf, read, buf.size - read)
+                        if (n < 0) break
+                        read += n
+                    }
+                    assertEquals(buf.size, read)
+                }
+            }
+
+            // Start 8-way background warm on 32 KiB/s degradedEdge (256 KiB block would take ~8,000ms):
+            cache.warm(listOf(0L until size), StreamRole.BACKGROUND, null, durable = true)
+            withTimeout(2000) { while (network.requests.count { it.host == degradedEdge } < 1) delay(1) }
+            val target = network.requests.first { it.host == degradedEdge }.start
+            advanceTimeBy(120); runCurrent()
+
+            val owner = TransferDemand(
+                ConsumerIntent(
+                    epoch = 1L,
+                    service = ServiceIntent.WAITING,
+                    bufferBudget = BufferBudget.NONE,
+                ),
+            )
+            val ticket = cache.beginRead(owner, target, target + 256 * 1024L)
+            val started = testScheduler.currentTime
+            val bytes = ByteArray(200 * 1024)
+            var count = 0
+            withTimeout(4000) {
+                while (count < bytes.size) {
+                    val n = ticket.readSome(bytes, count, bytes.size - count)
+                    assertTrue(n > 0, "premature EOF during ETA switchover rescue")
+                    count += n
+                }
+            }
+            val elapsed = testScheduler.currentTime - started
+            verifyContent(target, bytes)
+            assertTrue(elapsed < 2500, "ETA switchover waited on 32 KiB/s straggler (~6.25s) instead of switching: ${elapsed}ms")
+            assertTrue(
+                network.requests.any { it.host == fastSibling && it.start >= target && it.start < target + 256 * 1024 },
+                "degraded slot was never switched onto verified fastSibling",
+            )
+            assertTrue(
+                attempts.any { it.endReason == RangeAttempt.EndReason.OptimizedReplacement && it.outcome == RangeAttempt.Outcome.Cancelled },
+                "expected OptimizedReplacement safe-point switchover, got $attempts",
+            )
+            assertTrue(attempts.none { it.outcome == RangeAttempt.Outcome.Failed }, "ETA switchover was misclassified as failure")
+            assertFalse(client.hostHealth.isBad("https://$degradedEdge/file?signature=same"), "OptimizedReplacement must not mark degraded host bad")
+            network.assertConservation()
+            assertEquals(0, network.rejected, "1-shot permit handoff prevented 9th concurrent signed request")
+            println("SIM etaSwitchover elapsedMs=$elapsed requests=${network.requests.size}")
+            ticket.endRead(ReadEndReason.RangeCompleted)
+            owner.close()
+        } catch (t: Throwable) {
+            failure = t
+            throw t
+        } finally {
+            trainer.close()
+            cleanup(failure, cache, source, client, http, network)
+        }
     }
 
     @Test fun urgentSeekRescuesImmediatelyDespitePositivePlaybackBuffer() = runTest(timeout = 5.minutes) {
-        rescueStraggler(1000, urgent = true)
-    }
-
-    private suspend fun TestScope.rescueStraggler(bufferMs: Long, urgent: Boolean = false): Long {
         val network = VirtualNetwork(this, 128 * MIB, NetworkProfile(stallRequest = 1))
         val http = HttpClient(network.engine)
         val client = PikPakClient("simulation", { "unused" }, sessionStore = InMemorySessionStore(),
@@ -181,52 +258,46 @@ class TransportSimulationTest {
             scheduler = client.scheduler, memoryBudget = client.transportMemoryBudget, timeSource = testScheduler.timeSource)
         var failure: Throwable? = null
         try {
+            // Request #1 (0 .. 16 MiB - 1) stalls at 0 body bytes for 30s.
             cache.warm(listOf(0L until 128 * MIB), StreamRole.BACKGROUND, null, durable = true)
             withTimeout(2000) { while (network.requests.isEmpty()) delay(1) }
-            val target = network.requests.first().start
+            val stalledRange = network.requests.first()
+            val target = stalledRange.start + 3L * 256 * 1024 // 768 KiB into stalled multi-block range (>= 512 KiB)
             advanceTimeBy(200); runCurrent()
             val owner = TransferDemand(
                 ConsumerIntent(
-                    epoch = 0L,
-                    service = if (urgent) ServiceIntent.WAITING else ServiceIntent.PLAYING,
+                    epoch = 1L,
+                    service = ServiceIntent.WAITING,
                     playbackSample = PlaybackBufferSnapshot(
-                        generation = 0L,
-                        bufferedDuration = bufferMs.milliseconds,
+                        generation = 1L,
+                        bufferedDuration = 5_000.milliseconds,
                         sampledAt = testScheduler.timeSource.markNow(),
                         mediaBytesPerSecond = MIB,
                     ),
                 ),
             )
-            val ticket = cache.beginRead(owner, target)
+            val ticket = cache.beginRead(owner, target, target + 64 * 1024L)
             val started = testScheduler.currentTime
             val bytes = ByteArray(64 * 1024)
             var count = 0
-            withTimeout(5000) {
+            withTimeout(2000) {
                 while (count < bytes.size) {
                     val n = ticket.readSome(bytes, count, bytes.size - count)
-                    assertTrue(n > 0, "premature EOF during seek rescue")
+                    assertTrue(n > 0, "premature EOF during urgent seek reposition")
                     count += n
                 }
             }
+            val elapsed = testScheduler.currentTime - started
             verifyContent(target, bytes)
-            assertTrue(testScheduler.currentTime - started < 5000, "seek waited on original 30 second straggler")
-            assertTrue(network.requests.count { it.start <= target && it.end >= target } >= 2, "head ownership was never rescued")
+            assertTrue(elapsed < 500, "urgent seek waited on stalled straggler or positive buffer instead of repositioning: ${elapsed}ms")
+            assertTrue(network.requests.any { it.id != 1 && it.start == target }, "repositioned request at target was never issued")
+            assertTrue(attempts.any { it.start == stalledRange.start && it.endReason == RangeAttempt.EndReason.Preempted })
+            assertTrue(attempts.none { it.outcome == RangeAttempt.Outcome.Failed })
             network.assertConservation()
             assertEquals(0, network.rejected)
-            val replacement = network.requests.first { it.id != 1 && it.start <= target && it.end >= target }
-            val rescueDelay = replacement.atMs - started
-            val expectedDelay = if (urgent) 0L else bufferMs
-            assertTrue(rescueDelay in expectedDelay..(expectedDelay + 100),
-                "replacement ignored deadline: $rescueDelay for buffer=$bufferMs urgent=$urgent")
-            val cancelled = attempts.first { it.start == target }
-            assertEquals(RangeAttempt.Outcome.Cancelled, cancelled.outcome)
-            assertTrue(cancelled.rightCensored)
-            assertTrue(attempts.none { it.outcome == RangeAttempt.Outcome.Failed }, "deadline rescue was classified as network failure")
-            println("SIM playbackBufferMs=$bufferMs urgent=$urgent rescueDelayMs=$rescueDelay " +
-                "ready64KiBMs=${testScheduler.currentTime - started} outcome=${cancelled.outcome}")
-            ticket.endRead(allowFinishInFlight = false)
+            println("SIM urgentReposition elapsedMs=$elapsed requests=${network.requests.size}")
+            ticket.endRead(ReadEndReason.RangeCompleted)
             owner.close()
-            return rescueDelay
         } catch (t: Throwable) {
             failure = t
             throw t

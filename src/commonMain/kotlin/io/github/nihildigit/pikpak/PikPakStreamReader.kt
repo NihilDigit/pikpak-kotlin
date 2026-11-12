@@ -139,14 +139,14 @@ class PikPakStreamReader internal constructor(
         val old = currentTicket
         currentTicket = null
         currentPosition = position
-        old?.endRead(allowFinishInFlight = false)
+        old?.endRead(ReadEndReason.Repositioned)
         if (ownsOwner) {
             owner.updateIntent { it.copy(epoch = it.epoch + 1L) }
         }
         if (startedReading && !closed && position < size) {
             val next = cache.beginReadInternal(owner, position, size, initialRoleOverride = role, eagerRegister = true)
             if (closed) {
-                next.endRead(allowFinishInFlight = false)
+                next.endRead(ReadEndReason.Cancelled)
             } else {
                 currentTicket = next
             }
@@ -167,11 +167,11 @@ class PikPakStreamReader internal constructor(
         if (length == 0) return 0
         startedReading = true
         var ticket = currentTicket
-        if (ticket == null || ticket.ended || ticket.position != pos || ticket.epoch < owner.intent.epoch) {
-            ticket?.endRead(allowFinishInFlight = false)
+        if (ticket == null || ticket.ended || ticket.position != pos) {
+            ticket?.endRead(ReadEndReason.Repositioned)
             ticket = cache.beginReadInternal(owner, pos, size, initialRoleOverride = role)
             if (closed) {
-                ticket.endRead(allowFinishInFlight = false)
+                ticket.endRead(ReadEndReason.Cancelled)
                 throw PikPakException(-1, "PikPakStreamReader is closed")
             }
             currentTicket = ticket
@@ -202,7 +202,7 @@ class PikPakStreamReader internal constructor(
         closed = true
         val ticket = currentTicket
         currentTicket = null
-        ticket?.endRead(allowFinishInFlight = false)
+        ticket?.endRead(ReadEndReason.ConsumerClosed)
         if (ownsOwner) owner.close()
         if (ownsCache) cache.close()
     }

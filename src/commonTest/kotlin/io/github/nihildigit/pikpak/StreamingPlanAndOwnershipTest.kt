@@ -26,6 +26,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.onSubscription
@@ -595,7 +596,7 @@ class StreamingPlanAndOwnershipTest {
     }
 
     @Test
-    fun `Stage 4 - preemption and withdrawal record distinct reasons in 0ms and never penalize HostHealth while byte deadline stays monotonic`() = runTest {
+    fun `Stage 4 - preemption and withdrawal record distinct reasons in 0ms and never penalize HostHealth while recoveryGoalRevision stays monotonic`() = runTest {
         val url = "https://dl-test.mypikpak.com/media.mkv?sign=stage4"
         val holdStream = CompletableDeferred<Unit>()
         val http = HttpClient(
@@ -694,8 +695,14 @@ class StreamingPlanAndOwnershipTest {
             ownerB.close()
             runCurrent()
 
-            // 3. Monotonic ByteDeadline check: a later larger buffer sample on the same stalled slot never pushes its deadline later.
-            val deadlineOwner = client.openTransferDemand(
+            // 3. Monotonic recoveryGoalRevision & ReadEndReason fact mapping:
+            assertTrue(ReadEndReason.RangeCompleted.allowsFinishInFlight)
+            assertTrue(ReadEndReason.ConsumerClosed.allowsFinishInFlight)
+            assertFalse(ReadEndReason.Repositioned.allowsFinishInFlight)
+            assertFalse(ReadEndReason.Cancelled.allowsFinishInFlight)
+            assertFalse(ReadEndReason.SourceFailed.allowsFinishInFlight)
+
+            val recoveryOwner = client.openTransferDemand(
                 ConsumerIntent(
                     epoch = 0L,
                     service = ServiceIntent.PLAYING,
@@ -703,21 +710,24 @@ class StreamingPlanAndOwnershipTest {
                     playbackSample = PlaybackBufferSnapshot(0L, 300.milliseconds, testScheduler.timeSource.markNow()),
                 ),
             )
-            val tD = cache.beginRead(deadlineOwner, blockSize + 4096, blockSize + 8192)
+            val tD = cache.beginRead(recoveryOwner, blockSize + 4096, blockSize + 8192)
             val rD = async { runCatching { tD.readSome(ByteArray(4096), 0, 4096) } }
             runCurrent()
-            val initialDeadline = assertNotNull(cache.planForTest().required.single { it.owner === deadlineOwner }.deadlineAt)
+            val ctrl = assertNotNull(cache.activeClaimControlForTest(1))
+            assertTrue(ctrl.inBlockQuantum, "active Required sets single-block quantum on FetchClaimControl")
+            assertEquals(2 * blockSize, ctrl.recoveryGoalEndOffset)
+            val initialRev = ctrl.recoveryGoalRevision
+            assertTrue(initialRev > 0L)
             advanceTimeBy(50)
-            deadlineOwner.reportPlaybackBuffer(PlaybackBufferSnapshot(0L, 5.seconds, testScheduler.timeSource.markNow()))
+            recoveryOwner.reportPlaybackBuffer(PlaybackBufferSnapshot(0L, 5.seconds, testScheduler.timeSource.markNow()))
             runCurrent()
-            val updatedDeadline = assertNotNull(cache.planForTest().required.single { it.owner === deadlineOwner }.deadlineAt)
-            assertEquals(initialDeadline, updatedDeadline, "byte deadline must stay monotonic and never extend on optimistic heartbeats")
+            assertEquals(initialRev, ctrl.recoveryGoalRevision, "same-epoch heartbeats never re-arm recoveryGoalRevision")
 
             rD.cancel()
-            tD.endRead(allowFinishInFlight = false)
-            deadlineOwner.close()
+            tD.endRead(ReadEndReason.Cancelled)
+            recoveryOwner.close()
             warm.cancel()
-            tB.endRead(allowFinishInFlight = false)
+            tB.endRead(ReadEndReason.Cancelled)
         } finally {
             holdStream.complete(Unit)
             ownerA.close()
@@ -945,7 +955,6 @@ class StreamingPlanAndOwnershipTest {
             // 2. Direct FetchClaimControl check: flipping finishInFlightOnly=true mid-backoff aborts immediately in 0ms with 0 retries!
             val ctrl = FetchClaimControl(
                 priorityFlow = MutableStateFlow(PikPakStreamReader.STREAMING_PRIORITY),
-                deadlineFlow = MutableStateFlow(null),
             )
             val directRead = async {
                 runCatching {
@@ -1162,10 +1171,10 @@ class StreamingPlanAndOwnershipTest {
             assertTrue(6 in cancelledSlots, "in-flight epoch-0 FinishInFlight on slot 6 cancelled in 0ms")
             assertFalse(1 in cancelledSlots, "slot 1 actively awaited by activeOldTicket.readSome must NOT be severed!")
 
-            // activeOldTicket emits Required ONLY for single block slot 1 with zero deadline episode:
+            // activeOldTicket emits Required ONLY for single block slot 1 at STREAMING_PRIORITY:
             val reqAfterBump = planAfterBump.required.single()
             assertEquals(1, reqAfterBump.slot)
-            assertNull(reqAfterBump.deadlineAt, "older-epoch Required claim must not arm new-epoch deadline episode")
+            assertEquals(PikPakStreamReader.STREAMING_PRIORITY, reqAfterBump.priority)
             assertFalse(parkedRead.isCompleted, "parked readSome stays alive instead of throwing DemandWithdrawnException")
 
             // Deliver slot 1 -> activeOldTicket.readSome completes cleanly with exact bytes (no premature EOF for reconnect=0)!
@@ -1187,14 +1196,17 @@ class StreamingPlanAndOwnershipTest {
             assertIs<PikPakException>(runCatching { unregisteredOldTicket.readSome(ByteArray(16), 0, 16) }.exceptionOrNull())
 
             // 3. New-epoch (epoch 1) FinishInFlight on slot 8 is NOT cleared when older-epoch spanOldTicket calls endRead(false):
-            val newFifTicket = cache.beginRead(owner, 8 * blockSize + 16 * 1024L, 8 * blockSize + 24 * 1024L)
+            //    spanOldTicket still holds mid-block Continuation on slot 8 across epoch 0 -> 1 until endRead(false),
+            //    then slot 8 hands off cleanly to newFifTicket's epoch-1 FinishInFlight!
+            assertEquals(listOf(8), cache.planForTest().continuation.map { it.slot })
+            val newFifTicket = cache.beginRead(owner, 8 * blockSize + 4096L, 8 * blockSize + 12288L)
             assertEquals(8192, newFifTicket.readSome(ByteArray(8192), 0, 8192))
             newFifTicket.endRead(allowFinishInFlight = true)
             runCurrent()
-            assertEquals(listOf(8), cache.planForTest().finishInFlight.map { it.slot })
 
             spanOldTicket.endRead(allowFinishInFlight = false)
             runCurrent()
+            assertTrue(cache.planForTest().continuation.isEmpty())
             assertEquals(
                 listOf(8),
                 cache.planForTest().finishInFlight.map { it.slot },
@@ -1228,12 +1240,12 @@ class StreamingPlanAndOwnershipTest {
     }
 
     @Test
-    fun `Stage 4 - fired ByteDeadline consumes episode without rearming on heartbeats and clears when Required leaves`() = runTest {
-        val url = "https://dl-test.mypikpak.com/deadline.mkv?sign=dl"
+    fun `VFS - 1_1s TTFB and 11 KiB chunked reader across intra-session seek completes block in 1 HTTP request with zero Withdrawn`() = runTest {
+        val url = "https://dl-us01-0008.mypikpak.com/us-stream.mkv?sign=vfs1"
         val fileSize = 8 * blockSize
-        val holdSlot0Attempt1 = CompletableDeferred<Unit>()
-        val holdSlot1 = CompletableDeferred<Unit>()
-        var slot0Requests = 0
+        val payload = ByteArray(fileSize.toInt()) { (it * 29 % 251).toByte() }
+        val chunkBytes = 11 * 1024 // 11 KiB chunks matching US-node mpv/lavf trace
+        val requestedStarts = mutableListOf<Long>()
 
         val http = HttpClient(
             MockEngine(
@@ -1244,68 +1256,36 @@ class StreamingPlanAndOwnershipTest {
                         val start = range.substringBefore('-').toLong()
                         val end = range.substringAfter('-').toLong()
                         val len = (end - start + 1).toInt()
-                        if (start < blockSize) {
-                            slot0Requests++
-                            if (slot0Requests == 1) {
-                                val ch = ByteChannel(autoFlush = true)
-                                launch {
-                                    runCatching {
-                                        ch.writeFully(ByteArray(1024) { 3 })
-                                        holdSlot0Attempt1.await()
-                                        ch.close()
-                                    }
+                        requestedStarts += start
+                        val ch = ByteChannel(autoFlush = true)
+                        launch {
+                            runCatching {
+                                delay(1_100.milliseconds) // 1.1s high-RTT TTFB
+                                var written = 0
+                                while (written < len) {
+                                    val step = minOf(chunkBytes, len - written)
+                                    ch.writeFully(payload, start.toInt() + written, start.toInt() + written + step)
+                                    written += step
+                                    if (written < len) delay(15.milliseconds)
                                 }
-                                respond(
-                                    ch,
-                                    HttpStatusCode.PartialContent,
-                                    headersOf(
-                                        HttpHeaders.ContentRange to listOf("bytes $start-$end/$fileSize"),
-                                        HttpHeaders.ContentLength to listOf(len.toString()),
-                                    ),
-                                )
-                            } else {
-                                val ch = ByteChannel(autoFlush = true)
-                                launch {
-                                    ch.writeFully(ByteArray(1024) { 3 })
-                                    delay(400.milliseconds)
-                                    ch.writeFully(ByteArray(len - 1024) { 3 })
-                                    ch.flushAndClose()
-                                }
-                                respond(
-                                    ch,
-                                    HttpStatusCode.PartialContent,
-                                    headersOf(
-                                        HttpHeaders.ContentRange to listOf("bytes $start-$end/$fileSize"),
-                                        HttpHeaders.ContentLength to listOf(len.toString()),
-                                    ),
-                                )
+                                ch.flushAndClose()
                             }
-                        } else {
-                            val ch = ByteChannel(autoFlush = true)
-                            launch {
-                                runCatching {
-                                    ch.writeFully(ByteArray(1024) { 8 })
-                                    holdSlot1.await()
-                                    ch.writeFully(ByteArray(len - 1024) { 8 })
-                                    ch.flushAndClose()
-                                }
-                            }
-                            respond(
-                                ch,
-                                HttpStatusCode.PartialContent,
-                                headersOf(
-                                    HttpHeaders.ContentRange to listOf("bytes $start-$end/$fileSize"),
-                                    HttpHeaders.ContentLength to listOf(len.toString()),
-                                ),
-                            )
                         }
+                        respond(
+                            ch,
+                            HttpStatusCode.PartialContent,
+                            headersOf(
+                                HttpHeaders.ContentRange to listOf("bytes $start-$end/$fileSize"),
+                                HttpHeaders.ContentLength to listOf(len.toString()),
+                            ),
+                        )
                     }
                 },
             ),
         )
 
         val client = PikPakClient(
-            account = "dl",
+            account = "vfs-us-node",
             password = "pw",
             httpClient = http,
             cdnHttpClient = http,
@@ -1313,97 +1293,106 @@ class StreamingPlanAndOwnershipTest {
             timeSource = testScheduler.timeSource,
         )
         val attempts = mutableListOf<RangeAttempt>()
-        val reader = RangeReader(client, { url }, connectionBudget = 2, onAttempt = { attempts += it })
+        val reader = RangeReader(client, { url }, connectionBudget = 4, onAttempt = { attempts += it })
         val cache = BlockCache(
             source = reader,
             size = fileSize,
-            concurrency = 2,
+            concurrency = 4,
             parentCoroutineContext = coroutineContext,
             foregroundStreams = client.foregroundStreams,
             blockSize = blockSize,
-            readAheadBytes = 2 * blockSize,
-            memoryCapBytes = 8 * blockSize,
+            readAheadBytes = 4 * blockSize,
+            memoryCapBytes = 16 * blockSize,
             scheduler = client.scheduler,
             memoryBudget = client.transportMemoryBudget,
             timeSource = testScheduler.timeSource,
         )
-
-        val owner1 = client.openTransferDemand(
+        val owner = client.openTransferDemand(
             ConsumerIntent(
                 epoch = 0L,
                 service = ServiceIntent.PLAYING,
-                bufferBudget = BufferBudget.NONE,
-                playbackSample = PlaybackBufferSnapshot(0L, 200.milliseconds, testScheduler.timeSource.markNow()),
+                bufferBudget = BufferBudget(maxReadAheadBytes = 4 * blockSize),
             ),
         )
-        val owner2 = client.openTransferDemand(
-            ConsumerIntent(
-                epoch = 0L,
-                service = ServiceIntent.PLAYING,
-                bufferBudget = BufferBudget.NONE,
-                playbackSample = PlaybackBufferSnapshot(0L, 300.milliseconds, testScheduler.timeSource.markNow()),
-            ),
-        )
+        var oldTicket: ReadTicket? = null
+        var seekTicket: ReadTicket? = null
         try {
-            // Part A: ByteDeadline fires once at 200ms and is NEVER rearmed by subsequent reportPlaybackBuffer heartbeats.
-            val warm0 = cache.warm(listOf(0L until blockSize), StreamRole.BACKGROUND, null)
-            runCurrent()
-            val t1 = cache.beginRead(owner1, 4096L, 8192L)
-            val r1 = async {
-                val out = ByteArray(4096)
-                t1.readSome(out, 0, out.size)
-            }
-            runCurrent()
-            assertNotNull(cache.activeDeadlineForTest(0), "initial ByteDeadline armed on low-priority Fetch")
+            oldTicket = cache.beginRead(owner, 0L, blockSize)
 
-            advanceTimeBy(200)
+            // Reject concurrent readSome on the exact same ReadTicket cleanly:
+            val firstChunkOut = ByteArray(chunkBytes)
+            val pendingFirst = async { oldTicket.readSome(firstChunkOut, 0, firstChunkOut.size) }
             runCurrent()
-            assertEquals(1, attempts.count { it.endReason == RangeAttempt.EndReason.DemandDeadline }, "DemandDeadline fired once at 200ms")
-            assertNull(cache.activeDeadlineForTest(0), "consumed ByteDeadline cleared")
-            assertEquals(2, slot0Requests)
-
-            // Send repeated heartbeats (both tight and roomy) while attempt #2 is in-flight over 400ms: must NEVER rearm!
-            for (sampleDur in listOf(40.milliseconds, 10.milliseconds, 2.seconds)) {
-                advanceTimeBy(60)
-                assertTrue(owner1.reportPlaybackBuffer(PlaybackBufferSnapshot(0L, sampleDur, testScheduler.timeSource.markNow())))
-                runCurrent()
-                assertNull(cache.activeDeadlineForTest(0), "consumed episode must never rearm on heartbeat ($sampleDur)")
-                assertEquals(1, attempts.count { it.endReason == RangeAttempt.EndReason.DemandDeadline }, "zero DemandDeadline retry storm")
+            assertFailsWith<IllegalStateException> {
+                oldTicket.readSome(ByteArray(64), 0, 64)
             }
 
-            advanceTimeBy(300)
+            // Advance past 1.1s TTFB so chunk #1 (11 KiB) returns:
+            advanceTimeBy(1_105)
             runCurrent()
-            assertEquals(4096, r1.await())
-            warm0.await()
-            assertEquals(2, slot0Requests, "attempt #2 completed cleanly without any rearmed deadline interruption")
-            t1.endRead(allowFinishInFlight = false)
+            assertEquals(chunkBytes, pendingFirst.await())
+            val assembled = ByteArray(blockSize.toInt())
+            firstChunkOut.copyInto(assembled, 0, 0, chunkBytes)
+            var totalRead = chunkBytes
 
-            // Part B: When Required leaves a shared Fetch, fetch.deadlineFlow is cleared to null immediately.
-            val warm1 = cache.warm(listOf(blockSize until 2 * blockSize), StreamRole.BACKGROUND, null)
-            runCurrent()
-            owner2.reportPlaybackBuffer(PlaybackBufferSnapshot(0L, 300.milliseconds, testScheduler.timeSource.markNow()))
-            val t2 = cache.beginRead(owner2, blockSize + 4096L, blockSize + 8192L)
-            val r2 = async { runCatching { t2.readSome(ByteArray(4096), 0, 4096) } }
-            runCurrent()
-            assertNotNull(cache.activeDeadlineForTest(1), "ByteDeadline armed on slot 1 while Required is waiting")
+            // Between readSome calls (activeWaiter == null), OpenReader holds ByteClaim.Continuation on slot 0!
+            val midPlan = cache.planForTest()
+            assertTrue(midPlan.required.isEmpty())
+            assertEquals(listOf(0), midPlan.continuation.map { it.slot })
+            assertTrue(assertNotNull(cache.activeClaimControlForTest(0)).inBlockQuantum)
 
-            advanceTimeBy(100)
-            t2.endRead(allowFinishInFlight = false)
-            owner2.close()
+            // Read 2 more 11 KiB chunks with 10ms consumer pauses, then trigger intra-session seek (epoch 0 -> 1)
+            // AND open a second overlapping OpenReader at 4 * blockSize while oldTicket finishes reading all 256 KiB!
+            repeat(2) {
+                delay(10.milliseconds)
+                val n = oldTicket.readSome(assembled, totalRead, minOf(chunkBytes, assembled.size - totalRead))
+                assertTrue(n > 0)
+                totalRead += n
+            }
+            assertTrue(
+                owner.submitIntent(
+                    ConsumerIntent(
+                        epoch = 1L,
+                        service = ServiceIntent.WAITING,
+                        bufferBudget = BufferBudget(maxReadAheadBytes = 4 * blockSize),
+                    ),
+                ),
+            )
             runCurrent()
-            assertTrue(r2.await().isFailure)
-            assertNull(cache.activeDeadlineForTest(1), "deadlineFlow must clear to null when no Required claim remains on shared Fetch")
+            // After epoch 0 -> 1 bump, oldTicket STILL holds Continuation on slot 0 (never self-cancels every 11 KiB)!
+            assertEquals(listOf(0), cache.planForTest().continuation.map { it.slot })
 
+            seekTicket = cache.beginRead(owner, 4 * blockSize, 5 * blockSize)
+            val seekHeadJob = async {
+                val out = ByteArray(chunkBytes)
+                val n = seekTicket.readSome(out, 0, out.size)
+                n to out
+            }
+
+            while (totalRead < assembled.size) {
+                delay(8.milliseconds)
+                val n = oldTicket.readSome(assembled, totalRead, minOf(chunkBytes, assembled.size - totalRead))
+                assertTrue(n > 0, "oldTicket must never hit premature EOF mid-block")
+                totalRead += n
+            }
+            val (seekN, seekOut) = seekHeadJob.await()
+            assertEquals(chunkBytes, seekN)
+            assertContentEquals(payload.copyOfRange((4 * blockSize).toInt(), (4 * blockSize).toInt() + chunkBytes), seekOut)
+            assertContentEquals(payload.copyOfRange(0, blockSize.toInt()), assembled)
+
+            oldTicket.endRead(ReadEndReason.RangeCompleted)
+            seekTicket.endRead(ReadEndReason.ConsumerClosed)
+            // Let slot 4 FinishInFlight complete cleanly:
             advanceTimeBy(500)
             runCurrent()
-            assertEquals(1, attempts.count { it.endReason == RangeAttempt.EndReason.DemandDeadline }, "cleared deadline never fires on shared warm")
-            holdSlot1.complete(Unit)
-            warm1.await()
+
+            assertEquals(1, requestedStarts.count { it == 0L }, "slot 0 completed in 1 single HTTP request across 11 KiB reads & seek")
+            assertEquals(0, attempts.count { it.start == 0L && it.outcome == RangeAttempt.Outcome.Cancelled }, "zero self-cancellations on slot 0")
+            assertFalse(client.hostHealth.isBad(url))
         } finally {
-            holdSlot0Attempt1.complete(Unit)
-            holdSlot1.complete(Unit)
-            owner1.close()
-            owner2.close()
+            oldTicket?.endRead(ReadEndReason.Cancelled)
+            seekTicket?.endRead(ReadEndReason.Cancelled)
+            owner.close()
             cache.close()
             cache.awaitClosedForTest()
             reader.close()
@@ -1669,163 +1658,41 @@ class StreamingPlanAndOwnershipTest {
     }
 
     @Test
-    fun `Stage 4 - concurrent republish of shared-cell ByteDeadline never double-fires DemandDeadline`() = runTest {
-        val url = "https://dl-test.mypikpak.com/deadline-race.mkv?sign=dlrace"
-        val fileSize = 4 * blockSize
-        val holdAttempt1 = CompletableDeferred<Unit>()
-        var requests = 0
+    fun `VFS - stop-reading backpressure caps unprobed Range 0- at 1 block freezes mature window clamps PAUSED multi-block Fetch and rebuilds cached-seek lane`() = runTest {
+        val url = "https://dl-test.mypikpak.com/backpressure.mkv?sign=vfs2"
+        val fileSize = 64 * blockSize // 16 MiB
+        val payload = ByteArray((16 * blockSize).toInt()) { (it * 13 % 251).toByte() }
+        val issuedRanges = mutableListOf<Pair<Long, Long>>()
+        val holdMultiBlockSecondSlot = CompletableDeferred<Unit>()
 
         val http = HttpClient(
             MockEngine(
                 MockEngineConfig().apply {
                     dispatcher = StandardTestDispatcher(testScheduler)
                     addHandler { request ->
-                        requests++
                         val range = (request.headers[HttpHeaders.Range] ?: "bytes=0-${blockSize - 1}").removePrefix("bytes=")
                         val start = range.substringBefore('-').toLong()
                         val end = range.substringAfter('-').toLong()
                         val len = (end - start + 1).toInt()
-                        if (requests == 1) {
-                            val ch = ByteChannel(autoFlush = true)
-                            launch {
-                                runCatching {
-                                    ch.writeFully(ByteArray(1024) { 2 })
-                                    holdAttempt1.await()
-                                    ch.close()
-                                }
-                            }
-                            respond(
-                                ch,
-                                HttpStatusCode.PartialContent,
-                                headersOf(
-                                    HttpHeaders.ContentRange to listOf("bytes $start-$end/$fileSize"),
-                                    HttpHeaders.ContentLength to listOf(len.toString()),
-                                ),
-                            )
-                        } else {
-                            val ch = ByteChannel(autoFlush = true)
-                            launch {
-                                ch.writeFully(ByteArray(1024) { 2 })
-                                delay(300.milliseconds)
-                                ch.writeFully(ByteArray(len - 1024) { 2 })
-                                ch.flushAndClose()
-                            }
-                            respond(
-                                ch,
-                                HttpStatusCode.PartialContent,
-                                headersOf(
-                                    HttpHeaders.ContentRange to listOf("bytes $start-$end/$fileSize"),
-                                    HttpHeaders.ContentLength to listOf(len.toString()),
-                                ),
-                            )
-                        }
-                    }
-                },
-            ),
-        )
-
-        val client = PikPakClient(
-            account = "dlrace",
-            password = "pw",
-            httpClient = http,
-            cdnHttpClient = http,
-            sessionStore = InMemorySessionStore(),
-            timeSource = testScheduler.timeSource,
-        )
-        val attempts = mutableListOf<RangeAttempt>()
-        val reader = RangeReader(client, { url }, connectionBudget = 2, onAttempt = { attempts += it })
-        try {
-            val sharedConsumed = MutableStateFlow(false)
-            val coConsumed = MutableStateFlow(false)
-            val baseMark = testScheduler.timeSource.markNow()
-            // Simulate reconcileClaimsLocked() building d2 from the same unconsumed episode right before d1.tryConsume() wins.
-            val d1 = ByteDeadline(
-                slot = 0,
-                endExclusive = 8192L,
-                at = baseMark + 100.milliseconds,
-                consumed = sharedConsumed,
-                coConsumed = listOf(coConsumed),
-            )
-            val d2 = ByteDeadline(
-                slot = 0,
-                endExclusive = 16384L,
-                at = baseMark + 100.milliseconds,
-                consumed = sharedConsumed,
-                coConsumed = listOf(coConsumed),
-            )
-            val ctrl = FetchClaimControl(
-                priorityFlow = MutableStateFlow(PikPakStreamReader.STREAMING_PRIORITY),
-                deadlineFlow = MutableStateFlow(d1),
-            )
-
-            val readJob = async {
-                withContext(ctrl) {
-                    reader.read(0L, blockSize, PikPakStreamReader.BACKGROUND_READ_AHEAD_PRIORITY) { ch ->
-                        val out = ByteArray(blockSize.toInt())
-                        var total = 0
-                        while (total < out.size) {
-                            val n = ch.readAvailable(out, total, out.size - total)
-                            if (n < 0) break
-                            total += n
-                        }
-                        total
-                    }
-                }
-            }
-            runCurrent()
-            assertEquals(1, requests)
-
-            // Fire d1 at +100ms: consumes sharedConsumed & coConsumed atomically and triggers Attempt #2.
-            advanceTimeBy(100)
-            runCurrent()
-            assertTrue(sharedConsumed.value)
-            assertTrue(coConsumed.value)
-            assertEquals(1, attempts.count { it.endReason == RangeAttempt.EndReason.DemandDeadline })
-            assertEquals(2, requests)
-
-            // Late publisher writes stale-constructed d2 onto deadlineFlow: sharedConsumed is already true,
-            // so demandWatch clears deadlineFlow immediately and never fires a second DemandDeadline!
-            ctrl.deadlineFlow.value = d2
-            runCurrent()
-            assertFalse(d2.tryConsume())
-            assertNull(ctrl.deadlineFlow.value, "already-consumed ByteDeadline must clear immediately without re-firing")
-
-            advanceTimeBy(350)
-            runCurrent()
-            assertEquals(blockSize.toInt(), readJob.await())
-            assertEquals(1, attempts.count { it.endReason == RangeAttempt.EndReason.DemandDeadline }, "DemandDeadline never double-fires")
-            assertEquals(2, requests)
-        } finally {
-            holdAttempt1.complete(Unit)
-            reader.close()
-            client.close()
-            http.close()
-        }
-    }
-
-    @Test
-    fun `Stage 4 - withdrawing owner 1 as its deadline timer expires while owner 2 shares in-flight slot causes zero DemandDeadline cancellations`() = runTest {
-        val url = "https://dl-test.mypikpak.com/shared-deadline.mkv?sign=sdl"
-        val fileSize = 4 * blockSize
-        val holdSlot0 = CompletableDeferred<Unit>()
-        var requests = 0
-
-        val http = HttpClient(
-            MockEngine(
-                MockEngineConfig().apply {
-                    dispatcher = StandardTestDispatcher(testScheduler)
-                    addHandler { request ->
-                        requests++
-                        val range = (request.headers[HttpHeaders.Range] ?: "bytes=0-${blockSize - 1}").removePrefix("bytes=")
-                        val start = range.substringBefore('-').toLong()
-                        val end = range.substringAfter('-').toLong()
-                        val len = (end - start + 1).toInt()
+                        issuedRanges += start to len.toLong()
                         val ch = ByteChannel(autoFlush = true)
                         launch {
                             runCatching {
-                                ch.writeFully(ByteArray(1024) { 9 })
-                                holdSlot0.await()
-                                ch.writeFully(ByteArray(len - 1024) { 9 })
+                                var written = 0
+                                while (written < len) {
+                                    if (len > blockSize.toInt() && written == 64 * 1024 && start >= 20 * blockSize) {
+                                        holdMultiBlockSecondSlot.await()
+                                    }
+                                    val step = minOf(16 * 1024, len - written)
+                                    val srcOff = ((start + written) % payload.size).toInt()
+                                    val sliceLen = minOf(step, payload.size - srcOff)
+                                    ch.writeFully(payload, srcOff, srcOff + sliceLen)
+                                    if (sliceLen < step) {
+                                        ch.writeFully(payload, 0, step - sliceLen)
+                                    }
+                                    written += step
+                                    if (written < len) delay(5.milliseconds)
+                                }
                                 ch.flushAndClose()
                             }
                         }
@@ -1843,7 +1710,7 @@ class StreamingPlanAndOwnershipTest {
         )
 
         val client = PikPakClient(
-            account = "sdl",
+            account = "vfs-backpressure",
             password = "pw",
             httpClient = http,
             cdnHttpClient = http,
@@ -1851,90 +1718,354 @@ class StreamingPlanAndOwnershipTest {
             timeSource = testScheduler.timeSource,
         )
         val attempts = mutableListOf<RangeAttempt>()
-        val reader = RangeReader(client, { url }, connectionBudget = 2, onAttempt = { attempts += it })
+        val reader = RangeReader(client, { url }, connectionBudget = 4, onAttempt = { attempts += it })
         val cache = BlockCache(
             source = reader,
             size = fileSize,
-            concurrency = 2,
+            concurrency = 4,
             parentCoroutineContext = coroutineContext,
             foregroundStreams = client.foregroundStreams,
             blockSize = blockSize,
-            readAheadBytes = 2 * blockSize,
-            memoryCapBytes = 8 * blockSize,
+            readAheadBytes = 16 * blockSize,
+            memoryCapBytes = 32 * blockSize,
             scheduler = client.scheduler,
             memoryBudget = client.transportMemoryBudget,
             timeSource = testScheduler.timeSource,
         )
-        val owner1 = client.openTransferDemand(
+        val owner = client.openTransferDemand(
             ConsumerIntent(
                 epoch = 0L,
-                service = ServiceIntent.PLAYING,
-                bufferBudget = BufferBudget.NONE,
-                playbackSample = PlaybackBufferSnapshot(0L, 200.milliseconds, testScheduler.timeSource.markNow()),
+                service = ServiceIntent.WAITING,
+                bufferBudget = BufferBudget(maxReadAheadBytes = 4 * blockSize),
             ),
         )
-        val owner2 = client.openTransferDemand(
-            ConsumerIntent(
-                epoch = 0L,
-                service = ServiceIntent.PLAYING,
-                bufferBudget = BufferBudget.NONE,
-            ),
-        )
-        var warm: Deferred<Unit>? = null
-        var r1: Deferred<Result<Int>>? = null
-        var r2: Deferred<Int>? = null
+        var unboundedProbe: ReadTicket? = null
+        var playingTicket: ReadTicket? = null
+        var pausedMultiTicket: ReadTicket? = null
         try {
-            warm = cache.warm(listOf(0L until blockSize), StreamRole.BACKGROUND, null)
+            // 1. Open unbounded Range: bytes=0-, read 11 KiB in WAITING (0 LookAhead), then stop calling readSome:
+            //    Continuation finishes ONLY slot 0 (<= 256 KiB) and issues ZERO further HTTP requests!
+            unboundedProbe = cache.beginRead(owner, 0L)
+            assertEquals(11 * 1024, unboundedProbe.readSome(ByteArray(11 * 1024), 0, 11 * 1024))
+            assertTrue(cache.planForTest().lookAhead.isEmpty(), "11 KiB head read in WAITING has 0 LookAhead")
+            advanceTimeBy(10_000)
             runCurrent()
-            assertEquals(1, requests)
+            assertEquals(listOf(0L to blockSize), issuedRanges, "idle Range: bytes=0- stops after 1 x 256 KiB block with 0 further requests")
 
-            val t1 = cache.beginRead(owner1, 4096L, 8192L)
-            r1 = async { runCatching { t1.readSome(ByteArray(4096), 0, 4096) } }
-            val t2 = cache.beginRead(owner2, 4096L, 8192L)
-            val out2 = ByteArray(4096)
-            r2 = async { t2.readSome(out2, 0, out2.size) }
-            runCurrent()
-
-            val armedTarget = assertNotNull(cache.activeDeadlineForTest(0), "owner1 armed ByteDeadline on shared slot 0")
-            advanceTimeBy(199)
-            runCurrent()
-
-            // Advance virtual clock to t=200ms before running tasks scheduled at 200ms, withdraw owner1,
-            // AND verify authorizeDeadline rejects the detached target under BlockCache.mutex!
-            advanceTimeBy(1)
-            owner1.close()
-            runCurrent()
-
-            assertTrue(r1.await().isFailure)
-            assertFalse(
-                cache.authorizeDeadlineForTest(0, armedTarget, 1024L),
-                "detached target after owner1 withdrawal must not authorize DemandDeadline",
+            // 2. Cached-seek reuse on older-born ReadTicket (epoch 0 -> 1 without closing unboundedProbe):
+            //    - Short 4 KiB read in slot 0 keeps 0 lanes / 0 LookAhead;
+            //    - Crossing from slot 0 into slot 1 under epoch 1 re-attaches a fresh ReadLane and rebuilds bounded LookAhead!
+            assertTrue(
+                owner.submitIntent(
+                    ConsumerIntent(
+                        epoch = 1L,
+                        service = ServiceIntent.WAITING,
+                        bufferBudget = BufferBudget(maxReadAheadBytes = 4 * blockSize),
+                    ),
+                ),
             )
-            assertNull(cache.activeDeadlineForTest(0))
-            assertEquals(0, attempts.count { it.endReason == RangeAttempt.EndReason.DemandDeadline }, "zero DemandDeadline cancellations")
-            assertEquals(1, requests, "shared in-flight HTTP request continues uninterrupted for owner2")
-
-            holdSlot0.complete(Unit)
             runCurrent()
-            assertEquals(4096, r2.await())
-            assertContentEquals(ByteArray(4096) { 9 }, out2)
-            warm.await()
-            assertEquals(1, requests)
-            assertEquals(0, attempts.count { it.endReason == RangeAttempt.EndReason.DemandDeadline })
-            t1.endRead(allowFinishInFlight = false)
-            t2.endRead(allowFinishInFlight = false)
+            assertEquals(0, cache.laneCountForTest(owner))
+            assertEquals(4096, unboundedProbe.readSome(ByteArray(4096), 0, 4096))
+            assertEquals(0, cache.laneCountForTest(owner), "short intra-block read on older-born ticket keeps 0 ReadLanes")
+            assertTrue(cache.planForTest().lookAhead.isEmpty())
+
+            // Read remaining bytes of slot 0 + 4 KiB of slot 1 (crosses block boundary under epoch 1):
+            var remToSlot1 = (blockSize + 4096L - unboundedProbe.position).toInt()
+            val crossBuf = ByteArray(32 * 1024)
+            while (remToSlot1 > 0) {
+                val n = unboundedProbe.readSome(crossBuf, 0, minOf(crossBuf.size, remToSlot1))
+                assertTrue(n > 0)
+                remToSlot1 -= n
+            }
+            assertEquals(1, cache.laneCountForTest(owner), "older-born open ticket re-attached 1 ReadLane upon crossing block boundary")
+            val rebuiltLa = cache.planForTest().lookAhead.single()
+            assertEquals(2, rebuiltLa.firstSlot)
+            assertEquals(3, rebuiltLa.lastSlotInclusive, "cross-block WAITING unlocked 2-block (512 KiB) LookAhead")
+            unboundedProbe.endRead(ReadEndReason.ConsumerClosed)
+
+            // 3. Mature PLAYING window freezes when consumer stops calling readSome (never self-rolls to EOF):
+            assertTrue(
+                owner.submitIntent(
+                    ConsumerIntent(
+                        epoch = 2L,
+                        service = ServiceIntent.PLAYING,
+                        bufferBudget = BufferBudget(maxReadAheadBytes = 4 * blockSize),
+                    ),
+                ),
+            )
+            playingTicket = cache.beginRead(owner, 8 * blockSize, fileSize)
+            assertEquals(8192, playingTicket.readSome(ByteArray(8192), 0, 8192))
+            advanceTimeBy(10_000)
+            runCurrent()
+            val maxIssuedEndSlot = issuedRanges.maxOf { (s, l) -> ((s + l) / blockSize).toInt() }
+            assertTrue(maxIssuedEndSlot <= 13, "frozen PLAYING window stopped at bounded LookAhead (<= slot 13), never rolling to slot 64 (got $maxIssuedEndSlot)")
+            playingTicket.endRead(ReadEndReason.ConsumerClosed)
+
+            // 4. Switching to ServiceIntent.PAUSED mid-multi-block Fetch clamps allowedProductionEndOffset to current block
+            //    and stops cleanly at block boundary via BoundaryStop (0 HostHealth penalty)!
+            assertTrue(
+                owner.submitIntent(
+                    ConsumerIntent(
+                        epoch = 3L,
+                        service = ServiceIntent.PLAYING,
+                        bufferBudget = BufferBudget(maxReadAheadBytes = 16 * blockSize),
+                    ),
+                ),
+            )
+            pausedMultiTicket = cache.beginRead(owner, 20 * blockSize, fileSize)
+            // Kick off head read at slot 20, let Wave 1 (20..23) finish so Wave 2 launches multi-block Fetch(24..25) (gated at 64 KiB of slot 24),
+            // then advance pausedMultiTicket into slot 24 so it holds Continuation on Fetch(24..25) when PAUSED clamps allowedProductionEndOffset:
+            val stepBuf = ByteArray(64 * 1024)
+            var read20 = pausedMultiTicket.readSome(stepBuf, 0, 8192).toLong()
+            assertEquals(8192L, read20)
+            advanceTimeBy(120)
+            runCurrent()
+            while (read20 < 4 * blockSize + 8192L) {
+                val ask = minOf(stepBuf.size.toLong(), 4 * blockSize + 8192L - read20).toInt()
+                val n = pausedMultiTicket.readSome(stepBuf, 0, ask)
+                assertTrue(n > 0)
+                read20 += n
+            }
+            runCurrent()
+            assertTrue(issuedRanges.any { it.first >= 20 * blockSize && it.second >= 2 * blockSize }, "expected multi-block LookAhead fetch, got $issuedRanges")
+
+            assertTrue(
+                owner.submitIntent(
+                    ConsumerIntent(
+                        epoch = 3L,
+                        service = ServiceIntent.PAUSED,
+                        bufferBudget = BufferBudget.NONE,
+                    ),
+                ),
+            )
+            holdMultiBlockSecondSlot.complete(Unit)
+            advanceTimeBy(200)
+            runCurrent()
+            assertTrue(
+                attempts.any { it.endReason == RangeAttempt.EndReason.BoundaryStop },
+                "clamped multi-block fetch stopped cleanly via BoundaryStop: $attempts",
+            )
+            assertFalse(client.hostHealth.isBad(url), "BoundaryStop never penalizes HostHealth")
         } finally {
-            r1?.cancel()
-            r2?.cancel()
-            warm?.cancel()
-            holdSlot0.complete(Unit)
-            owner1.close()
-            owner2.close()
+            holdMultiBlockSecondSlot.complete(Unit)
+            unboundedProbe?.endRead(ReadEndReason.Cancelled)
+            playingTicket?.endRead(ReadEndReason.Cancelled)
+            pausedMultiTicket?.endRead(ReadEndReason.Cancelled)
+            owner.close()
             cache.close()
             cache.awaitClosedForTest()
             reader.close()
             client.close()
             http.close()
+        }
+    }
+
+    @Test
+    fun `VFS - single-worker dual OpenReader quantum prevents 11 KiB ping-pong while higher tier preempts in 0ms and moov tail cross-block unlocks LookAhead and 1-2-4 striping`() = runTest {
+        // Part 1: concurrency = 1 with two interleaved PLAYING OpenReaders reading 11 KiB chunks ->
+        // ZERO mid-block ping-pong cancellations (handoff at 256 KiB boundary), while WAITING (100 > 50) preempts in 0ms!
+        val p1Size = 8 * blockSize
+        val p1Payload = ByteArray(p1Size.toInt()) { (it * 7 % 251).toByte() }
+        val p1CancelledSlots = mutableListOf<Int>()
+        val holdSlot4Body = CompletableDeferred<Unit>()
+        val p1Source = object : RangeSource {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T = coroutineScope {
+                val slot = (start / blockSize).toInt()
+                val ch = ByteChannel(autoFlush = true)
+                var completed = false
+                val writer = launch {
+                    runCatching {
+                        if (slot == 4) {
+                            ch.writeFully(p1Payload, start.toInt(), start.toInt() + 11 * 1024)
+                            holdSlot4Body.await()
+                            ch.writeFully(p1Payload, start.toInt() + 11 * 1024, (start + length).toInt())
+                        } else {
+                            var written = 0
+                            while (written < length.toInt()) {
+                                val step = minOf(11 * 1024, length.toInt() - written)
+                                ch.writeFully(p1Payload, start.toInt() + written, start.toInt() + written + step)
+                                written += step
+                                if (written < length.toInt()) delay(10.milliseconds)
+                            }
+                        }
+                        ch.flushAndClose()
+                    }
+                }
+                try {
+                    val res = block(ch)
+                    completed = true
+                    res
+                } finally {
+                    if (!completed) p1CancelledSlots += slot
+                    writer.cancel()
+                }
+            }
+        }
+        val singleWorkerCache = BlockCache(
+            source = p1Source,
+            size = p1Size,
+            concurrency = 1,
+            parentCoroutineContext = coroutineContext,
+            foregroundStreams = null,
+            blockSize = blockSize,
+            readAheadBytes = blockSize,
+            memoryCapBytes = 8 * blockSize,
+            timeSource = testScheduler.timeSource,
+        )
+        val playingA = TransferDemand(ConsumerIntent(epoch = 0L, service = ServiceIntent.PLAYING, bufferBudget = BufferBudget.NONE))
+        val playingB = TransferDemand(ConsumerIntent(epoch = 0L, service = ServiceIntent.PLAYING, bufferBudget = BufferBudget.NONE))
+        val urgentWaiting = TransferDemand(ConsumerIntent(epoch = 0L, service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
+        try {
+            val tA = singleWorkerCache.beginRead(playingA, 0L, blockSize)
+            val tB = singleWorkerCache.beginRead(playingB, 2 * blockSize, 2 * blockSize + 11 * 1024L)
+            val aChunk1 = ByteArray(11 * 1024)
+            assertEquals(11 * 1024, tA.readSome(aChunk1, 0, aChunk1.size))
+            // Now tA is between readSome calls (holding Continuation on slot 0 with inBlockQuantum = true).
+            // tB starts readSome on slot 2 at the SAME PLAYING tier (50): must NOT preempt slot 0 mid-block!
+            val bRead = async {
+                val out = ByteArray(11 * 1024)
+                val n = tB.readSome(out, 0, out.size)
+                n to out
+            }
+            runCurrent()
+            assertTrue(p1CancelledSlots.isEmpty(), "same-tier OpenReader must never ping-pong cancel active Continuation mid-block")
+            assertFalse(bRead.isCompleted, "tB waits cleanly for slot 0's 256 KiB quantum to finish")
+
+            var aTotal = 11 * 1024
+            val aRest = ByteArray(blockSize.toInt())
+            aChunk1.copyInto(aRest, 0, 0, 11 * 1024)
+            while (aTotal < blockSize.toInt()) {
+                delay(5.milliseconds)
+                val n = tA.readSome(aRest, aTotal, minOf(11 * 1024, blockSize.toInt() - aTotal))
+                assertTrue(n > 0)
+                aTotal += n
+            }
+            assertContentEquals(p1Payload.copyOfRange(0, blockSize.toInt()), aRest)
+            val (bN, bBytes) = bRead.await()
+            assertEquals(11 * 1024, bN)
+            assertContentEquals(p1Payload.copyOfRange((2 * blockSize).toInt(), (2 * blockSize).toInt() + 11 * 1024), bBytes)
+            assertTrue(p1CancelledSlots.isEmpty(), "clean 256 KiB boundary handoff with 0 cancellations")
+            tA.endRead(ReadEndReason.RangeCompleted)
+            tB.endRead(ReadEndReason.RangeCompleted)
+            // Drain slot 2 FinishInFlight:
+            advanceTimeBy(300)
+            runCurrent()
+
+            // Strictly higher service tier (WAITING 100 > PLAYING 50) still preempts mid-block in 0ms!
+            val tPlaying4 = singleWorkerCache.beginRead(playingA, 4 * blockSize, 5 * blockSize)
+            assertEquals(11 * 1024, tPlaying4.readSome(ByteArray(11 * 1024), 0, 11 * 1024))
+            val preemptAt = testScheduler.currentTime
+            val tUrgent6 = singleWorkerCache.beginRead(urgentWaiting, 6 * blockSize, 6 * blockSize + 11 * 1024L)
+            assertEquals(11 * 1024, tUrgent6.readSome(ByteArray(11 * 1024), 0, 11 * 1024))
+            assertEquals(preemptAt, testScheduler.currentTime, "WAITING (100) preempted PLAYING (50) Continuation in 0ms")
+            assertEquals(listOf(4), p1CancelledSlots)
+            tPlaying4.endRead(ReadEndReason.Cancelled)
+            tUrgent6.endRead(ReadEndReason.Cancelled)
+        } finally {
+            holdSlot4Body.complete(Unit)
+            playingA.close()
+            playingB.close()
+            urgentWaiting.close()
+            singleWorkerCache.close()
+            singleWorkerCache.awaitClosedForTest()
+        }
+
+        // Part 2: Cross-block MP4 moov tail probe (offset = blockSize - 4296) + Progressive 256 KiB -> 512 KiB -> 1 MiB striping!
+        val stripeFileSize = 48 * blockSize
+        val stripeLengths = mutableListOf<Pair<Long, Long>>()
+        val scheduler = TransferScheduler(8, 4, BandwidthLimiter(), testScheduler.timeSource)
+        val stripeSource = object : RangeSource {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
+                stripeLengths += start to length
+                delay(20.milliseconds)
+                return block(ByteReadChannel(ByteArray(length.toInt()) { 6 }))
+            }
+        }
+        val stripeCache = BlockCache(
+            source = stripeSource,
+            size = stripeFileSize,
+            concurrency = 4,
+            parentCoroutineContext = coroutineContext,
+            foregroundStreams = null,
+            blockSize = blockSize,
+            readAheadBytes = 24 * blockSize, // 6 MiB ceiling so 16+ uncached slots remain ahead for 4 x 1 MiB Wave 3
+            memoryCapBytes = 40 * blockSize,
+            scheduler = scheduler,
+            timeSource = testScheduler.timeSource,
+        )
+        val moovOwner = TransferDemand(
+            ConsumerIntent(
+                epoch = 0L,
+                service = ServiceIntent.WAITING,
+                bufferBudget = BufferBudget(maxReadAheadBytes = 24 * blockSize),
+            ),
+        )
+        try {
+            // 2a. moov probe starts 4,296 bytes before end of slot 0:
+            val moovTicket = stripeCache.beginRead(moovOwner, blockSize - 4296L, 6 * blockSize)
+            assertEquals(4296, moovTicket.readSome(ByteArray(4296), 0, 4296))
+            assertTrue(stripeCache.planForTest().lookAhead.isEmpty(), "tail read within slot 0 emits 0 LookAhead")
+
+            // Reading 4,096 bytes into slot 1 crosses block boundary (total read = 8,392B << 256 KiB) -> unlocks 512 KiB LookAhead immediately!
+            // (slot 1 completed into RAM cache, so LookAhead covers slots 1..3: protecting cached slot 1 and prefetching slots 2..3!)
+            assertEquals(4096, moovTicket.readSome(ByteArray(4096), 0, 4096))
+            val moovLa = stripeCache.planForTest().lookAhead.single()
+            assertEquals(1, moovLa.firstSlot)
+            assertEquals(3, moovLa.lastSlotInclusive, "cross-block moov probe immediately unlocks 2 * blockSize (slots 2..3) LookAhead")
+            moovTicket.endRead(ReadEndReason.RangeCompleted)
+            advanceTimeBy(100)
+            runCurrent()
+
+            // 2b. Progressive 1 -> 2 -> 4 block striping (256 KiB -> 512 KiB -> 1 MiB) under PLAYING with 4 workers & 6 MiB budget:
+            stripeLengths.clear()
+            assertTrue(
+                moovOwner.submitIntent(
+                    ConsumerIntent(
+                        epoch = 1L,
+                        service = ServiceIntent.PLAYING,
+                        bufferBudget = BufferBudget(maxReadAheadBytes = 24 * blockSize),
+                    ),
+                ),
+            )
+            val playTicket = stripeCache.beginRead(moovOwner, 8 * blockSize, stripeFileSize)
+            val headRead = async { playTicket.readSome(ByteArray(4096), 0, 4096) }
+            runCurrent()
+            // Wave 1 (slots 8..11): 4 parallel 1-block (256 KiB) stripes for minimum first-byte latency!
+            assertEquals(4, stripeLengths.size)
+            assertTrue(stripeLengths.take(4).all { it.second == blockSize }, "Wave 1 must issue 4 x 256 KiB stripes, got $stripeLengths")
+
+            assertEquals(4096, headRead.await())
+            // Advance so Wave 2 issues 2-block (512 KiB) stripes across slots 12..19:
+            advanceTimeBy(50)
+            runCurrent()
+            assertTrue(stripeLengths.any { it.second == 2 * blockSize }, "Wave 2 must step up to 512 KiB (2 blocks), got $stripeLengths")
+
+            // Consumer advances through buffered slots 8..19 so a full 4 MiB (16-slot) window opens ahead -> Wave 3 issues 1 MiB (4-block) stripes!
+            val consumeBuf = ByteArray(64 * 1024)
+            while (playTicket.position < 20 * blockSize) {
+                val ask = minOf(consumeBuf.size.toLong(), 20 * blockSize - playTicket.position).toInt()
+                val n = playTicket.readSome(consumeBuf, 0, ask)
+                assertTrue(n > 0)
+            }
+            advanceTimeBy(50)
+            runCurrent()
+            assertTrue(stripeLengths.any { it.second == 4 * blockSize }, "Wave 3 must step up to 1 MiB (4 blocks), got $stripeLengths")
+            playTicket.endRead(ReadEndReason.Cancelled)
+        } finally {
+            moovOwner.close()
+            stripeCache.close()
+            stripeCache.awaitClosedForTest()
         }
     }
 
@@ -2511,7 +2642,7 @@ class StreamingPlanAndOwnershipTest {
             }
         }
 
-        // 1. Sub-threshold stream (< 3 MiB/s -> 2 MiB/s): WAITING ceiling stays unchanged at 8 blocks (2 MiB).
+        // 1. Sub-threshold stream (< 3 MiB/s -> 2 MiB/s): WAITING ceiling scales to readAheadWorkers * 1 MiB = 16 blocks (4 MiB) once >= 512 KiB is read.
         val sdCache = BlockCache(
             source = source,
             size = fileSize,
@@ -2543,12 +2674,12 @@ class StreamingPlanAndOwnershipTest {
             readBytesExactly(sdTicket, 128L * 1024L)
             assertTrue(sdCache.planForTest().lookAhead.isEmpty(), "< 256 KiB probe emits 0 LookAhead")
 
-            // Advance to 6 * blockSize (1.5 MiB sequential -> 2x = 3 MiB > 2 MiB cap):
-            readBytesExactly(sdTicket, 6 * blockSize - 128L * 1024L)
+            // Advance to 10 * blockSize (2.5 MiB sequential -> 2x = 5 MiB > 4 MiB worker*span cap):
+            readBytesExactly(sdTicket, 10 * blockSize - 128L * 1024L)
             val sdLa = sdCache.planForTest().lookAhead.single()
-            assertEquals(6, sdLa.firstSlot)
-            assertEquals(13, sdLa.lastSlotInclusive)
-            assertEquals(8, sdLa.lastSlotInclusive - sdLa.firstSlot + 1, "< 3 MiB/s WAITING cap stays 8 blocks (2 MiB)")
+            assertEquals(10, sdLa.firstSlot)
+            assertEquals(25, sdLa.lastSlotInclusive)
+            assertEquals(16, sdLa.lastSlotInclusive - sdLa.firstSlot + 1, "< 3 MiB/s WAITING cap matches 4 workers * 1 MiB = 16 blocks (4 MiB)")
 
             // Owner 1 reports an epoch=0 12 MiB/s sample on the 2 MiB/s cache -> only Owner 1 scales to 48 blocks (12 MiB):
             assertTrue(
@@ -2561,20 +2692,20 @@ class StreamingPlanAndOwnershipTest {
                     ),
                 ),
             )
-            readBytesExactly(sdTicket, 22 * blockSize) // total 28 blocks = 7 MiB (2x = 14 MiB >= 12 MiB)
+            readBytesExactly(sdTicket, 18 * blockSize) // total 28 blocks = 7 MiB (2x = 14 MiB >= 12 MiB)
             val sdOwner1Boosted = sdCache.planForTest().lookAhead.single { it.owner === sdOwner }
             assertEquals(48, sdOwner1Boosted.lastSlotInclusive - sdOwner1Boosted.firstSlot + 1)
 
             // Sibling Owner 2 on the SAME cache (playbackSample = null) must NOT inherit Owner 1's 12 MiB/s sample:
             val sdTicket2 = sdCache.beginRead(sdOwner2, 0L, fileSize)
-            readBytesExactly(sdTicket2, 6 * blockSize)
+            readBytesExactly(sdTicket2, 10 * blockSize)
             val sdOwner2La = sdCache.planForTest().lookAhead.single { it.owner === sdOwner2 }
-            assertEquals(6, sdOwner2La.firstSlot)
-            assertEquals(13, sdOwner2La.lastSlotInclusive)
-            assertEquals(8, sdOwner2La.lastSlotInclusive - sdOwner2La.firstSlot + 1, "sibling owner stays at configured 2 MiB/s (8 blocks)")
+            assertEquals(10, sdOwner2La.firstSlot)
+            assertEquals(25, sdOwner2La.lastSlotInclusive)
+            assertEquals(16, sdOwner2La.lastSlotInclusive - sdOwner2La.firstSlot + 1, "sibling owner stays at 4 MiB (16 blocks) ceiling")
             sdTicket2.endRead(allowFinishInFlight = false)
 
-            // Advancing Owner 1 to epoch=1 with playbackSample = null resets Owner 1 back to configured 2 MiB/s (8 blocks):
+            // Advancing Owner 1 to epoch=1 with playbackSample = null resets Owner 1 back to 4 MiB (16 blocks):
             sdTicket.endRead(allowFinishInFlight = false)
             assertTrue(
                 sdOwner.submitIntent(
@@ -2587,11 +2718,11 @@ class StreamingPlanAndOwnershipTest {
                 ),
             )
             val sdEpoch1Ticket = sdCache.beginRead(sdOwner, 0L, fileSize)
-            readBytesExactly(sdEpoch1Ticket, 6 * blockSize)
+            readBytesExactly(sdEpoch1Ticket, 10 * blockSize)
             val sdEpoch1La = sdCache.planForTest().lookAhead.single { it.owner === sdOwner }
-            assertEquals(6, sdEpoch1La.firstSlot)
-            assertEquals(13, sdEpoch1La.lastSlotInclusive)
-            assertEquals(8, sdEpoch1La.lastSlotInclusive - sdEpoch1La.firstSlot + 1, "epoch advance with null sample resets back to configured 2 MiB/s (8 blocks)")
+            assertEquals(10, sdEpoch1La.firstSlot)
+            assertEquals(25, sdEpoch1La.lastSlotInclusive)
+            assertEquals(16, sdEpoch1La.lastSlotInclusive - sdEpoch1La.firstSlot + 1, "epoch advance with null sample resets back to 4 MiB (16 blocks)")
             sdEpoch1Ticket.endRead(allowFinishInFlight = false)
         } finally {
             sdOwner.close()
@@ -2697,6 +2828,125 @@ class StreamingPlanAndOwnershipTest {
             remuxOwner.close()
             remuxCache.close()
             remuxCache.awaitClosedForTest()
+        }
+    }
+
+    @Test
+    fun `VFS - tail Required on in-flight multi-block Fetch continues with live priority promotion when near and repositions when far`() = runTest {
+        val fileSize = 16 * blockSize
+        val payload = ByteArray(fileSize.toInt()) { (it * 43 % 251).toByte() }
+        val holdFirstMulti = CompletableDeferred<Unit>()
+        val holdSecondMulti = CompletableDeferred<Unit>()
+        val cancelledStarts = mutableListOf<Long>()
+        val observedLivePriorities = mutableListOf<Int>()
+
+        val store = object : DurableBlockStore {
+            override suspend fun read(file: String, offset: Long, length: Int): ByteArray? = null
+            override suspend fun write(file: String, offset: Long, bytes: ByteArray) = Unit
+            override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
+        }
+        val source = object : RangeSource {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T = coroutineScope {
+                val ctrl = currentCoroutineContext()[FetchClaimControl]
+                val gate = when {
+                    start == 0L && length > blockSize -> holdFirstMulti
+                    start == 4 * blockSize && length > blockSize -> holdSecondMulti
+                    else -> null
+                }
+                if (gate != null) {
+                    val ch = ByteChannel(autoFlush = true)
+                    var completed = false
+                    val writer = launch {
+                        runCatching {
+                            ch.writeFully(payload, start.toInt(), start.toInt() + 16 * 1024)
+                            gate.await()
+                            if (ctrl != null) observedLivePriorities += ctrl.priorityFlow.value
+                            ch.writeFully(payload, start.toInt() + 16 * 1024, (start + length).toInt())
+                            ch.flushAndClose()
+                        }
+                    }
+                    try {
+                        val res = block(ch)
+                        completed = true
+                        res
+                    } finally {
+                        if (!completed && !gate.isCompleted) cancelledStarts += start
+                        writer.cancel()
+                    }
+                } else {
+                    block(ByteReadChannel(payload.copyOfRange(start.toInt(), (start + length).toInt())))
+                }
+            }
+        }
+        val scheduler = TransferScheduler(4, 4, BandwidthLimiter(), testScheduler.timeSource)
+        val cache = BlockCache(
+            source = source,
+            size = fileSize,
+            concurrency = 1,
+            parentCoroutineContext = coroutineContext,
+            foregroundStreams = null,
+            store = store,
+            storeKey = "tail.mkv",
+            blockSize = blockSize,
+            readAheadBytes = 4 * blockSize,
+            memoryCapBytes = 16 * blockSize,
+            scheduler = scheduler,
+            timeSource = testScheduler.timeSource,
+        )
+        val urgentOwner = TransferDemand(ConsumerIntent(epoch = 0L, service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
+        var warmA: Deferred<Unit>? = null
+        var warmB: Deferred<Unit>? = null
+        try {
+            // 1. Near tail Required (< 512 KiB intervening bytes):
+            //    Multi-block Fetch(0..3) wrote 16 KiB of slot 0 -> slot 1 is only 240 KiB away (< 512 KiB).
+            //    Urgent WAITING Required on slot 1 promotes livePriority to BLOCKING_PRIORITY (100) WITHOUT cancelling Fetch(0..3)!
+            warmA = cache.warm(listOf(0L until 4 * blockSize), StreamRole.BACKGROUND, null, durable = true)
+            runCurrent()
+            val nearTicket = cache.beginRead(urgentOwner, blockSize, blockSize + 4096L)
+            val nearOut = ByteArray(4096)
+            val nearJob = async { nearTicket.readSome(nearOut, 0, nearOut.size) }
+            runCurrent()
+
+            assertTrue(cancelledStarts.isEmpty(), "< 512 KiB intervening bytes must continue in-flight Fetch without suicide")
+            assertEquals(PikPakStreamReader.BLOCKING_PRIORITY, assertNotNull(cache.activeClaimControlForTest(0)).priorityFlow.value)
+
+            holdFirstMulti.complete(Unit)
+            runCurrent()
+            assertEquals(4096, nearJob.await())
+            assertContentEquals(payload.copyOfRange(blockSize.toInt(), blockSize.toInt() + 4096), nearOut)
+            assertTrue(PikPakStreamReader.BLOCKING_PRIORITY in observedLivePriorities)
+            nearTicket.endRead(ReadEndReason.RangeCompleted)
+            warmA.await()
+            // Let foregroundIdle elapse so background durable warmB claims a full 4-block Fetch(4..7) instead of 1-block throttled chunks:
+            advanceTimeBy(11_000)
+            runCurrent()
+
+            // 2. Far tail Required (>= 512 KiB intervening bytes on unmeasured stream):
+            //    Multi-block Fetch(4..7) wrote 16 KiB of slot 4 -> slot 7 is 752 KiB away (>= 512 KiB).
+            //    Urgent WAITING Required on slot 7 repositions immediately in 0ms!
+            warmB = cache.warm(listOf(4 * blockSize until 8 * blockSize), StreamRole.BACKGROUND, null, durable = true)
+            runCurrent()
+            val farAt = testScheduler.currentTime
+            val farTicket = cache.beginRead(urgentOwner, 7 * blockSize, 7 * blockSize + 4096L)
+            val farOut = ByteArray(4096)
+            assertEquals(4096, farTicket.readSome(farOut, 0, farOut.size))
+            assertEquals(farAt, testScheduler.currentTime, "far tail Required repositioned in 0ms")
+            assertContentEquals(payload.copyOfRange((7 * blockSize).toInt(), (7 * blockSize).toInt() + 4096), farOut)
+            assertEquals(listOf(4 * blockSize), cancelledStarts)
+            farTicket.endRead(ReadEndReason.RangeCompleted)
+        } finally {
+            holdFirstMulti.complete(Unit)
+            holdSecondMulti.complete(Unit)
+            warmA?.cancel()
+            warmB?.cancel()
+            urgentOwner.close()
+            cache.close()
+            cache.awaitClosedForTest()
         }
     }
 }
