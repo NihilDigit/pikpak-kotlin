@@ -2949,4 +2949,106 @@ class StreamingPlanAndOwnershipTest {
             cache.awaitClosedForTest()
         }
     }
+
+    @Test
+    fun supersededPreSeekSocketDoesNotSpawnZombieLookAheadAndWave3ReachesFull1MiB() = runTest {
+        val blockSize = 256L * 1024L
+        val fileSize = 96 * blockSize // 24 MiB
+        val requestedSpans = ArrayList<Pair<Long, Long>>()
+        val holdNewTarget = CompletableDeferred<Unit>()
+        val source = object : RangeSource {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
+                requestedSpans += start to length
+                if (start == 64 * blockSize) {
+                    holdNewTarget.await()
+                }
+                val bytes = ByteArray(length.toInt()) { i -> ((start + i) and 0xFF).toByte() }
+                return block(ByteReadChannel(bytes))
+            }
+        }
+        val foregroundStreams = ForegroundStreams()
+        val scheduler = TransferScheduler(8, 8, BandwidthLimiter(), testScheduler.timeSource)
+        val cache = BlockCache(
+            source = source,
+            size = fileSize,
+            concurrency = 8,
+            parentCoroutineContext = coroutineContext,
+            foregroundStreams = foregroundStreams,
+            store = null,
+            storeKey = "seek.mkv",
+            blockSize = blockSize,
+            scheduler = scheduler,
+            timeSource = testScheduler.timeSource,
+        )
+        val owner = TransferDemand(
+            ConsumerIntent(
+                epoch = 0L,
+                service = ServiceIntent.PLAYING,
+                bufferBudget = BufferBudget(maxReadAheadBytes = 12L * 1024 * 1024), // 48 blocks (12 MiB)
+            ),
+        )
+        try {
+            // 1. Progressive striping reaches full 1 MiB (4-block) spans in Wave 3 without fairShare strangling to 512 KiB,
+            //    and single-stream ForegroundStreams scales read-ahead concurrency to 6 workers:
+            val oldTicket = cache.beginRead(owner, 0L, fileSize)
+            val firstBuf = ByteArray(64 * 1024)
+            assertEquals(firstBuf.size, oldTicket.readSome(firstBuf, 0, firstBuf.size))
+            runCurrent()
+
+            assertEquals(1, foregroundStreams.active.value)
+            assertTrue(
+                requestedSpans.any { (_, len) -> len == 4 * blockSize },
+                "Wave 3 must issue full 1 MiB (4-block) requests instead of being strangled by fairShare: $requestedSpans",
+            )
+
+            // 2. Simulate FFmpeg http_seek_internal:
+            //    UI advances to epoch=1 (WAITING) and opens post-seek ticket at slot 64 (held in TTFB),
+            //    while old_hd (epoch=0) drains cached 64 KiB chunks across multiple 256 KiB block boundaries into TCP buffer.
+            requestedSpans.clear()
+            owner.submitIntent(owner.intent.copy(epoch = 1L, service = ServiceIntent.WAITING))
+            runCurrent()
+
+            val newTicket = cache.beginRead(owner, 64 * blockSize, fileSize)
+            val newRead = async {
+                val out = ByteArray(4096)
+                newTicket.readSome(out, 0, out.size)
+            }
+            runCurrent()
+
+            // Drain 768 KiB (3 block boundaries!) on superseded oldTicket while newTicket is still awaiting TTFB:
+            var drained = 0
+            val stepBuf = ByteArray(64 * 1024)
+            while (drained < (3 * blockSize).toInt()) {
+                val n = oldTicket.readSome(stepBuf, 0, stepBuf.size)
+                assertTrue(n > 0)
+                drained += n
+                runCurrent()
+            }
+
+            // Superseded epoch=0 ticket must NOT re-attach any ReadLane or spawn any LookAhead near slots 0..48!
+            assertTrue(
+                cache.planForTest().lookAhead.none { it.firstSlot < 64 },
+                "Superseded pre-seek ticket must not emit LookAhead at old offset: ${cache.planForTest().lookAhead}",
+            )
+            assertTrue(
+                requestedSpans.none { (start, _) -> start < 64 * blockSize },
+                "Superseded pre-seek ticket must not trigger upstream LookAhead fetches: $requestedSpans",
+            )
+
+            holdNewTarget.complete(Unit)
+            assertEquals(4096, newRead.await())
+            oldTicket.endRead(ReadEndReason.ConsumerClosed)
+            newTicket.endRead(ReadEndReason.RangeCompleted)
+        } finally {
+            holdNewTarget.complete(Unit)
+            owner.close()
+            cache.close()
+            cache.awaitClosedForTest()
+        }
+    }
 }
