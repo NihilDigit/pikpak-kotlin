@@ -80,11 +80,19 @@ class PikPakStreamReaderTest {
     fun `inactive demand retains position and cached bytes without speculative reads`() = runBlocking<Unit> {
         val content = payload((unit * 8).toInt())
         val source = FakeRangeSource(content)
-        val reader = reader(source, content.size.toLong(), concurrency = 1)
+        val cache = sharedCache(source, content.size.toLong(), concurrency = 1)
+        val owner = TransferDemand(
+            ConsumerIntent(
+                service = ServiceIntent.PLAYING,
+                bufferBudget = BufferBudget(maxReadAheadBytes = 1L * 1024 * 1024),
+            ),
+        )
+        val reader = PikPakStreamReader(cache, ownsCache = false, initialRole = StreamRole.FOREGROUND, externalOwner = owner)
         try {
             reader.read(ByteArray(1), 0, 1)
             waitUntil("read-ahead cached") { reader.cachedBytesForTest() >= unit * 4 }
-            reader.setDemandActive(false)
+            owner.submitIntent(ConsumerIntent(service = ServiceIntent.PAUSED, bufferBudget = BufferBudget.NONE))
+            owner.withdrawSpeculation()
             delay(100.milliseconds)
             val requests = source.requests().size
             val position = reader.position
@@ -96,8 +104,17 @@ class PikPakStreamReaderTest {
             val bytes = ByteArray(1)
             reader.read(bytes, 0, 1)
             assertEquals(content[position.toInt()], bytes[0])
-            reader.setDemandActive(true)
-        } finally { reader.close() }
+            owner.submitIntent(
+                ConsumerIntent(
+                    service = ServiceIntent.PLAYING,
+                    bufferBudget = BufferBudget(maxReadAheadBytes = 1L * 1024 * 1024),
+                ),
+            )
+        } finally {
+            reader.close()
+            owner.close()
+            cache.close()
+        }
     }
 
     @Test
@@ -368,12 +385,12 @@ class PikPakStreamReaderTest {
         val content = payload((unit * 64).toInt())
         val source = FakeRangeSource(content, latency = 20.milliseconds)
         val cache = sharedCache(source, content.size.toLong())
-        val first = PikPakStreamReader(cache, ownsCache = false, initialRole = StreamRole.FOREGROUND)
-        val second = PikPakStreamReader(cache, ownsCache = false, initialRole = StreamRole.FOREGROUND)
+        val owner1 = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING, bufferBudget = BufferBudget(maxReadAheadBytes = unit * 4)))
+        val owner2 = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING, bufferBudget = BufferBudget(maxReadAheadBytes = unit * 4)))
+        val first = PikPakStreamReader(cache, ownsCache = false, initialRole = StreamRole.FOREGROUND, externalOwner = owner1)
+        val second = PikPakStreamReader(cache, ownsCache = false, initialRole = StreamRole.FOREGROUND, externalOwner = owner2)
 
         try {
-            first.readAheadLimit = unit * 4
-            second.readAheadLimit = unit * 4
             val buffer = ByteArray(unit.toInt())
             readExactly(first, buffer)
             assertContentEquals(content.copyOfRange(0, buffer.size), buffer)
@@ -394,6 +411,8 @@ class PikPakStreamReaderTest {
         } finally {
             first.close()
             second.close()
+            owner1.close()
+            owner2.close()
             cache.close()
         }
     }

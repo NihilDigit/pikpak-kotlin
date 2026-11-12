@@ -170,18 +170,52 @@ class TransportFeedbackTest {
         val http = HttpClient(MockEngine { respond("") })
         val client = PikPakClient("transport-test", "unused", httpClient = http)
         val cache = client.fileCache(FakeRangeSource(ByteArray(1024)), 1024)
-        val stream = cache.openStream()
+        val owner = client.openTransferDemand(
+            ConsumerIntent(
+                epoch = 0L,
+                service = ServiceIntent.PLAYING,
+                bufferBudget = BufferBudget(targetBuffer = 2.seconds, maxReadAheadBytes = 512 * 1024),
+            ),
+        )
+        val stream = cache.openStream(owner)
         try {
-            stream.reportPlaybackBuffer(2.seconds, 128_000)
-            stream.reportPlaybackBuffer(Duration.ZERO)
+            assertTrue(
+                owner.reportPlaybackBuffer(
+                    PlaybackBufferSnapshot(
+                        generation = 0L,
+                        bufferedDuration = 2.seconds,
+                        sampledAt = kotlin.time.TimeSource.Monotonic.markNow(),
+                        mediaBytesPerSecond = 128_000,
+                    ),
+                ),
+            )
+            assertTrue(
+                owner.reportPlaybackBuffer(
+                    PlaybackBufferSnapshot(
+                        generation = 0L,
+                        bufferedDuration = Duration.ZERO,
+                        sampledAt = kotlin.time.TimeSource.Monotonic.markNow(),
+                    ),
+                ),
+            )
             cache.updateMediaBytesPerSecond(256_000)
             cache.updateMediaBytesPerSecond(null)
-            assertFailsWith<IllegalArgumentException> { stream.reportPlaybackBuffer((-1).seconds) }
-            assertFailsWith<IllegalArgumentException> { stream.reportPlaybackBuffer(Duration.INFINITE) }
-            assertFailsWith<IllegalArgumentException> { stream.reportPlaybackBuffer(1.seconds, 0) }
+            assertFailsWith<IllegalArgumentException> { BufferBudget(targetBuffer = (-1).seconds) }
+            assertFailsWith<IllegalArgumentException> { BufferBudget(targetBuffer = Duration.INFINITE) }
+            assertFailsWith<IllegalArgumentException> { BufferBudget(maxReadAheadBytes = -1) }
+            assertFailsWith<IllegalArgumentException> {
+                PlaybackBufferSnapshot(0L, (-1).seconds, kotlin.time.TimeSource.Monotonic.markNow())
+            }
+            assertFailsWith<IllegalArgumentException> {
+                PlaybackBufferSnapshot(0L, Duration.INFINITE, kotlin.time.TimeSource.Monotonic.markNow())
+            }
+            assertFailsWith<IllegalArgumentException> {
+                PlaybackBufferSnapshot(0L, 1.seconds, kotlin.time.TimeSource.Monotonic.markNow(), mediaBytesPerSecond = 0)
+            }
             assertFailsWith<IllegalArgumentException> { cache.updateMediaBytesPerSecond(-1) }
         } finally {
             stream.close()
+            owner.close()
             cache.close()
             client.close()
             http.close()

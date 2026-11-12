@@ -1,8 +1,7 @@
 package io.github.nihildigit.pikpak
 
-import io.github.nihildigit.pikpak.internal.CacheDemand
-import io.github.nihildigit.pikpak.internal.TransferScheduler
 import io.github.nihildigit.pikpak.internal.AdaptiveRangeSource
+import io.github.nihildigit.pikpak.internal.TransferScheduler
 import io.ktor.utils.io.ByteReadChannel
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
@@ -12,23 +11,24 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class BlockCacheTest {
     @Test
-    fun `foreground warm stays bounded and becomes hungry only when a playback cursor blocks`() = runTest {
-        val scheduler = TransferScheduler(16, 8, BandwidthLimiter(), testScheduler.timeSource,
-            concurrencyMode = ConcurrencyMode.Fixed(8))
+    fun `foreground warm stays bounded to two workers and yields full capacity to active foreground read`() = runTest {
+        val scheduler = TransferScheduler(
+            16,
+            8,
+            BandwidthLimiter(),
+            testScheduler.timeSource,
+            concurrencyMode = ConcurrencyMode.Fixed(8),
+        )
         val players = List(2) { scheduler.register(8) {} }
         val downloads = List(2) { scheduler.register(8) {} }
-        players.forEach { scheduler.reportDemand(it, CacheDemand(foreground = true)) }
-        downloads.forEach { scheduler.reportDemand(it, CacheDemand(background = true)) }
-        val otherWarm = scheduler.register(8) {}
-        scheduler.reportDemand(otherWarm, CacheDemand(warm = true))
         var active = 0
         var allowance = 0
+        val priorities = mutableListOf<Int>()
         val source = object : RangeSource, AdaptiveRangeSource {
             override val maxConnections = 8
             override val connectionLimit = MutableStateFlow(8)
@@ -36,41 +36,59 @@ class BlockCacheTest {
                 allowance = value
                 connectionLimit.value = value
             }
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                block: suspend (ByteReadChannel) -> T): T {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
+                priorities += priority
                 active++
-                try { awaitCancellation() } finally { active-- }
+                try {
+                    awaitCancellation()
+                } finally {
+                    active--
+                }
             }
         }
-        val cache = BlockCache(source, 4096, 8, coroutineContext, null,
-            blockSize = 64, readAheadBytes = 512, memoryCapBytes = 4096,
-            scheduler = scheduler, timeSource = testScheduler.timeSource)
+        val cache = BlockCache(
+            source,
+            4096,
+            8,
+            coroutineContext,
+            null,
+            blockSize = 64,
+            readAheadBytes = 512,
+            memoryCapBytes = 4096,
+            scheduler = scheduler,
+            timeSource = testScheduler.timeSource,
+        )
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING))
         try {
             val warm = cache.warm(listOf(0L..2047L), StreamRole.FOREGROUND, null)
             runCurrent()
-            assertFalse(scheduler.isAccountHungry())
             assertEquals(8, allowance)
-            assertEquals(2, active)
+            assertEquals(2, active, "warm without active stream stays capped to 2 workers")
             assertEquals(listOf(8, 8), players.map(scheduler::connectionAllowanceFor))
             assertTrue(downloads.all { scheduler.spanFor(it, 2, true) > 1 })
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
+
+            val ticket = cache.beginRead(owner, 2048L)
+            val read = async { ticket.readSome(ByteArray(1), 0, 1) }
             runCurrent()
-            assertTrue(scheduler.isAccountHungry())
-            assertTrue(allowance > 1)
-            assertTrue(downloads.all { scheduler.workersFor(it, true) == 0 })
+            assertTrue(active > 2, "active foreground stream lifts the 2-worker warm cap")
+            assertTrue(PikPakStreamReader.STREAMING_PRIORITY in priorities)
             read.cancelAndJoin()
-            cache.closeCursor(cursor)
-            runCurrent()
-            assertFalse(scheduler.isAccountHungry())
+            ticket.endRead(allowFinishInFlight = false)
+            owner.close()
             warm.cancelAndJoin()
             runCurrent()
             assertEquals(0, active)
             assertEquals(0, allowance)
         } finally {
+            owner.close()
             cache.close()
             cache.awaitClosedForTest()
-            (players + downloads + otherWarm).forEach(scheduler::unregister)
+            (players + downloads).forEach(scheduler::unregister)
         }
     }
 }

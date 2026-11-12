@@ -185,16 +185,25 @@ class TransportSimulationTest {
             withTimeout(2000) { while (network.requests.isEmpty()) delay(1) }
             val target = network.requests.first().start
             advanceTimeBy(200); runCurrent()
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setUrgent(cursor, urgent)
-            cache.seek(cursor, target)
-            cache.reportPlaybackBuffer(cursor, bufferMs.milliseconds, MIB)
+            val owner = TransferDemand(
+                ConsumerIntent(
+                    epoch = 0L,
+                    service = if (urgent) ServiceIntent.WAITING else ServiceIntent.PLAYING,
+                    playbackSample = PlaybackBufferSnapshot(
+                        generation = 0L,
+                        bufferedDuration = bufferMs.milliseconds,
+                        sampledAt = testScheduler.timeSource.markNow(),
+                        mediaBytesPerSecond = MIB,
+                    ),
+                ),
+            )
+            val ticket = cache.beginRead(owner, target)
             val started = testScheduler.currentTime
             val bytes = ByteArray(64 * 1024)
             var count = 0
             withTimeout(5000) {
                 while (count < bytes.size) {
-                    val n = cache.read(cursor, bytes, count, bytes.size - count)
+                    val n = ticket.readSome(bytes, count, bytes.size - count)
                     assertTrue(n > 0, "premature EOF during seek rescue")
                     count += n
                 }
@@ -215,7 +224,8 @@ class TransportSimulationTest {
             assertTrue(attempts.none { it.outcome == RangeAttempt.Outcome.Failed }, "deadline rescue was classified as network failure")
             println("SIM playbackBufferMs=$bufferMs urgent=$urgent rescueDelayMs=$rescueDelay " +
                 "ready64KiBMs=${testScheduler.currentTime - started} outcome=${cancelled.outcome}")
-            cache.closeCursor(cursor)
+            ticket.endRead(allowFinishInFlight = false)
+            owner.close()
             return rescueDelay
         } catch (t: Throwable) {
             failure = t
@@ -237,31 +247,49 @@ class TransportSimulationTest {
         val cache = BlockCache(source, size, 8, backgroundScope.coroutineContext, client.foregroundStreams,
             VirtualDisk(), blockSize = 256 * 1024, readAheadBytes = 4 * MIB, memoryCapBytes = 16 * MIB,
             scheduler = client.scheduler, memoryBudget = client.transportMemoryBudget, timeSource = testScheduler.timeSource)
-        val cursor = cache.openCursor(StreamRole.FOREGROUND)
+        val owner = TransferDemand(ConsumerIntent(epoch = 0L, service = ServiceIntent.PLAYING))
         val started = testScheduler.currentTime
         var failure: Throwable? = null
         try {
             val offsets = listOf(17L, 63 * MIB + 31, 2 * MIB - 19, 100 * MIB + 7, 7 * MIB + 65521, 17L)
+            var epoch = 0L
             for (target in offsets) {
-                // Cancel a read while it is in flight, then seek to a distinct unaligned position.
-                cache.seek(cursor, (target + 16 * MIB) % (size - MIB))
-                val abandoned = launch { cache.read(cursor, ByteArray(64 * 1024), 0, 64 * 1024) }
+                // Cancel a read while it is in flight, then bump epoch and read at a distinct unaligned position.
+                epoch++
+                owner.submitIntent(ConsumerIntent(epoch = epoch, service = ServiceIntent.PLAYING))
+                val decoyTicket = cache.beginRead(owner, (target + 16 * MIB) % (size - MIB))
+                val abandoned = launch { decoyTicket.readSome(ByteArray(64 * 1024), 0, 64 * 1024) }
                 advanceTimeBy(25); runCurrent()
                 abandoned.cancelAndJoin()
-                cache.seek(cursor, target)
-                cache.reportPlaybackBuffer(cursor, 100.milliseconds, MIB)
+                decoyTicket.endRead(allowFinishInFlight = false)
+                epoch++
+                owner.submitIntent(
+                    ConsumerIntent(
+                        epoch = epoch,
+                        service = ServiceIntent.PLAYING,
+                        playbackSample = PlaybackBufferSnapshot(
+                            generation = epoch,
+                            bufferedDuration = 100.milliseconds,
+                            sampledAt = testScheduler.timeSource.markNow(),
+                            mediaBytesPerSecond = MIB,
+                        ),
+                    ),
+                )
+                val ticket = cache.beginRead(owner, target)
                 val bytes = ByteArray(96 * 1024)
                 withTimeout(5000) {
                     var count = 0
                     while (count < bytes.size) {
-                        val n = cache.read(cursor, bytes, count, bytes.size - count)
+                        val n = ticket.readSome(bytes, count, bytes.size - count)
                         assertTrue(n > 0)
                         count += n
                     }
                 }
+                ticket.endRead(allowFinishInFlight = false)
                 verifyContent(target, bytes)
                 assertTrue(client.transportMemoryPeakBytes <= 16 * MIB)
             }
+            owner.close()
             assertTrue(attempts.any { it.outcome == RangeAttempt.Outcome.Cancelled })
             assertTrue(attempts.none { it.outcome == RangeAttempt.Outcome.Failed })
             network.assertConservation()

@@ -1,29 +1,29 @@
 package io.github.nihildigit.pikpak
 
-import io.github.nihildigit.pikpak.internal.TransferScheduler
 import io.github.nihildigit.pikpak.internal.ReadTelemetry
+import io.github.nihildigit.pikpak.internal.TransferScheduler
 import io.github.nihildigit.pikpak.internal.TransportMemoryBudget
 import io.ktor.utils.io.ByteChannel
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.writeFully
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.test.runCurrent
-import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -50,11 +50,23 @@ class BlockCacheStreamingTest {
         assertEquals(expected, (0 until slots.size).map { slots[it] })
         assertEquals(expected.size, slots.size)
     }
-    private fun cache(source: RangeSource, store: BlockStore? = null,
-                      timeSource: kotlin.time.TimeSource = kotlin.time.TimeSource.Monotonic) = BlockCache(
-        source, size = 256, concurrency = 1, parentCoroutineContext = EmptyCoroutineContext,
-        foregroundStreams = null, store = store, blockSize = 64, readAheadBytes = 192,
-        memoryCapBytes = 512, wideBlockThresholdBytes = 1, timeSource = timeSource,
+
+    private fun cache(
+        source: RangeSource,
+        store: BlockStore? = null,
+        timeSource: kotlin.time.TimeSource = kotlin.time.TimeSource.Monotonic,
+    ) = BlockCache(
+        source,
+        size = 256,
+        concurrency = 1,
+        parentCoroutineContext = EmptyCoroutineContext,
+        foregroundStreams = null,
+        store = store,
+        blockSize = 64,
+        readAheadBytes = 192,
+        memoryCapBytes = 512,
+        wideBlockThresholdBytes = 1,
+        timeSource = timeSource,
     )
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -63,17 +75,29 @@ class BlockCacheStreamingTest {
         val channel = ByteChannel(autoFlush = true)
         val budget = TransportMemoryBudget(64)
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T = block(channel)
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T = block(channel)
         }
-        val cache = BlockCache(source, 64, 1, coroutineContext, null,
-            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512,
-            memoryBudget = budget)
-        val cursor = cache.openCursor(StreamRole.BACKGROUND)
-        cache.setReadAhead(cursor, 0)
+        val cache = BlockCache(
+            source,
+            64,
+            1,
+            coroutineContext,
+            null,
+            blockSize = 64,
+            readAheadBytes = 192,
+            memoryCapBytes = 512,
+            memoryBudget = budget,
+        )
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
+        val ticket = cache.beginRead(owner, 0L)
         try {
             repeat(32) {
-                val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
+                val read = async { ticket.readSome(ByteArray(1), 0, 1) }
                 runCurrent()
                 channel.writeFully(byteArrayOf(it.toByte()))
                 runCurrent()
@@ -85,11 +109,12 @@ class BlockCacheStreamingTest {
             runCurrent()
             val sweeps = cache.ownershipSweepsForTest()
             repeat(32) {
-                assertEquals(1, cache.read(cursor, ByteArray(1), 0, 1))
+                assertEquals(1, ticket.readSome(ByteArray(1), 0, 1))
                 assertEquals(sweeps, cache.ownershipSweepsForTest(), "LRU hits do not drop ownership")
             }
             assertEquals(64L, budget.usedBytes)
         } finally {
+            owner.close()
             cache.close()
             cache.awaitClosedForTest()
         }
@@ -101,8 +126,12 @@ class BlockCacheStreamingTest {
         val firstDelivered = CompletableDeferred<Unit>()
         val releaseSuffix = CompletableDeferred<Unit>()
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T = coroutineScope {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T = coroutineScope {
                 if (start != 64L || length < 128L) return@coroutineScope block(ByteReadChannel(ByteArray(length.toInt())))
                 val channel = ByteChannel(autoFlush = true)
                 val writer = launch {
@@ -112,21 +141,27 @@ class BlockCacheStreamingTest {
                     channel.writeFully(ByteArray((length - 64).toInt()))
                     channel.close()
                 }
-                try { block(channel) } finally { writer.cancel() }
+                try {
+                    block(channel)
+                } finally {
+                    writer.cancel()
+                }
             }
         }
         val cache = cache(source)
-        val cursor = cache.openCursor(StreamRole.FOREGROUND)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING))
         try {
             // The first cached slot makes the next claim a standalone two-slot fetch.
             cache.warm(listOf(0L..63L), StreamRole.BACKGROUND, null).await()
-            assertEquals(1, cache.read(cursor, ByteArray(1), 0, 1))
+            val t0 = cache.beginRead(owner, 0L)
+            assertEquals(1, t0.readSome(ByteArray(1), 0, 1))
             withTimeout(3000) { firstDelivered.await() }
-            cache.seek(cursor, 64)
-            assertEquals(64, withTimeout(1000) { cache.read(cursor, ByteArray(64), 0, 64) })
+            val t1 = cache.beginRead(owner, 64L)
+            assertEquals(64, withTimeout(1000) { t1.readSome(ByteArray(64), 0, 64) })
             assertFalse(releaseSuffix.isCompleted)
         } finally {
             releaseSuffix.complete(Unit)
+            owner.close()
             cache.close()
         }
     }
@@ -136,33 +171,37 @@ class BlockCacheStreamingTest {
         val source = FakeRangeSource(ByteArray(256))
         val scheduler = TransferScheduler(16, 8, BandwidthLimiter(), concurrencyMode = ConcurrencyMode.Fixed(8))
         val bg = scheduler.register(8) {}
-        scheduler.update(bg, false, false, true)
         val cache = BlockCache(
-            source, size = 256, concurrency = 1, parentCoroutineContext = EmptyCoroutineContext,
-            foregroundStreams = null, blockSize = 64, readAheadBytes = 192,
-            memoryCapBytes = 512, wideBlockThresholdBytes = 1, scheduler = scheduler,
+            source,
+            size = 256,
+            concurrency = 1,
+            parentCoroutineContext = EmptyCoroutineContext,
+            foregroundStreams = null,
+            blockSize = 64,
+            readAheadBytes = 192,
+            memoryCapBytes = 512,
+            wideBlockThresholdBytes = 1,
+            scheduler = scheduler,
         )
-        val cursor = cache.openCursor(StreamRole.FOREGROUND)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
-            cache.setReadAhead(cursor, 0)
-            assertEquals(0L, cursor.readAhead)
-            assertEquals(1, withTimeout(1000) { cache.read(cursor, ByteArray(1), 0, 1) })
+            val ticket = cache.beginRead(owner, 0L)
+            assertEquals(1, withTimeout(1000) { ticket.readSome(ByteArray(1), 0, 1) })
             delay(100)
             assertEquals(listOf(0L), source.requests().map { it.start })
             assertEquals(listOf(64L), source.requests().map { it.length })
             assertEquals(0, cache.inFlightSlotsForTest())
-            // Freezing readAhead at 0 immediately releases foreground demand after read() returns.
-            assertEquals(8, scheduler.workersFor(bg, true))
+            assertEquals(8, scheduler.connectionAllowanceFor(bg))
         } finally {
+            owner.close()
             cache.close()
             scheduler.unregister(bg)
         }
     }
 
     @Test
-    fun `hunger truncates a wide durable tail after the next complete slot`() = runBlocking<Unit> {
+    fun `blocking tail preempts a wide durable range without downloading unwanted middle`() = runBlocking<Unit> {
         val release = CompletableDeferred<Unit>()
-        val returned = CompletableDeferred<Unit>()
         val requested = CompletableDeferred<Long>()
         val limiter = BandwidthLimiter()
         val scheduler = TransferScheduler(8, 8, limiter)
@@ -170,19 +209,27 @@ class BlockCacheStreamingTest {
             val mutex = Mutex()
             val blocks = mutableMapOf<Long, ByteArray>()
             override suspend fun read(file: String, offset: Long, length: Int): ByteArray? = mutex.withLock { blocks[offset] }
-            override suspend fun write(file: String, offset: Long, bytes: ByteArray) { mutex.withLock { blocks[offset] = bytes } }
+            override suspend fun write(file: String, offset: Long, bytes: ByteArray) {
+                mutex.withLock { blocks[offset] = bytes }
+            }
             override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
         }
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T = coroutineScope {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T = coroutineScope {
                 currentCoroutineContext()[ReadTelemetry]?.apply {
                     attempts = 1
                     deliveredBytes = length
                     networkDuration = 100.milliseconds
                     timeToFirstByte = 20.milliseconds
                 }
-                if (start != 64L) return@coroutineScope block(ByteReadChannel(ByteArray(length.toInt())))
+                if (start != 64L || requested.isCompleted) {
+                    return@coroutineScope block(ByteReadChannel(ByteArray(length.toInt())))
+                }
                 requested.complete(length)
                 val channel = ByteChannel(autoFlush = true)
                 val writer = launch {
@@ -191,32 +238,49 @@ class BlockCacheStreamingTest {
                     channel.writeFully(ByteArray(64))
                     awaitCancellation()
                 }
-                try { block(channel) } finally { writer.cancel(); returned.complete(Unit) }
+                try {
+                    block(channel)
+                } finally {
+                    writer.cancel()
+                }
             }
         }
-        val cache = BlockCache(source, 1024, 1, EmptyCoroutineContext, null, store,
-            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512,
-            wideBlockThresholdBytes = 1, scheduler = scheduler)
+        val cache = BlockCache(
+            source,
+            1024,
+            1,
+            EmptyCoroutineContext,
+            null,
+            store,
+            blockSize = 64,
+            readAheadBytes = 192,
+            memoryCapBytes = 512,
+            wideBlockThresholdBytes = 1,
+            scheduler = scheduler,
+        )
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
             cache.warm(listOf(0L..63L), StreamRole.BACKGROUND, null, durable = true).await()
             val download = cache.warm(listOf(64L..1023L), StreamRole.BACKGROUND, null, durable = true)
             assertTrue(withTimeout(3000) { requested.await() } >= 128L)
             withTimeout(1000) { while (cache.deliveredBytes < 128) delay(5) }
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
-            cache.seek(cursor, 128)
-            val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
-            withTimeout(1000) { while (!cursor.reading) delay(5) }
+            val ticket = cache.beginRead(owner, 128L)
+            val read = async { ticket.readSome(ByteArray(1), 0, 1) }
             delay(20)
             release.complete(Unit)
-            withTimeout(1000) { returned.await() }
             assertEquals(1, withTimeout(1000) { read.await() })
+            ticket.endRead(allowFinishInFlight = false)
+            owner.close()
             withTimeout(3000) { download.await() }
-        } finally { release.complete(Unit); cache.close() }
+        } finally {
+            release.complete(Unit)
+            owner.close()
+            cache.close()
+        }
     }
 
     @Test
-    fun `a playback cursor bypasses a durable fetch waiting for limiter tokens`() = runBlocking<Unit> {
+    fun `a playback ticket bypasses a durable fetch waiting for limiter tokens`() = runBlocking<Unit> {
         val limiter = BandwidthLimiter(1)
         limiter.acquire(1000)
         val scheduler = TransferScheduler(8, 8, limiter)
@@ -226,19 +290,33 @@ class BlockCacheStreamingTest {
             override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
         }
         val source = FakeRangeSource(ByteArray(256))
-        val cache = BlockCache(source, 256, 1, EmptyCoroutineContext, null, store,
-            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512,
-            wideBlockThresholdBytes = 1, scheduler = scheduler, downloadLimiter = limiter)
+        val cache = BlockCache(
+            source,
+            256,
+            1,
+            EmptyCoroutineContext,
+            null,
+            store,
+            blockSize = 64,
+            readAheadBytes = 192,
+            memoryCapBytes = 512,
+            wideBlockThresholdBytes = 1,
+            scheduler = scheduler,
+            downloadLimiter = limiter,
+        )
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
             val download = cache.warm(listOf(0L..63L), StreamRole.BACKGROUND, null, durable = true)
             withTimeout(3000) { while (cache.inFlightSlotsForTest() == 0) delay(5) }
             delay(50)
             assertTrue(source.requests().isEmpty())
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
-            assertEquals(1, withTimeout(1000) { cache.read(cursor, ByteArray(1), 0, 1) })
+            val ticket = cache.beginRead(owner, 0L)
+            assertEquals(1, withTimeout(1000) { ticket.readSome(ByteArray(1), 0, 1) })
             withTimeout(1000) { download.await() }
-        } finally { cache.close() }
+        } finally {
+            owner.close()
+            cache.close()
+        }
     }
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -252,24 +330,42 @@ class BlockCacheStreamingTest {
             override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
         }
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
                 requests++
                 return block(ByteReadChannel(ByteArray(length.toInt())))
             }
         }
-        val cache = BlockCache(source, 256, 1, coroutineContext, null, store,
-            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512,
-            downloadLimiter = limiter, timeSource = testScheduler.timeSource)
+        val cache = BlockCache(
+            source,
+            256,
+            1,
+            coroutineContext,
+            null,
+            store,
+            blockSize = 64,
+            readAheadBytes = 192,
+            memoryCapBytes = 512,
+            downloadLimiter = limiter,
+            timeSource = testScheduler.timeSource,
+        )
+        val owner = TransferDemand(
+            ConsumerIntent(
+                service = ServiceIntent.PLAYING,
+                bufferBudget = BufferBudget(maxReadAheadBytes = 63),
+            ),
+        )
         try {
             val download = cache.warm(listOf(0L..127L), StreamRole.BACKGROUND, null, durable = true)
             runCurrent()
             assertEquals(64L, cache.deliveredBytes)
             assertFalse(download.isCompleted)
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 63)
-            cache.seek(cursor, 64)
-            val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
+            val ticket = cache.beginRead(owner, 64L)
+            val read = async { ticket.readSome(ByteArray(1), 0, 1) }
             runCurrent()
             assertTrue(read.isCompleted, "promotion must bypass tokens without advancing time")
             assertEquals(1, read.await())
@@ -277,6 +373,7 @@ class BlockCacheStreamingTest {
             assertEquals(1, requests, "the original multi-block transport remains owned")
             assertEquals(0L, testScheduler.currentTime)
         } finally {
+            owner.close()
             cache.close()
             cache.awaitClosedForTest()
         }
@@ -294,22 +391,31 @@ class BlockCacheStreamingTest {
                 override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
             }
             val source = object : RangeSource {
-                override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                             block: suspend (ByteReadChannel) -> T): T {
+                override suspend fun <T> read(
+                    start: Long,
+                    length: Long,
+                    priority: Int,
+                    block: suspend (ByteReadChannel) -> T,
+                ): T {
                     val telemetry = currentCoroutineContext()[ReadTelemetry]!!
                     observed = telemetry
                     val started = testScheduler.timeSource.markNow()
                     delay(10)
                     try {
                         return coroutineScope {
-                            // Model an actual pump wait overlapping the block's token wait;
-                            // a cumulative sinkWait alone establishes no interval overlap.
                             val sink = launch {
                                 telemetry.beginSinkWait()
-                                try { delay(sinkWait) } finally { telemetry.endSinkWait() }
+                                try {
+                                    delay(sinkWait)
+                                } finally {
+                                    telemetry.endSinkWait()
+                                }
                             }
-                            try { block(ByteReadChannel(ByteArray(length.toInt()))) }
-                            finally { sink.cancelAndJoin() }
+                            try {
+                                block(ByteReadChannel(ByteArray(length.toInt())))
+                            } finally {
+                                sink.cancelAndJoin()
+                            }
                         }
                     } finally {
                         telemetry.attempts = 1
@@ -320,9 +426,19 @@ class BlockCacheStreamingTest {
                     }
                 }
             }
-            val cache = BlockCache(source, 256, 1, coroutineContext, null, store,
-                blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512,
-                downloadLimiter = limiter, timeSource = testScheduler.timeSource)
+            val cache = BlockCache(
+                source,
+                256,
+                1,
+                coroutineContext,
+                null,
+                store,
+                blockSize = 64,
+                readAheadBytes = 192,
+                memoryCapBytes = 512,
+                downloadLimiter = limiter,
+                timeSource = testScheduler.timeSource,
+            )
             try {
                 cache.warm(listOf(0L..127L), StreamRole.BACKGROUND, null, durable = true).await()
                 runCurrent()
@@ -335,35 +451,50 @@ class BlockCacheStreamingTest {
     }
 
     @Test
-    fun `only cached contiguous bytes make the foreground buffer comfortable`() = runBlocking<Unit> {
-        val limiter = BandwidthLimiter()
-        val scheduler = TransferScheduler(16, 8, limiter, concurrencyMode = ConcurrencyMode.Fixed(8))
-        val background = scheduler.register(8) {}
-        scheduler.update(background, false, false, true)
+    fun `only cached contiguous bytes count toward near window commitment`() = runBlocking<Unit> {
         val release = CompletableDeferred<Unit>()
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
                 if (start > 0) release.await()
                 return block(ByteReadChannel(ByteArray(length.toInt())))
             }
         }
-        val cache = BlockCache(source, 256, 2, EmptyCoroutineContext, null,
-            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512,
-            wideBlockThresholdBytes = 1, scheduler = scheduler, mediaBytesPerSecond = 16)
+        val cache = BlockCache(
+            source,
+            256,
+            2,
+            EmptyCoroutineContext,
+            null,
+            blockSize = 64,
+            readAheadBytes = 192,
+            memoryCapBytes = 512,
+            wideBlockThresholdBytes = 128,
+            mediaBytesPerSecond = 16,
+        )
+        val owner = TransferDemand(
+            ConsumerIntent(
+                service = ServiceIntent.PLAYING,
+                bufferBudget = BufferBudget(maxReadAheadBytes = 128),
+            ),
+        )
         try {
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 128) // Two workers each claim one slot in this small window.
-            assertEquals(1, withTimeout(1000) { cache.read(cursor, ByteArray(1), 0, 1) })
+            val ticket = cache.beginRead(owner, 0L)
+            assertEquals(1, withTimeout(1000) { ticket.readSome(ByteArray(1), 0, 1) })
             withTimeout(1000) { while (cache.inFlightSlotsForTest() == 0) delay(5) }
-            // 63 ready bytes are below the 4-second entry cushion; reserved slots do not count.
-            assertEquals(8, scheduler.workersFor(background, true))
+            val plan = cache.planForTest()
+            assertFalse(plan.lookAhead.single().nearReady, "in-flight slots do not mark near window ready")
             release.complete(Unit)
-            withTimeout(3000) { while (scheduler.workersFor(background, true) != 8) delay(5) }
+            withTimeout(3000) { while (cache.inFlightSlotsForTest() != 0) delay(5) }
+            assertTrue(cache.planForTest().lookAhead.single().nearReady)
         } finally {
             release.complete(Unit)
+            owner.close()
             cache.close()
-            scheduler.unregister(background)
         }
     }
 
@@ -371,26 +502,40 @@ class BlockCacheStreamingTest {
     fun `optional queued arrays keep ownership after cache eviction`() = runBlocking<Unit> {
         val store = object : DurableBlockStore {
             override suspend fun read(file: String, offset: Long, length: Int): ByteArray? = null
-            override suspend fun write(file: String, offset: Long, bytes: ByteArray) { awaitCancellation() }
+            override suspend fun write(file: String, offset: Long, bytes: ByteArray) {
+                awaitCancellation()
+            }
             override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
         }
-        val cache = BlockCache(FakeRangeSource(ByteArray(1024)), 1024, 1, EmptyCoroutineContext, null, store,
-            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512, wideBlockThresholdBytes = 1)
+        val cache = BlockCache(
+            FakeRangeSource(ByteArray(1024)),
+            1024,
+            1,
+            EmptyCoroutineContext,
+            null,
+            store,
+            blockSize = 64,
+            readAheadBytes = 192,
+            memoryCapBytes = 512,
+            wideBlockThresholdBytes = 1,
+        )
+        val owners = mutableListOf<TransferDemand>()
         try {
             withTimeout(3000) { cache.warm(listOf(0L..511L), StreamRole.BACKGROUND, null).await() }
-            // Cover every cached slot except zero. Filling slot eight evicts zero while its
-            // optional store write still owns the bytes, then leaves all 512 bytes pinned.
+            // Cover every cached slot except zero across distinct owners.
             for (position in listOf(64L, 256L, 448L)) {
-                val cursor = cache.openCursor(StreamRole.BACKGROUND)
-                cursor.consuming = true
-                cache.seek(cursor, position)
+                val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING, bufferBudget = BufferBudget(maxReadAheadBytes = 192)))
+                owners += owner
+                cache.beginRead(owner, position)
             }
             val more = cache.warm(listOf(512L..575L), StreamRole.BACKGROUND, null)
             delay(100)
-            // Eviction does not mint new credits while an optional writer still owns the array.
             assertFalse(more.isCompleted)
             assertEquals(512L, cache.accountedBytesForTest())
-        } finally { cache.close() }
+        } finally {
+            owners.forEach { it.close() }
+            cache.close()
+        }
     }
 
     @Test
@@ -412,7 +557,9 @@ class BlockCacheStreamingTest {
             withTimeout(1000) { cache.awaitClosedForTest() }
             assertEquals(0L, cache.accountedBytesForTest())
             assertTrue(cache.optionalWriteQueueEmptyForTest())
-        } finally { cache.close() }
+        } finally {
+            cache.close()
+        }
     }
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -423,11 +570,16 @@ class BlockCacheStreamingTest {
         val releaseCleanup = CompletableDeferred<Unit>()
         val budget = TransportMemoryBudget(64)
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
                 entered.complete(Unit)
-                try { awaitCancellation() }
-                finally {
+                try {
+                    awaitCancellation()
+                } finally {
                     withContext(NonCancellable) {
                         cleaning.complete(Unit)
                         releaseCleanup.await()
@@ -435,9 +587,18 @@ class BlockCacheStreamingTest {
                 }
             }
         }
-        val cache = BlockCache(source, 256, 1, coroutineContext, null,
-            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512,
-            wideBlockThresholdBytes = 1, memoryBudget = budget)
+        val cache = BlockCache(
+            source,
+            256,
+            1,
+            coroutineContext,
+            null,
+            blockSize = 64,
+            readAheadBytes = 192,
+            memoryCapBytes = 512,
+            wideBlockThresholdBytes = 1,
+            memoryBudget = budget,
+        )
         try {
             cache.warm(listOf(0L..63L), StreamRole.BACKGROUND, null)
             entered.await()
@@ -467,8 +628,12 @@ class BlockCacheStreamingTest {
             override suspend fun read(file: String, offset: Long, length: Int): ByteArray? = null
             override suspend fun write(file: String, offset: Long, bytes: ByteArray) {
                 entered.complete(Unit)
-                try { awaitCancellation() }
-                catch (e: CancellationException) { cancelled.complete(Unit); throw e }
+                try {
+                    awaitCancellation()
+                } catch (e: CancellationException) {
+                    cancelled.complete(Unit)
+                    throw e
+                }
             }
             override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
         }
@@ -481,7 +646,9 @@ class BlockCacheStreamingTest {
             cache.close()
             withTimeout(1000) { cancelled.await() }
             withTimeout(1000) { while (cache.accountedBytesForTest() != 0L) delay(5) }
-        } finally { cache.close() }
+        } finally {
+            cache.close()
+        }
     }
 
     @Test
@@ -489,18 +656,28 @@ class BlockCacheStreamingTest {
         val persisted = CompletableDeferred<Long>()
         val store = object : DurableBlockStore {
             override suspend fun read(file: String, offset: Long, length: Int): ByteArray? = null
-            override suspend fun write(file: String, offset: Long, bytes: ByteArray) { persisted.complete(offset) }
+            override suspend fun write(file: String, offset: Long, bytes: ByteArray) {
+                persisted.complete(offset)
+            }
             override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
         }
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T = coroutineScope {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T = coroutineScope {
                 val channel = ByteChannel(autoFlush = true)
                 val writer = launch {
                     channel.writeFully(ByteArray(64))
                     awaitCancellation()
                 }
-                try { block(channel) } finally { writer.cancel() }
+                try {
+                    block(channel)
+                } finally {
+                    writer.cancel()
+                }
             }
         }
         val cache = cache(source, store)
@@ -510,7 +687,9 @@ class BlockCacheStreamingTest {
             download.cancelAndJoin()
             assertEquals(0L, withTimeout(3000) { persisted.await() })
             withTimeout(3000) { while (cache.inFlightSlotsForTest() != 0) delay(5) }
-        } finally { cache.close() }
+        } finally {
+            cache.close()
+        }
     }
 
     @Test
@@ -518,8 +697,12 @@ class BlockCacheStreamingTest {
         val release = CompletableDeferred<Unit>()
         val prefixSent = CompletableDeferred<Unit>()
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T = coroutineScope {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T = coroutineScope {
                 val channel = ByteChannel(autoFlush = true)
                 val writer = launch {
                     channel.writeFully(byteArrayOf(1, 2, 3, 4))
@@ -528,30 +711,42 @@ class BlockCacheStreamingTest {
                     channel.writeFully(ByteArray((length - 4).toInt()) { 9 })
                     channel.close()
                 }
-                try { block(channel) } finally { withContext(NonCancellable) { writer.cancelAndJoin() } }
+                try {
+                    block(channel)
+                } finally {
+                    withContext(NonCancellable) { writer.cancelAndJoin() }
+                }
             }
         }
         val cache = cache(source)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
+            val ticket = cache.beginRead(owner, 0L)
             val bytes = ByteArray(64)
-            val read = async { cache.read(cursor, bytes, 0, bytes.size) }
+            val read = async { ticket.readSome(bytes, 0, bytes.size) }
             withTimeout(1000) { prefixSent.await() }
             assertEquals(4, withTimeout(1000) { read.await() })
             assertEquals(listOf<Byte>(1, 2, 3, 4), bytes.take(4))
             release.complete(Unit)
-            assertEquals(60, withTimeout(1000) { cache.read(cursor, ByteArray(64), 0, 64) })
+            assertEquals(60, withTimeout(1000) { ticket.readSome(ByteArray(64), 0, 64) })
             assertEquals(listOf<Byte>(1, 2, 3, 4), bytes.take(4))
-        } finally { release.complete(Unit); cache.close() }
+        } finally {
+            release.complete(Unit)
+            owner.close()
+            cache.close()
+        }
     }
 
     @Test
     fun `a consumed partial prefix stays read after publication and buffer reuse`() = runBlocking<Unit> {
         val release = CompletableDeferred<Unit>()
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T = coroutineScope {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T = coroutineScope {
                 if (start != 0L) return@coroutineScope block(ByteReadChannel(ByteArray(length.toInt())))
                 val channel = ByteChannel(autoFlush = true)
                 val writer = launch {
@@ -560,28 +755,45 @@ class BlockCacheStreamingTest {
                     channel.writeFully(ByteArray((length - 4).toInt()))
                     channel.close()
                 }
-                try { block(channel) } finally { withContext(NonCancellable) { writer.cancelAndJoin() } }
+                try {
+                    block(channel)
+                } finally {
+                    withContext(NonCancellable) { writer.cancelAndJoin() }
+                }
             }
         }
         val budget = TransportMemoryBudget(64)
-        val cache = BlockCache(source, 256, 1, EmptyCoroutineContext, null,
-            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512,
-            wideBlockThresholdBytes = 1, memoryBudget = budget)
+        val cache = BlockCache(
+            source,
+            256,
+            1,
+            EmptyCoroutineContext,
+            null,
+            blockSize = 64,
+            readAheadBytes = 192,
+            memoryCapBytes = 512,
+            wideBlockThresholdBytes = 1,
+            memoryBudget = budget,
+        )
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
+            val ticket = cache.beginRead(owner, 0L)
             val bytes = ByteArray(64)
-            assertEquals(4, withTimeout(1000) { cache.read(cursor, bytes, 0, bytes.size) })
+            assertEquals(4, withTimeout(1000) { ticket.readSome(bytes, 0, bytes.size) })
             assertEquals(listOf<Byte>(1, 2, 3, 4), bytes.take(4))
+            ticket.endRead(allowFinishInFlight = true)
             release.complete(Unit)
             withTimeout(1000) { while (cache.deliveredBytes != 64L) delay(1) }
-            cache.closeCursor(cursor)
+            owner.close()
             withTimeout(1000) { cache.warm(listOf(64L..191L), StreamRole.BACKGROUND, null).await() }
-            // Slot zero was consumed before publication. Slot one was not consumed and
-            // must still count when the same multi-slot fetch advances to slot two.
+            // Slot zero was consumed before publication; slot one was not consumed and counts when slot two evicts it.
             assertEquals(64L, cache.wastedBytes)
             assertEquals(64L, budget.peakBytes)
-        } finally { release.complete(Unit); cache.close() }
+        } finally {
+            release.complete(Unit)
+            owner.close()
+            cache.close()
+        }
     }
 
     @Test
@@ -590,12 +802,18 @@ class BlockCacheStreamingTest {
         val persisted = CompletableDeferred<Long>()
         val store = object : DurableBlockStore {
             override suspend fun read(file: String, offset: Long, length: Int): ByteArray? = null
-            override suspend fun write(file: String, offset: Long, bytes: ByteArray) { persisted.complete(offset) }
+            override suspend fun write(file: String, offset: Long, bytes: ByteArray) {
+                persisted.complete(offset)
+            }
             override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
         }
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T = coroutineScope {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T = coroutineScope {
                 val channel = ByteChannel(autoFlush = true)
                 val writer = launch {
                     channel.writeFully(ByteArray(64))
@@ -603,7 +821,11 @@ class BlockCacheStreamingTest {
                     channel.writeFully(ByteArray((length - 64).toInt()))
                     channel.close()
                 }
-                try { block(channel) } finally { withContext(NonCancellable) { writer.cancelAndJoin() } }
+                try {
+                    block(channel)
+                } finally {
+                    withContext(NonCancellable) { writer.cancelAndJoin() }
+                }
             }
         }
         val cache = cache(source, store)
@@ -613,7 +835,10 @@ class BlockCacheStreamingTest {
             assertFalse(warm.isCompleted)
             suffix.complete(Unit)
             withTimeout(1000) { warm.await() }
-        } finally { suffix.complete(Unit); cache.close() }
+        } finally {
+            suffix.complete(Unit)
+            cache.close()
+        }
     }
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -638,13 +863,15 @@ class BlockCacheStreamingTest {
             override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
         }
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T = coroutineScope {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T = coroutineScope {
                 requests += start to length
                 active++
                 peak = maxOf(peak, active)
-                // A clean fast observation teaches long ranges. The next connection is
-                // slower; scheduling must recover without knowing which host it represents.
                 val slow = start != 0L && slowRange == null
                 if (slow) slowRange = start until start + length
                 val channel = ByteChannel(autoFlush = true)
@@ -661,11 +888,13 @@ class BlockCacheStreamingTest {
                 }
                 try {
                     val result = block(channel)
-                    if (start == 0L) currentCoroutineContext()[ReadTelemetry]?.apply {
-                        attempts = 1
-                        deliveredBytes = length
-                        timeToFirstByte = 10.milliseconds
-                        networkDuration = 11.milliseconds
+                    if (start == 0L) {
+                        currentCoroutineContext()[ReadTelemetry]?.apply {
+                            attempts = 1
+                            deliveredBytes = length
+                            timeToFirstByte = 10.milliseconds
+                            networkDuration = 11.milliseconds
+                        }
                     }
                     result
                 } finally {
@@ -677,13 +906,22 @@ class BlockCacheStreamingTest {
             }
         }
         val scheduler = TransferScheduler(8, 8, BandwidthLimiter(), testScheduler.timeSource)
-        val cache = BlockCache(source, size, 8, coroutineContext, null, store,
-            blockSize = blockSize, readAheadBytes = 192, memoryCapBytes = 2048,
-            wideBlockThresholdBytes = 1, scheduler = scheduler, timeSource = testScheduler.timeSource)
+        val cache = BlockCache(
+            source,
+            size,
+            8,
+            coroutineContext,
+            null,
+            store,
+            blockSize = blockSize,
+            readAheadBytes = 192,
+            memoryCapBytes = 2048,
+            wideBlockThresholdBytes = 1,
+            scheduler = scheduler,
+            timeSource = testScheduler.timeSource,
+        )
         try {
             cache.warm(listOf(0L until blockSize), StreamRole.BACKGROUND, null, durable = true).await()
-            // A durable waiter completes at commit; the transport's completion sample
-            // follows when the enclosing request and its cleanup have returned.
             runCurrent()
             val download = cache.warm(listOf(blockSize until size), StreamRole.BACKGROUND, null, durable = true)
             runCurrent()
@@ -692,8 +930,10 @@ class BlockCacheStreamingTest {
             advanceTimeBy(50)
             runCurrent()
             assertFalse(slowFinished, "the slow request is still receiving its first block")
-            assertFalse(requests.any { (start, _) -> start > original.first && start in original },
-                "unread transport buffers still belong to the issued request")
+            assertFalse(
+                requests.any { (start, _) -> start > original.first && start in original },
+                "unread transport buffers still belong to the issued request",
+            )
             assertTrue(writes.keys.any { it > original.last }, "independent ranges can finish")
             assertEquals(1, requests.count { it.first == original.first }, "the partially read block stays owned")
             download.await()
@@ -712,8 +952,12 @@ class BlockCacheStreamingTest {
     fun `a hundred GiB warm stores ranges rather than per block claims`() = runBlocking<Unit> {
         val entered = CompletableDeferred<Unit>()
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
                 entered.complete(Unit)
                 awaitCancellation()
             }
@@ -725,8 +969,15 @@ class BlockCacheStreamingTest {
         }
         val size = 100L * 1024 * 1024 * 1024
         val budget = TransportMemoryBudget(1024 * 1024)
-        val cache = BlockCache(source, size, 1, EmptyCoroutineContext, null, store,
-            memoryBudget = budget)
+        val cache = BlockCache(
+            source,
+            size,
+            1,
+            EmptyCoroutineContext,
+            null,
+            store,
+            memoryBudget = budget,
+        )
         try {
             cache.warm(listOf(0L until size), StreamRole.BACKGROUND, null, durable = true)
             withTimeout(3000) { entered.await() }
@@ -741,9 +992,18 @@ class BlockCacheStreamingTest {
     @Test
     fun `shared budget reclaims idle cache ownership for another file`() = runBlocking<Unit> {
         val budget = TransportMemoryBudget(64)
-        fun newCache() = BlockCache(FakeRangeSource(ByteArray(256)), 256, 1,
-            EmptyCoroutineContext, null, blockSize = 64, readAheadBytes = 192,
-            memoryCapBytes = 512, wideBlockThresholdBytes = 1, memoryBudget = budget)
+        fun newCache() = BlockCache(
+            FakeRangeSource(ByteArray(256)),
+            256,
+            1,
+            EmptyCoroutineContext,
+            null,
+            blockSize = 64,
+            readAheadBytes = 192,
+            memoryCapBytes = 512,
+            wideBlockThresholdBytes = 1,
+            memoryBudget = budget,
+        )
         val first = newCache()
         val second = newCache()
         try {
@@ -769,37 +1029,61 @@ class BlockCacheStreamingTest {
         val requests = mutableListOf<Pair<Long, Long>>()
         var cancelled = 0
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
                 requests += start to length
-                try { awaitCancellation() } finally { cancelled++ }
+                try {
+                    awaitCancellation()
+                } finally {
+                    cancelled++
+                }
             }
         }
         val scheduler = TransferScheduler(4, 4, BandwidthLimiter(), testScheduler.timeSource)
-        val cache = BlockCache(source, 256 * slotBytes, 4, coroutineContext, null,
-            blockSize = slotBytes, readAheadBytes = 64 * slotBytes, memoryCapBytes = 80 * slotBytes,
-            scheduler = scheduler, timeSource = testScheduler.timeSource, memoryBudget = budget)
-        val cursor = cache.openCursor(StreamRole.FOREGROUND)
+        val cache = BlockCache(
+            source,
+            256 * slotBytes,
+            4,
+            coroutineContext,
+            null,
+            blockSize = slotBytes,
+            readAheadBytes = 64 * slotBytes,
+            memoryCapBytes = 80 * slotBytes,
+            scheduler = scheduler,
+            timeSource = testScheduler.timeSource,
+            memoryBudget = budget,
+        )
+        val owner = TransferDemand(ConsumerIntent(epoch = 0L, service = ServiceIntent.WAITING))
         try {
-            for (head in listOf(0L, 128 * slotBytes)) {
-                cache.setUrgent(cursor, true)
-                cache.seek(cursor, head)
-                val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
+            for ((idx, head) in listOf(0L, 128 * slotBytes).withIndex()) {
+                if (idx > 0) owner.submitIntent(ConsumerIntent(epoch = idx.toLong(), service = ServiceIntent.WAITING))
+                val ticket = cache.beginRead(owner, head)
+                val read = async { ticket.readSome(ByteArray(1), 0, 1) }
                 runCurrent()
                 val wave = requests.filter { it.first >= head }
                 assertEquals(1, wave.size)
                 assertEquals(head, wave.single().first)
-                assertEquals(1L, wave.single().second / slotBytes,
-                    "blocking head uses a single slot so CDN burst edges finish head immediately")
+                assertEquals(
+                    1L,
+                    wave.single().second / slotBytes,
+                    "blocking head uses a single slot so CDN burst edges finish head immediately",
+                )
                 advanceTimeBy(1000)
                 runCurrent()
                 assertEquals(1, requests.count { it.first >= head }, "startup has no speculative suffix before its first block")
                 assertFalse(read.isCompleted)
                 assertEquals(slotBytes, budget.usedBytes)
                 read.cancelAndJoin()
+                ticket.endRead(allowFinishInFlight = false)
+                runCurrent()
+                assertEquals(idx + 1, cancelled, "seek/release cancels the obsolete head")
             }
-            assertEquals(1, cancelled, "seek cancels the obsolete head")
         } finally {
+            owner.close()
             cache.close()
             cache.awaitClosedForTest()
         }
@@ -809,40 +1093,61 @@ class BlockCacheStreamingTest {
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     @Test
-    fun `inactive cursor withdraws in-flight speculation but retains cached head and position`() = runTest {
+    fun `withdrawing speculation cancels in-flight lookahead in 0ms while retaining cached head and position`() = runTest {
         var requests = 0
         var cancellations = 0
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
                 requests++
                 if (start > 0) {
-                    try { awaitCancellation() } finally { cancellations++ }
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        cancellations++
+                    }
                 }
                 return block(ByteReadChannel(ByteArray(length.toInt()) { 7 }))
             }
         }
-        val cache = BlockCache(source, 4096, 1, coroutineContext, null,
-            blockSize = 64, readAheadBytes = 512, memoryCapBytes = 1024)
-        val cursor = cache.openCursor(StreamRole.FOREGROUND)
+        val cache = BlockCache(
+            source,
+            4096,
+            1,
+            coroutineContext,
+            null,
+            blockSize = 64,
+            readAheadBytes = 512,
+            memoryCapBytes = 1024,
+        )
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING))
+        val ticket = cache.beginRead(owner, 0L)
         try {
-            val first = async { cache.read(cursor, ByteArray(1), 0, 1) }
+            val first = async { ticket.readSome(ByteArray(1), 0, 1) }
             runCurrent()
             assertEquals(1, first.await())
             assertEquals(2, requests)
-            val position = cursor.position
+            val position = ticket.position
             val cached = cache.cachedBytesForTest()
-            cache.setDemandActive(cursor, false)
+            owner.withdrawSpeculation()
             runCurrent()
             assertEquals(1, cancellations)
             assertEquals(0, cache.inFlightSlotsForTest())
-            assertEquals(position, cursor.position)
+            assertEquals(position, ticket.position)
             assertEquals(cached, cache.cachedBytesForTest())
             assertEquals(2, requests)
-            cache.setDemandActive(cursor, true)
+            assertEquals(1, ticket.readSome(ByteArray(1), 0, 1))
             runCurrent()
             assertEquals(3, requests)
-        } finally { cache.close(); cache.awaitClosedForTest() }
+        } finally {
+            owner.close()
+            cache.close()
+            cache.awaitClosedForTest()
+        }
     }
 
     @Test
@@ -850,22 +1155,35 @@ class BlockCacheStreamingTest {
         val slotBytes = 256L * 1024
         val budget = TransportMemoryBudget(16L * 1024 * 1024)
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T =
-                block(ByteReadChannel(ByteArray(length.toInt())))
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T = block(ByteReadChannel(ByteArray(length.toInt())))
         }
-        val cache = BlockCache(source, 256 * slotBytes, 4, coroutineContext, null,
-            blockSize = slotBytes, readAheadBytes = 32 * slotBytes, memoryCapBytes = 80 * slotBytes,
-            memoryBudget = budget)
+        val cache = BlockCache(
+            source,
+            256 * slotBytes,
+            4,
+            coroutineContext,
+            null,
+            blockSize = slotBytes,
+            readAheadBytes = 32 * slotBytes,
+            memoryCapBytes = 80 * slotBytes,
+            memoryBudget = budget,
+        )
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING))
         try {
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
+            val ticket = cache.beginRead(owner, 0L)
             repeat(128) {
-                assertEquals(slotBytes.toInt(), cache.read(cursor, ByteArray(slotBytes.toInt()), 0, slotBytes.toInt()))
+                assertEquals(slotBytes.toInt(), ticket.readSome(ByteArray(slotBytes.toInt()), 0, slotBytes.toInt()))
                 assertTrue(budget.usedBytes <= budget.budgetBytes)
             }
             assertTrue(cache.deliveredBytes >= 128 * slotBytes)
             assertTrue(budget.peakBytes <= 16L * 1024 * 1024)
         } finally {
+            owner.close()
             cache.close()
             cache.awaitClosedForTest()
         }
@@ -879,19 +1197,34 @@ class BlockCacheStreamingTest {
         val releases = mutableListOf<CompletableDeferred<Unit>>()
         var cancellations = 0
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
                 val release = CompletableDeferred<Unit>()
                 releases += release
                 try {
                     release.await()
                     return block(ByteReadChannel(ByteArray(length.toInt())))
-                } catch (e: CancellationException) { cancellations++; throw e }
+                } catch (e: CancellationException) {
+                    cancellations++
+                    throw e
+                }
             }
         }
-        val cache = BlockCache(source, 4096, 4, coroutineContext, null,
-            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 2048,
-            workerLimit = { limit })
+        val cache = BlockCache(
+            source,
+            4096,
+            4,
+            coroutineContext,
+            null,
+            blockSize = 64,
+            readAheadBytes = 192,
+            memoryCapBytes = 2048,
+            workerLimit = { limit },
+        )
         try {
             cache.warm(listOf(0L..4095L), StreamRole.BACKGROUND, null)
             runCurrent()
@@ -928,12 +1261,18 @@ class BlockCacheStreamingTest {
         val store = object : DurableBlockStore {
             val held = mutableSetOf<Long>()
             override suspend fun read(file: String, offset: Long, length: Int): ByteArray? = null
-            override suspend fun write(file: String, offset: Long, bytes: ByteArray) { held += offset }
+            override suspend fun write(file: String, offset: Long, bytes: ByteArray) {
+                held += offset
+            }
             override suspend fun missing(file: String, ranges: List<LongRange>): List<LongRange> = ranges
         }
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
                 starts += start
                 return block(ByteReadChannel(ByteArray(if (start == 0L) 64 else length.toInt())))
             }
@@ -945,7 +1284,9 @@ class BlockCacheStreamingTest {
             assertEquals(setOf(0L, 64L), store.held)
             assertEquals(0, cache.inFlightSlotsForTest())
             assertEquals(0L, cache.cachedBytesForTest())
-        } finally { cache.close() }
+        } finally {
+            cache.close()
+        }
     }
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -953,11 +1294,24 @@ class BlockCacheStreamingTest {
     fun `partial slot chunks do not bump schedule revision while waking parked readers`(): Unit = runTest {
         val channel = ByteChannel(autoFlush = true)
         val source = object : RangeSource {
-            override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                         block: suspend (ByteReadChannel) -> T): T = block(channel)
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T = block(channel)
         }
-        val cache = BlockCache(source, 128, 1, coroutineContext, null,
-            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512)
+        val cache = BlockCache(
+            source,
+            128,
+            1,
+            coroutineContext,
+            null,
+            blockSize = 64,
+            readAheadBytes = 192,
+            memoryCapBytes = 512,
+        )
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
             val warm = cache.warm(listOf(0L..63L), StreamRole.BACKGROUND, null)
             runCurrent()
@@ -968,11 +1322,9 @@ class BlockCacheStreamingTest {
                 assertEquals((step + 1) * 4L, cache.receivedBytes)
                 assertEquals(baseRevision, cache.revisionForTest())
             }
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
-            cache.seek(cursor, 40)
+            val ticket = cache.beginRead(owner, 40L)
             val readBuf = ByteArray(8)
-            val parkedRead = async { cache.read(cursor, readBuf, 0, readBuf.size) }
+            val parkedRead = async { ticket.readSome(readBuf, 0, readBuf.size) }
             runCurrent()
             assertFalse(parkedRead.isCompleted)
             val parkedRevision = cache.revisionForTest()
@@ -993,6 +1345,7 @@ class BlockCacheStreamingTest {
             assertEquals(64L, cache.deliveredBytes)
             assertTrue(cache.revisionForTest() > prePublishRevision)
         } finally {
+            owner.close()
             cache.close()
             cache.awaitClosedForTest()
         }

@@ -38,9 +38,6 @@ internal suspend fun <T> withDefaultApiPriority(priority: Int, block: suspend ()
 
 internal suspend fun <T> PikPakClient.withInteractiveApiPriority(block: suspend () -> T): T =
     withDefaultApiPriority(ApiRequestPriority.INTERACTIVE) {
-        // Explicit background maintenance must not repeatedly suppress data transfers.
-        if (currentCoroutineContext()[ApiRequestPriority]!!.priority >= ApiRequestPriority.DEFAULT)
-            notifyInteractiveActivity()
         block()
     }
 
@@ -94,7 +91,7 @@ class RateLimiter(
         fun required() = 1.0 + if (waiter.priority <= ApiRequestPriority.BACKGROUND) backgroundReserve else 0
         val waitingJob = currentCoroutineContext().job
         val updates = demand?.let { owner -> launch {
-            owner.changes.collect {
+            owner.priorityFlow.collect {
                 if (owner.isClosed) waitingJob.cancel(CancellationException("demand closed"))
                 else mutex.withLock {
                     waiter.priority = effectivePriority()

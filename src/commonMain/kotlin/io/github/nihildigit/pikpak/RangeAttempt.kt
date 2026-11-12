@@ -115,7 +115,7 @@ class RangeAttempt(
     /** Why an incomplete attempt ended; cancellation is not evidence of a bad route. */
     val endReason: EndReason? = null,
 ) {
-    enum class EndReason { Preempted, DemandDeadline, HeaderTimeout, BodyStall, Truncated, TransportFailure }
+    enum class EndReason { Preempted, DemandDeadline, Withdrawn, HeaderTimeout, BodyStall, Truncated, TransportFailure }
     val rightCensored: Boolean get() = outcome == Outcome.Cancelled
     val networkDuration: Duration get() = (duration - sinkWait).coerceAtLeast(Duration.ZERO)
 

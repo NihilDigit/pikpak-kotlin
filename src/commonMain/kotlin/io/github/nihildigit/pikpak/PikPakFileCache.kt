@@ -9,29 +9,23 @@ import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 
 /**
- * The bytes of one file, shared by everything reading it: streams, prefetches and downloads.
+ * The bytes of one file, shared by everything reading it: tickets, streams, prefetches and downloads.
  *
- * One per file. Every stream opened here keeps its own position and read-ahead window over one
- * set of 256 KiB blocks and one set of workers, so a player's second connection, a prefetch of
- * the container index and a download of the whole file each read what the others fetched
- * instead of fetching it again. A second cache for the same file starts from nothing.
+ * One per file. Every [ReadTicket] or [PikPakStreamReader] opened here keeps its own position over
+ * one set of 256 KiB blocks and one set of workers, while speculative look-ahead is aggregated per
+ * logical [TransferDemand] owner rather than multiplied per connection. Bytes fetched by any ticket,
+ * prefetch or download are immediately reusable by all others on the same cache.
  *
- * The cache owns no link and knows no file object. It reads through a [RangeSource], normally
- * the file's [PikPakFileHandle], which is what keeps the reads going across expiring
- * signatures and file objects that have to be rebuilt; see [PikPakFileHandle.openCache]. A
- * handle used to own its cache, which tied the bytes to the object minting links for them and
- * made the handle carry three jobs at once.
- *
- * Blocks live in memory, capped at 64 MiB and evicted least-recently-used from outside every
- * stream's window. A [BlockStore], given at construction, is asked for every block before the
- * network and offered every block the network delivers; a [DurableBlockStore] also takes
+ * Blocks live in memory, capped at 64 MiB and evicted least-recently-used from outside every active
+ * owner's protected window. A [BlockStore], given at construction, is asked for every block before
+ * the network and offered every block the network delivers; a [DurableBlockStore] also takes
  * [download]s.
  *
  * Built by [PikPakClient.fileCache], because the account's connection budget and its count of
  * what is on screen are shared by every cache on the client.
  */
 class PikPakFileCache internal constructor(
-    private val cache: BlockCache,
+    internal val cache: BlockCache,
     /** Whether the remote file is waiting for its cold archive to be reactivated. */
     val isReactivating: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow(),
 ) : AutoCloseable {
@@ -44,8 +38,7 @@ class PikPakFileCache internal constructor(
 
     /**
      * Bytes the CDN has handed over to this cache, monotonic, whoever asked for them: every
-     * stream, prefetch and download on it. The basis of a speed readout. Blocks read back from
-     * the store are not counted.
+     * ticket, stream, prefetch and download on it. Blocks read back from the store are not counted.
      */
     val deliveredBytes: Long get() = cache.deliveredBytes
 
@@ -56,8 +49,7 @@ class PikPakFileCache internal constructor(
     val receivedBytes: Long get() = cache.receivedBytes
 
     /**
-     * Bytes fetched into memory and evicted before anyone read them. A read that waits says
-     * read-ahead was too shallow; this is the only signal that it was too deep.
+     * Bytes fetched into memory and evicted before anyone read them.
      */
     val wastedBytes: Long get() = cache.wastedBytes
 
@@ -65,38 +57,43 @@ class PikPakFileCache internal constructor(
     fun updateMediaBytesPerSecond(bytesPerSecond: Long?) = cache.updateMediaBytesPerSecond(bytesPerSecond)
 
     /**
-     * Opens a read position over the file, for playing it.
+     * Opens a per-read / per-HTTP-Range [ReadTicket] for `[startOffset, endExclusive)` under [owner].
      *
-     * Any number can be open at once. A player that opens a second connection to seek opens
-     * a second stream; nothing has to be cancelled for it. The result must be closed; closing
-     * it gives up its position and leaves the cache to everyone else.
-     *
-     * @param role [StreamRole.BACKGROUND] for a file being warmed ahead of the one on screen.
-     *   It can be changed later without losing the cache; see [PikPakStreamReader.role].
+     * Multiple tickets may be open concurrently on the same [owner] without multiplying [owner]'s
+     * speculative [BufferBudget]. Releasing one ticket via [ReadTicket.endRead] never closes [owner].
+     */
+    fun beginRead(
+        owner: TransferDemand,
+        startOffset: Long,
+        endExclusive: Long = size,
+    ): ReadTicket = cache.beginRead(owner, startOffset, endExclusive)
+
+    /**
+     * Opens a sequential seekable [PikPakStreamReader] over the file with an internal [TransferDemand].
      */
     fun openStream(role: StreamRole = StreamRole.FOREGROUND): PikPakStreamReader =
         PikPakStreamReader(cache, ownsCache = false, initialRole = role)
 
-    fun openStream(demand: TransferDemand, role: StreamRole = StreamRole.FOREGROUND): PikPakStreamReader =
-        openStream(role).also { it.demand = demand }
+    /**
+     * Opens a sequential seekable [PikPakStreamReader] bound to [owner]. Closing the stream releases
+     * only its read ticket without closing [owner].
+     */
+    fun openStream(owner: TransferDemand, role: StreamRole = StreamRole.FOREGROUND): PikPakStreamReader =
+        PikPakStreamReader(cache, ownsCache = false, initialRole = role, externalOwner = owner)
 
-    /** Preparation bytes share the owner's live priority, without masquerading as speculative warming. */
+    /** Preparation bytes share [owner]'s live priority and cancel automatically if [owner] closes. */
     fun prefetch(
-        ranges: List<LongRange>, demand: TransferDemand,
-        role: StreamRole = StreamRole.FOREGROUND, priority: Int? = null,
-    ): Deferred<Unit> = cache.warm(ranges, role, priority, demand = demand)
+        ranges: List<LongRange>,
+        owner: TransferDemand,
+        priority: Int? = null,
+    ): Deferred<Unit> = cache.warm(ranges, StreamRole.FOREGROUND, priority, demand = owner)
 
     /**
-     * Fetches [ranges] into memory without opening a stream, for bytes a stream will ask for
-     * next and cannot predict: the head of the file the user will play next, a container index
-     * at the far end.
+     * Fetches [ranges] into memory without opening a stream.
      *
-     * Ties at the connection gates go to the older demand, so files prefetched in the order
-     * they will be played finish in that order. [priority] defaults to the [role]'s warm band,
-     * [PikPakStreamReader.WARM_PRIORITY] in the foreground.
-     *
-     * The job completes once every block is cached and fails when one cannot be fetched.
-     * Cancelling it withdraws the request, and fetches only it wanted are cancelled.
+     * Ties at the connection gates go to the older demand. [priority] defaults to [role]'s warm band
+     * ([PikPakStreamReader.WARM_PRIORITY] in the foreground). Cancelling the returned job withdraws
+     * any fetches nothing else claims.
      */
     fun prefetch(
         ranges: List<LongRange>,
@@ -108,21 +105,6 @@ class PikPakFileCache internal constructor(
      * Fetches [ranges] into the cache's [DurableBlockStore], for keeping the file rather than
      * playing it.
      *
-     * What the store already holds is skipped, so calling this again after a failure, a
-     * cancellation or a restart continues where the store left off. The rest is fetched in the
-     * order [ranges] gives it — a player's header and index first, say, then the middle — and
-     * written as it arrives, the writes paced by the store: a disk that cannot keep up slows
-     * the download rather than filling memory. Blocks a stream already has in memory are
-     * written from there, and blocks written here are what a stream reads next, so a file
-     * downloaded while it plays is fetched once.
-     *
-     * The job completes once every block is held by the store. It fails when a block cannot be
-     * fetched (after the retries every read carries) or cannot be written, and retrying is the
-     * caller's: call again. Cancelling it withdraws what it had not fetched yet.
-     *
-     * Background transfers yield immediately to hungry foreground demand. Their accepted prefixes
-     * remain cached, and available capacity is returned without a throughput probe or cooldown.
-     *
      * @throws IllegalStateException through the job when the cache has no [DurableBlockStore].
      */
     fun download(
@@ -131,7 +113,7 @@ class PikPakFileCache internal constructor(
         priority: Int? = null,
     ): Deferred<Unit> = cache.warm(ranges, role, priority, durable = true)
 
-    /** Drops every block in memory and cancels every fetch, stream, prefetch and download. */
+    /** Drops every block in memory and cancels every fetch, ticket, stream, prefetch and download. */
     override fun close() {
         cache.close()
     }
@@ -139,15 +121,6 @@ class PikPakFileCache internal constructor(
 
 /**
  * A cache over [source], the file of [size] bytes that [storeKey] names in [blockStore].
- *
- * [source] is normally a [PikPakFileHandle] and [storeKey] its [PikPakFileHandle.contentKey];
- * [PikPakFileHandle.openCache] fills in both. Any [RangeSource] works, a bare [RangeReader]
- * over a link that will not expire included.
- *
- * @param connectionBudget requests in flight at once for this file, taken from the account's
- *   budget as well. The default is the per-link cap PikPak enforces.
- * @param coroutineContext where the workers run. Cancelling it closes the cache.
- * @param mediaBytesPerSecond average media consumption in bytes per second, when known.
  */
 fun PikPakClient.fileCache(
     source: RangeSource,

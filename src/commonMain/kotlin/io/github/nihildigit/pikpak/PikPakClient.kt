@@ -13,6 +13,7 @@ import io.github.nihildigit.pikpak.internal.defaultCdnHttpClient
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.HttpSend
 import io.ktor.client.plugins.plugin
+import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import kotlin.concurrent.Volatile
@@ -180,17 +181,22 @@ class PikPakClient(
         (cdnHttpClient ?: httpClient ?: defaultCdnHttpClient(maxOf(connectionBudget, accountConnectionBudget))).also { client ->
             client.plugin(HttpSend).intercept { request ->
                 val call = execute(request)
-                if (call.response.status == HttpStatusCode.PartialContent) {
-                    val totalSize = call.response.headers[HttpHeaders.ContentRange]
-                        ?.substringAfterLast('/', "")
-                        ?.trim()
-                        ?.toLongOrNull()
-                    if (totalSize != null && totalSize > 0L) {
-                        currentCoroutineContext()[StreamSizeListener]?.onTotalSize?.invoke(totalSize)
-                        notifyStreamSizeByUrl(request.url.toString(), totalSize)
+                try {
+                    if (call.response.status == HttpStatusCode.PartialContent) {
+                        val totalSize = call.response.headers[HttpHeaders.ContentRange]
+                            ?.substringAfterLast('/', "")
+                            ?.trim()
+                            ?.toLongOrNull()
+                        if (totalSize != null && totalSize > 0L) {
+                            currentCoroutineContext()[StreamSizeListener]?.onTotalSize?.invoke(totalSize)
+                            notifyStreamSizeByUrl(request.url.toString(), totalSize)
+                        }
                     }
+                    call
+                } catch (t: Throwable) {
+                    runCatching { call.response.bodyAsChannel().cancel(t) }
+                    throw t
                 }
-                call
             }
         }
     }
@@ -255,29 +261,13 @@ class PikPakClient(
         get() = scheduler.concurrencyMode
         set(value) { scheduler.concurrencyMode = value }
 
-    /** Compatibility hint. Use [openTransferDemand] to give interactive work an explicit lifetime. */
-    fun notifyInteractiveActivity() = scheduler.onInteractiveActivity()
-
-    /** Legacy single-owner signal. New integrations should use independently closable [openTransferDemand] leases. */
-    fun setUrgentForeground(urgent: Boolean) = scheduler.setExternalUrgentForeground(urgent)
-
     /**
-     * Account-bound consumer lease for preparation and playback. Pass it to cache streams/prefetches
-     * or as a coroutine context for direct reads. Lower its priority when steady; close it with the session.
+     * Account-bound consumer lease for preparation and playback. Pass it to cache reads/prefetches
+     * or as a coroutine context for direct reads; close it with the session.
      */
-    fun openTransferDemand(priority: Int = PikPakStreamReader.BLOCKING_PRIORITY): TransferDemand {
-        val registration = scheduler.register {}
-        val demand = TransferDemand(priority)
-        demand.onChanged = { value ->
-            if (value == null) scheduler.unregister(registration)
-            else scheduler.reportDemand(registration, io.github.nihildigit.pikpak.internal.CacheDemand(
-                foreground = value >= PikPakStreamReader.STREAMING_PRIORITY,
-                urgent = value >= PikPakStreamReader.BLOCKING_PRIORITY,
-            ))
-        }
-        demand.updatePriority(priority)
-        return demand
-    }
+    fun openTransferDemand(
+        initialIntent: ConsumerIntent = ConsumerIntent(),
+    ): TransferDemand = TransferDemand(initialIntent)
 
     /**
      * Foreground readers open on this account. Priority alone orders the
@@ -291,7 +281,6 @@ class PikPakClient(
     internal val hostHealth = HostHealth(
         steering = steerEdgeHosts,
         timeSource = timeSource,
-        foregroundHungry = { scheduler.foregroundHungry() },
     )
 
     // Keyed by content and variant: a transcode's length is only learned by a probe, and it

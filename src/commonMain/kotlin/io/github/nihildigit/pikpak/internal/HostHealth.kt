@@ -26,7 +26,6 @@ internal class HostHealth(
     /** False keeps every attempt on its link's own host; only silence is still remembered. */
     @Volatile internal var steering: Boolean = true,
     seeds: Collection<String> = emptyList(),
-    private val foregroundHungry: () -> Boolean = { false },
 ) {
     private data class HealthState(
         val epoch: Long = 0,
@@ -373,13 +372,12 @@ internal class HostHealth(
         mayExplore: Boolean,
         requestedBytes: Long = MIN_SAMPLE_BYTES,
         priority: Int = 0,
-        foregroundHungry: Boolean = this.foregroundHungry(),
         demandBytesPerSecond: Long? = null,
-    ): String = health.value.route(url, mayExplore, requestedBytes, priority, foregroundHungry, demandBytesPerSecond)
+    ): String = health.value.route(url, mayExplore, requestedBytes, priority, demandBytesPerSecond)
 
     private fun HealthState.route(
         url: String, mayExplore: Boolean, requestedBytes: Long, priority: Int,
-        foregroundHungry: Boolean, demandBytesPerSecond: Long?,
+        demandBytesPerSecond: Long?,
     ): String {
         if (!steering) return url
         val edge = Edge.parse(url) ?: return url

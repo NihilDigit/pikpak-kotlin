@@ -8,60 +8,28 @@ import kotlin.time.Duration
 import kotlin.time.TimeMark
 
 /**
- * Whether a [PikPakStreamReader] is what the user is watching now or is only
- * getting ready for later. See [PikPakStreamReader.role].
+ * Whether a [PikPakStreamReader] or [PikPakFileCache.prefetch] is serving foreground playback or
+ * background warming.
  */
 enum class StreamRole { FOREGROUND, BACKGROUND }
 
 /**
- * Serves one remote file to a media player as a seekable byte stream.
+ * Sequential seekable byte stream facade over [BlockCache] backed by a [TransferDemand] and
+ * [ReadTicket].
  *
- * This is a transport and nothing else. It has no download policy: it does not
- * decide what the file is worth keeping and fetches only what the read position
- * implies and what callers explicitly [prefetch]. PikPak is an online source, so
- * the player is the one that knows what it will read next, and every playback
- * fault this design replaced came from a policy layer second-guessing it.
+ * Callers serving concurrent HTTP Range requests for a media player should open per-request
+ * [ReadTicket]s via [PikPakFileCache.beginRead] over a shared [TransferDemand]. [PikPakStreamReader]
+ * remains the simple single-cursor stream API for sequential callers and direct byte consumers.
  *
- * A reader is one read position over a [PikPakFileCache], opened with
- * [PikPakFileCache.openStream]. Readers of one cache share it: any number of
- * them can read at once, each keeping its own read-ahead window filled, and
- * bytes one of them fetched are there for the rest. A player that opens a
- * second connection for a seek therefore opens a second reader instead of
- * taking the first one's position.
- *
- * The cache holds fixed-size blocks, evicted least-recently-used from outside
- * every reader's window, and fetches them over up to `concurrency` range
- * requests at once. HTTP ranges grow from observed first-byte cost and body
- * throughput, independently of block storage. An active reader can consume an
- * arrived prefix before its full block has been committed.
- *
- * The block a reader is blocked on is requested at a higher priority than
- * read-ahead, so it wins a contended connection slot both against this file's
- * own read-ahead and against every other file on the account; higher still
- * while the caller marks the reader [urgent].
- *
- * Every file on an account shares one connection budget, so readers also carry
- * a [role]. A background reader — one warming a file the user may open next —
- * asks on a band below every foreground request. Priority only decides who
- * takes the next free slot, though, and a slot a background read already holds
- * is not taken back; so while the account has foreground demand, a file with
- * none of its own keeps at most [BACKGROUND_WORKERS_WHILE_FOREGROUND] requests
- * in flight, each a single block. A foreground reader counts as that demand
- * while it reads and for five seconds after, so a paused player, or one sitting
- * on a full buffer, does not hold the rest of the account back.
- *
- * A block that cannot be fetched fails the read waiting on it; the reader stays
- * usable and a later read of that block tries again.
- *
- * Not safe for concurrent reads through one reader — one position, one caller.
- * [close] while a read is parked is supported and is how a player aborts one;
- * it is the one call that may run concurrently with [read].
+ * Not safe for concurrent [read] calls on the same instance; [close] may run concurrently from
+ * another thread to abort a parked [read].
  */
 class PikPakStreamReader internal constructor(
     private val cache: BlockCache,
     /** Whether closing this reader closes [cache] too: true when nothing else can reach it. */
     private val ownsCache: Boolean,
     initialRole: StreamRole,
+    externalOwner: TransferDemand? = null,
 ) : AutoCloseable {
 
     internal constructor(
@@ -92,290 +60,185 @@ class PikPakStreamReader internal constructor(
         initialRole = initialRole,
     )
 
-    private val cursor = cache.openCursor(initialRole)
+    private val ownsOwner: Boolean = externalOwner == null
 
-    /** Optional account-bound owner shared with preparation; updates promote already queued reads. */
-    var demand: TransferDemand?
-        get() = cursor.demand
-        set(value) = cache.setDemand(cursor, value)
+    internal val owner: TransferDemand = externalOwner ?: TransferDemand(
+        ConsumerIntent(
+            epoch = 0L,
+            service = ServiceIntent.PLAYING,
+            bufferBudget = BufferBudget(maxReadAheadBytes = cache.readAheadBytes),
+        ),
+    )
 
-    fun reportPlaybackBuffer(feedback: PlaybackBufferSnapshot) = cache.reportPlaybackBuffer(cursor, feedback)
+    @Volatile
+    private var currentPosition: Long = 0L
+
+    @Volatile
+    private var startedReading: Boolean = false
+
+    @Volatile
+    private var closed: Boolean = false
+
+    @Volatile
+    private var currentTicket: BlockCache.TicketHandle? = null
 
     /** Length of the remote file. */
     val size: Long get() = cache.size
 
-    /**
-     * Bytes fetched and then evicted without ever being served, across every
-     * reader sharing this cache.
-     *
-     * The other half of a read-ahead measurement. A read that waits says the
-     * window was too small; nothing said it was too big, so the depth could
-     * only be set by guessing -- and a guess in the narrow direction made a
-     * cold open two and a half times slower before this existed.
-     */
+    /** Bytes fetched and then evicted without ever being served, across every consumer sharing [cache]. */
     val wastedBytes: Long get() = cache.wastedBytes
 
-    /**
-     * Bytes the CDN has handed over to this reader's cache, monotonic. The
-     * basis of a speed readout. Shared by every reader of a handle, so one
-     * number describes the file.
-     */
+    /** Bytes the CDN has handed over to this reader's cache, monotonic. */
     val deliveredBytes: Long get() = cache.deliveredBytes
 
-    // Set by seekTo, consumed by the read that first serves bytes at the new
-    // position. What a viewer feels is the interval up to the byte, not up to
-    // the fetch, so the measurement ends in read and not in the worker.
     @Volatile
     private var seekTarget = -1L
 
     @Volatile
     private var seekMark: TimeMark? = null
 
-    /** How long the last [seekTo] took to produce its first byte. Null until one has. For the link probes. */
+    /** How long the last [seekTo] took to produce its first byte. Null until one has. */
     @Volatile
     internal var lastSeekLatency: Duration? = null
         private set
 
-    /**
-     * What the user is watching now, or a file warmed for later. See the class
-     * documentation for what a background reader gives up.
-     *
-     * Changing it keeps the cache and updates the live demand, including queued reads.
-     */
-    var role: StreamRole
-        get() = cursor.role
-        set(value) = cache.setRole(cursor, value)
+    /** Foreground vs background band for this reader's ticket and [prefetch]es. */
+    @Volatile
+    var role: StreamRole = initialRole
+        set(value) {
+            if (field == value) return
+            field = value
+            val ticket = currentTicket
+            if (ticket != null) {
+                cache.setTicketRole(ticket, value)
+            } else if (value == StreamRole.FOREGROUND) {
+                cache.markForegroundOwnerActive(owner)
+            }
+        }
 
-    /**
-     * Whether someone is waiting on this reader right now: a seek that has not
-     * shown its frame yet, a player stalled with an empty buffer, a first frame
-     * the user has scrolled to. While set, the block the reader is parked on
-     * goes out at [BLOCKING_PRIORITY]; otherwise at [STREAMING_PRIORITY].
-     *
-     * The reader cannot tell on its own. A player reads through its buffer
-     * with every read blocking, most of them with seconds of video still in
-     * hand, and a seek arrives as just another reader opened at an offset. Left
-     * at the top priority, those buffer fills filled the band a seek needed:
-     * in a feed with three players they were most of the requests at it, and a
-     * seek, as the newest demand, lost every tie to them. The caller knows, so
-     * the caller says; clear it once the wait is over.
-     *
-     * Only for a [StreamRole.FOREGROUND] reader. Urgent demand suppresses speculative suffixes.
-     */
-    var urgent: Boolean
-        get() = cursor.urgent
-        set(value) = cache.setUrgent(cursor, value)
-
-    /**
-     * How far past the read position this reader keeps the stream filled, at
-     * most the depth the cache was built with.
-     *
-     * Lower it when the consumer will not read far: a player showing a short
-     * excerpt of a long file needs seconds ahead, not the tens of megabytes a
-     * feature-length playback wants, and every block beyond what it reads is
-     * taken from the budget other files on the account share.
-     */
-    var readAheadLimit: Long
-        get() = cursor.readAhead
-        set(value) = cache.setReadAhead(cursor, value)
+    init {
+        if (initialRole == StreamRole.FOREGROUND) {
+            cache.markForegroundOwnerActive(owner)
+        }
+    }
 
     /** Current read position, in bytes from the start of the file. */
-    val position: Long get() = cursor.position
+    val position: Long get() = currentTicket?.position ?: currentPosition
+
+    val bytesRemaining: Long get() = (size - position).coerceAtLeast(0L)
 
     /**
-     * Withdraws speculative read-ahead while retaining this cursor's position and cached
-     * bytes for reuse. An ongoing read remains demand until it finishes. Active by default.
-     */
-    fun setDemandActive(active: Boolean) = cache.setDemandActive(cursor, active)
-
-    val bytesRemaining: Long get() = (size - position).coerceAtLeast(0)
-
-    /**
-     * Reports media already buffered by the player, independently of this byte cursor.
-     * Supply the media consumption rate when known; null preserves the cache estimate.
-     * A zero duration denotes an empty playback buffer and an immediate head deadline.
-     */
-    fun reportPlaybackBuffer(bufferedDuration: Duration, mediaBytesPerSecond: Long? = null) {
-        require(bufferedDuration >= Duration.ZERO && bufferedDuration.isFinite()) {
-            "bufferedDuration must be finite and non-negative"
-        }
-        require(mediaBytesPerSecond == null || mediaBytesPerSecond > 0) {
-            "mediaBytesPerSecond must be positive"
-        }
-        cache.reportPlaybackBuffer(cursor, bufferedDuration, mediaBytesPerSecond)
-    }
-
-    /**
-     * Moves the read position. Cheap: nothing is fetched here. Fetches no
-     * reader and no [prefetch] wants any more are cancelled rather than left
-     * to finish — what the reader needs back is the connection.
+     * Moves the read position and withdraws speculative work left behind by an internal owner.
      */
     suspend fun seekTo(position: Long) {
-        require(position >= 0) { "position must be >= 0, got $position" }
-        if (position == cursor.position) return
+        require(position >= 0L) { "position must be >= 0, got $position" }
+        checkNotClosed()
+        if (position == this.position) return
         seekTarget = position
         seekMark = cache.timeSource.markNow()
-        cache.seek(cursor, position)
+        val old = currentTicket
+        currentTicket = null
+        currentPosition = position
+        old?.endRead(allowFinishInFlight = false)
+        if (ownsOwner) {
+            owner.updateIntent { it.copy(epoch = it.epoch + 1L) }
+        }
+        if (startedReading && !closed && position < size) {
+            val next = cache.beginReadInternal(owner, position, size, initialRoleOverride = role, eagerRegister = true)
+            if (closed) {
+                next.endRead(allowFinishInFlight = false)
+            } else {
+                currentTicket = next
+            }
+        }
     }
 
     /**
-     * Fills [buffer] from the current position and advances it.
-     *
-     * Returns the number of bytes written, which is at most one block's worth
-     * however large [length] is, or -1 at end of file. May return a smaller
-     * arrived prefix without waiting for the rest of its block. Suspends until
-     * bytes at the read position arrive, and throws if they cannot be fetched.
+     * Fills [buffer] from the current position and advances it, returning `-1` at end of file.
+     * May return an arrived prefix smaller than a block without waiting for the rest of the block.
      */
     suspend fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-        val pos = cursor.position
-        val read = cache.read(cursor, buffer, offset, length)
-        if (read > 0 && seekTarget == pos) {
-            seekMark?.let { lastSeekLatency = it.elapsedNow() }
-            seekTarget = -1
-            seekMark = null
+        checkNotClosed()
+        require(offset >= 0 && length >= 0 && offset <= buffer.size - length) {
+            "invalid buffer slice offset=$offset length=$length size=${buffer.size}"
+        }
+        val pos = this.position
+        if (pos >= size) return -1
+        if (length == 0) return 0
+        startedReading = true
+        var ticket = currentTicket
+        if (ticket == null || ticket.ended || ticket.position != pos || ticket.epoch < owner.intent.epoch) {
+            ticket?.endRead(allowFinishInFlight = false)
+            ticket = cache.beginReadInternal(owner, pos, size, initialRoleOverride = role)
+            if (closed) {
+                ticket.endRead(allowFinishInFlight = false)
+                throw PikPakException(-1, "PikPakStreamReader is closed")
+            }
+            currentTicket = ticket
+        }
+        val read = ticket.readSome(buffer, offset, length)
+        if (read > 0) {
+            currentPosition = ticket.position
+            if (seekTarget == pos) {
+                seekMark?.let { lastSeekLatency = it.elapsedNow() }
+                seekTarget = -1L
+                seekMark = null
+            }
         }
         return read
     }
 
     /**
      * Fetches [ranges] into the cache without moving the read position.
-     *
-     * For bytes a caller knows the consumer will ask for next and the read
-     * position cannot predict: a container index at the far end of the file,
-     * the start of an excerpt in a file nobody is playing yet. The position
-     * stays put and a later [seekTo] does not cancel it.
-     *
-     * The blocks go out at [priority], by default [WARM_PRIORITY] for a
-     * foreground reader and the background read-ahead band for a background
-     * one. Ranges are clamped to the file.
-     *
-     * The returned job completes once every block is cached, fails when one
-     * cannot be fetched, and is cancelled by [close]. Nothing waits on it
-     * unless the caller does.
      */
     fun prefetch(ranges: List<LongRange>, priority: Int? = null): Deferred<Unit> =
-        cache.warm(ranges, cursor.role, priority)
+        cache.warm(ranges, role, priority)
 
     /**
-     * Gives the read position up and fails a read parked on it.
-     *
-     * Deliberately not suspending, unlike the rest of the surface. A player
-     * releases its input from a lifecycle callback that has no coroutine, and
-     * aborting a parked read from another thread is a supported way to stop
-     * playback. The shared cache stays with its handle; a reader that owns its
-     * cache drops it too.
+     * Releases this reader's ticket and aborts any parked [read]. Never closes an externally
+     * supplied [TransferDemand] owner.
      */
     override fun close() {
-        cache.closeCursor(cursor)
+        closed = true
+        val ticket = currentTicket
+        currentTicket = null
+        ticket?.endRead(allowFinishInFlight = false)
+        if (ownsOwner) owner.close()
         if (ownsCache) cache.close()
     }
 
-    /** Cached bytes held right now. For tests asserting the memory cap. */
+    private fun checkNotClosed() {
+        if (closed || cache.closed || owner.isClosed) {
+            throw PikPakException(-1, "PikPakStreamReader is closed")
+        }
+    }
+
     internal suspend fun cachedBytesForTest(): Long = cache.cachedBytesForTest()
 
-    /** Slots currently claimed by a fetch. A leaked claim shows up here as a count that never falls. */
     internal suspend fun inFlightSlotsForTest(): Int = cache.inFlightSlotsForTest()
 
-    /** See [BlockCache.readAheadDepthForTest]. */
-    internal suspend fun readAheadDepthForTest(): Long = cache.readAheadDepthForTest(cursor)
+    internal suspend fun readAheadDepthForTest(): Long = cache.readAheadDepthForTest(owner, position)
 
     internal suspend fun claimForTest(): BlockCache.Fetch? = cache.claimForTest()
 
     internal suspend fun abandonForTest(fetch: BlockCache.Fetch): Unit = cache.abandonForTest(fetch)
 
-    // Public: every member here is a documented default or a point on the priority scale, and a
-    // caller placing its own reads among these needs to name them.
     companion object {
-        /**
-         * Cache and persistent-store commit granularity. HTTP request spans
-         * are independent and adapt to observed latency and throughput;
-         * blocking readers can consume an arrived prefix smaller than a block.
-         */
         const val DEFAULT_BLOCK_SIZE: Long = 256L * 1024
-
-        /**
-         * How far past the read position the stream is kept filled. In memory
-         * only.
-         *
-         * Half the cap, not all of it. Equal to the cap, the window is the
-         * whole cache and nothing outside it can be evicted, so read-ahead stops
-         * a few blocks short and from then on only advances one block per block
-         * the reader consumes. The other half holds what has already been read,
-         * which is what a backward seek reads from.
-         */
         const val DEFAULT_READ_AHEAD_BYTES: Long = 32L * 1024 * 1024
-
         const val DEFAULT_MEMORY_CAP_BYTES: Long = 64L * 1024 * 1024
-
-        /**
-         * Bytes ahead that must be in hand before blocks double in size.
-         *
-         * A quarter of the window rather than half of it: at the window's own
-         * size the doubling could only start once read-ahead was complete,
-         * i.e. never while it matters.
-         */
         const val DEFAULT_WIDE_BLOCK_THRESHOLD_BYTES: Long = 8L * 1024 * 1024
 
-        /**
-         * What a container index the demuxer needs before it can play at all
-         * is fetched at: the Cues of a Matroska file, the moov of an MP4 that
-         * keeps it at the end.
-         *
-         * Above [BLOCKING_PRIORITY] on purpose. Until the index arrives there is
-         * no first frame, so no playback position for anything to be blocked at;
-         * what this outranks is the read for a frame that cannot be shown yet.
-         */
         const val INDEX_PRIORITY = 101
-
-        /** What an [urgent] reader asks for the block a caller is waiting on. */
         const val BLOCKING_PRIORITY = 100
-
-        /**
-         * What a reader asks for the block a caller is waiting on when nobody
-         * said it was [urgent]: a player filling its buffer. Above every
-         * read-ahead and warm, since a player that does run dry stops on this
-         * block; below a seek or a stall, which have someone watching.
-         */
         const val STREAMING_PRIORITY = 50
-
-        /**
-         * What a reader asks for blocks ahead of the read position.
-         *
-         * Anything a caller wants served ahead of its own read-ahead but behind
-         * the block playback is stopped on belongs between this and
-         * [STREAMING_PRIORITY].
-         */
         const val READ_AHEAD_PRIORITY = 10
-
-        /** Small direct range probes outrank speculative prefetch, but not playback reads. */
         const val MICRO_PROBE_PRIORITY = 12
-
-        /** Published near-buffer coverage lets next-file warming precede distant prefetch. */
         const val FAR_READ_AHEAD_PRIORITY = 6
-
-        /**
-         * What a foreground [prefetch] asks at by default: behind everything
-         * that is playing, ahead of everything in the background. Warming the
-         * file the user will see next must not starve the one they are seeing.
-         */
         const val WARM_PRIORITY = 8
-
-        /** What a [StreamRole.BACKGROUND] reader asks for the block it is blocked on: below all foreground work. */
         const val BACKGROUND_BLOCKING_PRIORITY = 5
-
-        /** What a [StreamRole.BACKGROUND] reader asks for blocks ahead of its read position. */
         const val BACKGROUND_READ_AHEAD_PRIORITY = 1
 
-        /**
-         * Requests a file with no foreground demand keeps in flight while the
-         * account has some.
-         *
-         * Priority cannot take a slot back, and a foreground reader whose
-         * read-ahead window is full holds none; left alone the background files
-         * take the whole budget and the next playback read queues behind all of
-         * them. Two keeps warming moving while leaving most of the budget free,
-         * the same figure Animeko settled on for its cache workers.
-         */
         const val BACKGROUND_WORKERS_WHILE_FOREGROUND = 2
     }
 }

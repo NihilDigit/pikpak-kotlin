@@ -32,40 +32,44 @@ class DemandTransportTest {
             }
         }
         val cache = BlockCache(source, 256, 1, coroutineContext, null, blockSize = 64, readAheadBytes = 192, memoryCapBytes = 1024)
-        val cursor = cache.openCursor(StreamRole.FOREGROUND)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING, bufferBudget = BufferBudget(maxReadAheadBytes = 192)))
+        val ticket = cache.beginRead(owner, 0L)
         try {
-            assertEquals(4, cache.read(cursor, ByteArray(4), 0, 4))
-            cache.setReadAhead(cursor, 0)
+            assertEquals(4, ticket.readSome(ByteArray(4), 0, 4))
+            owner.submitIntent(ConsumerIntent(service = ServiceIntent.PLAYING, bufferBudget = BufferBudget.NONE))
             runCurrent()
-            assertFalse(interrupted, "an idle retained reader still owns its partially consumed head")
+            assertFalse(interrupted, "an idle retained ticket still finishes its partially consumed single block via FinishInFlight")
             suffix.complete(Unit)
             runCurrent()
-            cache.closeCursor(cursor)
+            ticket.endRead()
             cache.warm(listOf(0L..63L), StreamRole.BACKGROUND, null).await()
             assertEquals(listOf(0L), starts)
             assertEquals(64L, cache.deliveredBytes)
-        } finally { suffix.complete(Unit); cache.close(); cache.awaitClosedForTest() }
+        } finally { suffix.complete(Unit); owner.close(); cache.close(); cache.awaitClosedForTest() }
     }
 
     @Test fun cachedSubBlockReadWakesNewTailOfReadAheadWindow() = runTest {
         val source = FakeRangeSource(ByteArray(2048))
         val cache = BlockCache(source, 2048, 1, coroutineContext, null,
             blockSize = 64, readAheadBytes = 192, memoryCapBytes = 4096, timeSource = testScheduler.timeSource)
-        val cursor = cache.openCursor(StreamRole.FOREGROUND)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING, bufferBudget = BufferBudget(maxReadAheadBytes = 192)))
         try {
-            cache.read(cursor, ByteArray(64), 0, 64)
+            val t0 = cache.beginRead(owner, 0L)
+            t0.readSome(ByteArray(64), 0, 64)
             runCurrent()
-            cache.seek(cursor, 511)
+            t0.endRead(allowFinishInFlight = false)
+            owner.updateIntent { it.copy(epoch = it.epoch + 1L) }
+            val ticket = cache.beginRead(owner, 511L)
             runCurrent()
-            cache.read(cursor, ByteArray(1), 0, 1)
+            ticket.readSome(ByteArray(1), 0, 1)
             runCurrent()
-            assertEquals(512L, cursor.position)
+            assertEquals(512L, ticket.position)
             val previous = source.requests().size
-            cache.read(cursor, ByteArray(1), 0, 1)
+            ticket.readSome(ByteArray(1), 0, 1)
             runCurrent()
             assertTrue(source.requests().drop(previous).any { it.start <= 704 && it.start + it.length > 704 },
                 "an in-block read can still expose a new uncached tail block")
-        } finally { cache.close(); cache.awaitClosedForTest() }
+        } finally { owner.close(); cache.close(); cache.awaitClosedForTest() }
     }
 
     @Test fun concurrentWarmMembershipChangesDoNotKillWorkers() = runBlocking {
@@ -99,14 +103,15 @@ class DemandTransportTest {
     @Test fun promotedBackgroundReaderCanReadUnderItsOwnUrgentLease() = runTest {
         val http = io.ktor.client.HttpClient(io.ktor.client.engine.mock.MockEngine { error("no network") })
         val client = PikPakClient("mock", "pw", httpClient = http, sessionStore = InMemorySessionStore())
-        val owner = client.openTransferDemand(PikPakStreamReader.WARM_PRIORITY)
+        val owner = client.openTransferDemand(
+            ConsumerIntent(service = ServiceIntent.PREFETCH, bufferBudget = BufferBudget.NONE),
+        )
         val cache = client.fileCache(FakeRangeSource(ByteArray(512 * 1024) { 7 }), 512L * 1024, "promotion", coroutineContext = coroutineContext)
         val reader = cache.openStream(owner, StreamRole.BACKGROUND)
-        reader.readAheadLimit = 0
         try {
             val bytes = ByteArray(256 * 1024)
             assertEquals(bytes.size, reader.read(bytes, 0, bytes.size))
-            owner.updatePriority(PikPakStreamReader.BLOCKING_PRIORITY)
+            owner.submitIntent(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
             val next = async { reader.read(bytes, 0, bytes.size) }
             runCurrent()
             assertTrue(next.isCompleted, "promotion must not classify its own reader as blocked background work")
@@ -124,13 +129,13 @@ class DemandTransportTest {
         }
         val http = io.ktor.client.HttpClient(io.ktor.client.engine.mock.MockEngine { error("no network") })
         val client = PikPakClient("mock", "pw", httpClient = http, sessionStore = InMemorySessionStore())
-        val owner = client.openTransferDemand(PikPakStreamReader.WARM_PRIORITY)
+        val owner = client.openTransferDemand(ConsumerIntent(service = ServiceIntent.PREFETCH))
         val cache = client.fileCache(source, 512L * 1024, "priority", coroutineContext = coroutineContext)
         try {
-            cache.prefetch(listOf(0L..63L), owner, StreamRole.BACKGROUND, PikPakStreamReader.WARM_PRIORITY - 1).await()
+            cache.prefetch(listOf(0L..63L), owner, PikPakStreamReader.WARM_PRIORITY - 1).await()
             assertEquals(PikPakStreamReader.WARM_PRIORITY - 1, priorities.single())
-            owner.updatePriority(PikPakStreamReader.BLOCKING_PRIORITY)
-            cache.prefetch(listOf(262144L..262207L), owner, StreamRole.BACKGROUND, PikPakStreamReader.WARM_PRIORITY - 1).await()
+            owner.submitIntent(ConsumerIntent(service = ServiceIntent.WAITING))
+            cache.prefetch(listOf(262144L..262207L), owner, PikPakStreamReader.WARM_PRIORITY - 1).await()
             assertEquals(PikPakStreamReader.BLOCKING_PRIORITY, priorities.last())
         } finally { owner.close(); cache.close(); client.close(); http.close() }
     }
@@ -186,19 +191,18 @@ class DemandTransportTest {
         val scheduler = TransferScheduler(1, 1, BandwidthLimiter(), testScheduler.timeSource)
         val cache = BlockCache(source, 256, 1, coroutineContext, null, blockSize = 64,
             readAheadBytes = 192, memoryCapBytes = 512, scheduler = scheduler)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
             val warm = cache.warm(listOf(0L..127L), StreamRole.BACKGROUND, null)
             runCurrent()
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
-            cache.seek(cursor, 192)
-            val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
+            val ticket = cache.beginRead(owner, 192L)
+            val read = async { ticket.readSome(ByteArray(1), 0, 1) }
             runCurrent()
             assertTrue(read.isCompleted)
             assertEquals(1, read.await())
             assertEquals(listOf(0L, 192L), starts.take(2))
             warm.await()
-        } finally { cache.close(); cache.awaitClosedForTest() }
+        } finally { owner.close(); cache.close(); cache.awaitClosedForTest() }
     }
 
     @Test fun waitingForMemoryPriorityDoesNotEvictUnrelatedCachedBytes() = runTest {
@@ -225,43 +229,48 @@ class DemandTransportTest {
         assertEquals(0L, memory.usedBytes)
     }
 
-    @Test fun hungerPreemptsEvenANearlyCompleteDownloadAndResumesItsPrefixImmediately() = runTest {
+    @Test fun singleWorkerUrgentReadPreemptsNearlyCompleteDownloadAndResumesPrefixImmediately() = runTest {
         val scheduler = TransferScheduler(8, 8, BandwidthLimiter(), testScheduler.timeSource)
         val starts = mutableListOf<Long>()
         var interrupted = false
-        val content = ByteArray(64) { it.toByte() }
-        val written = mutableListOf<ByteArray>()
+        val content = ByteArray(128) { it.toByte() }
+        val written = mutableMapOf<Long, ByteArray>()
         val source = object : RangeSource {
             override suspend fun <T> read(start: Long, length: Long, priority: Int, block: suspend (ByteReadChannel) -> T): T = coroutineScope {
                 starts.add(start)
-                if (starts.size > 1) return@coroutineScope block(ByteReadChannel(content.copyOfRange(start.toInt(), 64)))
-                val channel = ByteChannel(autoFlush = true)
-                val writer = launch { channel.writeFully(content, 0, 48); awaitCancellation() }
-                try { block(channel) } finally { interrupted = true; writer.cancel() }
+                if (start == 0L && starts.count { it == 0L } == 1) {
+                    val channel = ByteChannel(autoFlush = true)
+                    val writer = launch { channel.writeFully(content, 0, 48); awaitCancellation() }
+                    try { return@coroutineScope block(channel) } finally { interrupted = true; writer.cancel() }
+                }
+                block(ByteReadChannel(content.copyOfRange(start.toInt(), (start + length).toInt())))
             }
         }
         val store = object : DurableBlockStore {
             override suspend fun read(file: String, offset: Long, length: Int): ByteArray? = null
             override suspend fun missing(file: String, ranges: List<LongRange>) = ranges
-            override suspend fun write(file: String, offset: Long, bytes: ByteArray) { written.add(bytes.copyOf()) }
+            override suspend fun write(file: String, offset: Long, bytes: ByteArray) { written[offset] = bytes.copyOf() }
         }
-        val cache = BlockCache(source, 64, 1, coroutineContext, null, store, blockSize = 64,
+        val cache = BlockCache(source, 128, 1, coroutineContext, null, store, blockSize = 64,
             readAheadBytes = 192, memoryCapBytes = 512, scheduler = scheduler, timeSource = testScheduler.timeSource)
-        val player = scheduler.register {}
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
             val download = cache.warm(listOf(0L..63L), StreamRole.BACKGROUND, null, durable = true)
             runCurrent()
-            scheduler.reportDemand(player, CacheDemand(foreground = true, hungry = true))
+            val ticket = cache.beginRead(owner, 64L)
+            val buf = ByteArray(64)
+            val read = async { ticket.readSome(buf, 0, 64) }
             runCurrent()
-            assertTrue(interrupted)
-            assertEquals(listOf(0L), starts)
-            scheduler.unregister(player)
+            assertTrue(interrupted, "single worker preempts durable download in 0ms")
+            assertEquals(64, read.await())
+            ticket.endRead(allowFinishInFlight = false)
+            owner.close()
             runCurrent()
             download.await()
-            assertEquals(listOf(0L, 48L), starts)
-            assertContentEquals(content, written.single())
+            assertEquals(listOf(0L, 64L, 48L), starts)
+            assertContentEquals(content.copyOfRange(0, 64), written.getValue(0L))
             assertEquals(0L, testScheduler.currentTime)
-        } finally { scheduler.unregister(player); cache.close(); cache.awaitClosedForTest() }
+        } finally { owner.close(); cache.close(); cache.awaitClosedForTest() }
     }
 
     @Test fun memoryWaiterPriorityDoesNotLeakAfterWithdrawal() {
@@ -276,30 +285,27 @@ class DemandTransportTest {
         assertEquals(0L, memory.usedBytes)
     }
 
-    @Test fun preparationLeaseCanFetchItsOwnDependenciesAndCloseWithoutAClockTick() = runTest {
+    @Test fun preparationOwnerFetchesDependenciesAndClosesCleanly() = runTest {
         val http = io.ktor.client.HttpClient(io.ktor.client.engine.mock.MockEngine { error("no network") })
         val client = PikPakClient("mock", "pw", httpClient = http, sessionStore = InMemorySessionStore())
-        val background = client.scheduler.register {}
-        client.scheduler.reportDemand(background, CacheDemand(background = true))
         val first = client.openTransferDemand()
         val second = client.openTransferDemand()
         val cache = client.fileCache(FakeRangeSource(ByteArray(64) { 9 }), 64, "lease", coroutineContext = coroutineContext)
         try {
-            assertEquals(0, client.scheduler.workersFor(background, true))
             cache.prefetch(listOf(0L..63L), first).await()
             first.close()
-            assertEquals(0, client.scheduler.workersFor(background, true), "another owner is still urgent")
+            assertTrue(first.isClosed)
+            assertFalse(second.isClosed)
             second.close()
-            assertEquals(8, client.scheduler.workersFor(background, true))
-            first.close()
-            assertEquals(8, client.scheduler.workersFor(background, true))
+            assertTrue(second.isClosed)
+            assertEquals(0L, testScheduler.currentTime)
         } finally { cache.close(); first.close(); second.close(); client.close(); http.close() }
     }
 
     @Test fun closedOwnerWithdrawsQueuedAndActiveRequests() = runTest {
         val admission = SignedUrlGates(1)
-        val first = TransferDemand(10)
-        val second = TransferDemand(1)
+        val first = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING))
+        val second = TransferDemand(ConsumerIntent(service = ServiceIntent.PAUSED))
         val running = async(first) {
             try { admission.withSlot("https://cdn/a") { awaitCancellation() } }
             catch (_: CancellationException) { }
@@ -318,19 +324,22 @@ class DemandTransportTest {
     }
 
     @Test fun staleFeedbackCannotRestoreAnEarlierGenerationOrRefreshItsSampleTime() = runTest {
-        val cache = BlockCache(FakeRangeSource(ByteArray(64)), 64, 1, coroutineContext, null,
-            blockSize = 64, readAheadBytes = 192, memoryCapBytes = 512, timeSource = testScheduler.timeSource)
-        try {
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            val sampled = testScheduler.timeSource.markNow()
-            advanceTimeBy(1000)
-            cache.reportPlaybackBuffer(cursor, PlaybackBufferSnapshot(2, 2.seconds, sampled))
-            assertEquals(1.seconds, cursor.bufferedDuration - cursor.feedbackAt!!.elapsedNow())
-            cache.reportPlaybackBuffer(cursor, PlaybackBufferSnapshot(1, 20.seconds, testScheduler.timeSource.markNow()))
-            assertEquals(1.seconds, cursor.bufferedDuration - cursor.feedbackAt!!.elapsedNow())
-            cache.reportPlaybackBuffer(cursor, PlaybackBufferSnapshot(3, null, testScheduler.timeSource.markNow()))
-            assertNull(cursor.feedbackAt)
-        } finally { cache.close(); cache.awaitClosedForTest() }
+        val owner = TransferDemand(ConsumerIntent(epoch = 2L, service = ServiceIntent.PLAYING))
+        val sampled = testScheduler.timeSource.markNow()
+        advanceTimeBy(1000)
+        assertTrue(owner.reportPlaybackBuffer(PlaybackBufferSnapshot(2L, 2.seconds, sampled)))
+        val stored = assertNotNull(owner.intent.playbackSample)
+        assertEquals(1.seconds, stored.bufferedDuration!! - stored.sampledAt.elapsedNow())
+
+        assertFalse(owner.reportPlaybackBuffer(PlaybackBufferSnapshot(1L, 20.seconds, testScheduler.timeSource.markNow())))
+        val afterStale = assertNotNull(owner.intent.playbackSample)
+        assertEquals(1.seconds, afterStale.bufferedDuration!! - afterStale.sampledAt.elapsedNow())
+
+        assertTrue(owner.submitIntent(ConsumerIntent(epoch = 3L, service = ServiceIntent.WAITING)))
+        assertNull(owner.intent.playbackSample)
+        assertFalse(owner.reportPlaybackBuffer(PlaybackBufferSnapshot(2L, 5.seconds, testScheduler.timeSource.markNow())))
+        assertNull(owner.intent.playbackSample)
+        owner.close()
     }
 
     @Test fun partialPrefixSurvivesCancellationWithinTheSameMemoryBudget() = runTest {
@@ -348,20 +357,20 @@ class DemandTransportTest {
         val memory = TransportMemoryBudget(64)
         val cache = BlockCache(source, 64, 1, coroutineContext, null, blockSize = 64,
             readAheadBytes = 192, memoryCapBytes = 512, memoryBudget = memory)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
             val warm = cache.warm(listOf(0L..63L), StreamRole.BACKGROUND, null)
             runCurrent()
             warm.cancelAndJoin()
             runCurrent()
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
+            val ticket = cache.beginRead(owner, 0L)
             val result = ByteArray(64)
             var count = 0
-            while (count < 64) count += cache.read(cursor, result, count, 64 - count)
+            while (count < 64) count += ticket.readSome(result, count, 64 - count)
             assertContentEquals(data, result)
             assertEquals(listOf(0L, 32L), starts)
             assertEquals(64L, memory.peakBytes)
-        } finally { cache.close(); cache.awaitClosedForTest() }
+        } finally { owner.close(); cache.close(); cache.awaitClosedForTest() }
         assertEquals(0L, memory.usedBytes)
     }
 
@@ -376,21 +385,20 @@ class DemandTransportTest {
         }
         val cache = BlockCache(source, 256, 1, coroutineContext, null, blockSize = 64,
             readAheadBytes = 192, memoryCapBytes = 512)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
             val warm = cache.warm(listOf(0L..191L), StreamRole.BACKGROUND, null)
             runCurrent()
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
-            cache.seek(cursor, 64)
+            val ticket = cache.beginRead(owner, 64L)
             val result = ByteArray(64)
-            val read = async { cache.read(cursor, result, 0, 64) }
+            val read = async { ticket.readSome(result, 0, 64) }
             runCurrent()
             assertTrue(read.isCompleted)
             assertEquals(64, read.await())
             assertContentEquals(ByteArray(64) { 7 }, result)
             assertEquals(listOf(0L, 64L), starts.take(2))
             warm.cancelAndJoin()
-        } finally { cache.close(); cache.awaitClosedForTest() }
+        } finally { owner.close(); cache.close(); cache.awaitClosedForTest() }
     }
 
     @Test fun blockedFileDoesNotReserveAccountCapacity() = runTest {
@@ -441,14 +449,15 @@ class DemandTransportTest {
             catch (_: TransferPreempted) { }
         }
         runCurrent()
-        val owner = TransferDemand(1)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PAUSED))
         val promoted = async(owner) { admission.withSlot("https://cdn/b") { 3 } }
         runCurrent()
         assertFalse(promoted.isCompleted)
-        owner.updatePriority(100)
+        owner.submitIntent(ConsumerIntent(service = ServiceIntent.WAITING))
         runCurrent()
         assertEquals(3, promoted.await())
         low.await()
+        owner.close()
     }
 
     @Test fun nearCompleteRangesNeverExtendBodySilence() {
@@ -473,6 +482,7 @@ class DemandTransportTest {
         val scheduler = TransferScheduler(2, 2, BandwidthLimiter(), testScheduler.timeSource)
         val cache = BlockCache(source, 192, 1, coroutineContext, null, blockSize = 64,
             readAheadBytes = 192, memoryCapBytes = 1024, scheduler = scheduler, memoryBudget = memory)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
             val warm1 = cache.warm(listOf(64L..127L), StreamRole.BACKGROUND, null)
             runCurrent()
@@ -480,13 +490,12 @@ class DemandTransportTest {
             runCurrent()
             seedPartial = false
             cache.warm(listOf(0L..191L), StreamRole.FOREGROUND, null).await()
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
+            val ticket = cache.beginRead(owner, 0L)
             val out = ByteArray(192)
             var read = 0
-            while (read < 192) read += cache.read(cursor, out, read, 192 - read)
+            while (read < 192) read += ticket.readSome(out, read, 192 - read)
             assertContentEquals(data, out)
-        } finally { cache.close(); cache.awaitClosedForTest() }
+        } finally { owner.close(); cache.close(); cache.awaitClosedForTest() }
     }
 
     @Test fun obsoletePartialsAreReclaimedWhenMemoryCapIsFull() = runTest {
@@ -505,6 +514,7 @@ class DemandTransportTest {
         val memory = TransportMemoryBudget(192)
         val cache = BlockCache(source, 192, 1, coroutineContext, null, blockSize = 64,
             readAheadBytes = 64, memoryCapBytes = 256, memoryBudget = memory)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
             for (offset in listOf(64L..127L, 128L..191L)) {
                 val warm = cache.warm(listOf(offset), StreamRole.BACKGROUND, null)
@@ -514,12 +524,11 @@ class DemandTransportTest {
             }
             seedPartials = false
             cache.warm(listOf(0L..63L), StreamRole.FOREGROUND, null).await()
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
+            val ticket = cache.beginRead(owner, 0L)
             val out = ByteArray(64)
             var read = 0
-            while (read < 64) read += cache.read(cursor, out, read, 64 - read)
+            while (read < 64) read += ticket.readSome(out, read, 64 - read)
             assertContentEquals(data.copyOfRange(0, 64), out)
-        } finally { cache.close(); cache.awaitClosedForTest() }
+        } finally { owner.close(); cache.close(); cache.awaitClosedForTest() }
     }
 }

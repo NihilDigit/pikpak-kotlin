@@ -13,7 +13,6 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class AdaptiveBlockCacheTest {
@@ -43,8 +42,12 @@ class AdaptiveBlockCacheTest {
             requests.toList().forEach { it.complete(Unit) }
         }
 
-        override suspend fun <T> read(start: Long, length: Long, priority: Int,
-                                     block: suspend (ByteReadChannel) -> T): T {
+        override suspend fun <T> read(
+            start: Long,
+            length: Long,
+            priority: Int,
+            block: suspend (ByteReadChannel) -> T,
+        ): T {
             val release = CompletableDeferred<Unit>()
             requests += release
             active++
@@ -58,12 +61,22 @@ class AdaptiveBlockCacheTest {
         }
     }
 
-    private fun TestScope.cache(source: AdaptiveSource, scheduler: TransferScheduler? = null,
-                                store: BlockStore? = null) = BlockCache(
-        source, size = 64 * 1024, concurrency = source.maxConnections,
-        parentCoroutineContext = coroutineContext, foregroundStreams = null, store = store,
-        blockSize = 64, readAheadBytes = 192, memoryCapBytes = 16 * 1024,
-        scheduler = scheduler, timeSource = testScheduler.timeSource,
+    private fun TestScope.cache(
+        source: AdaptiveSource,
+        scheduler: TransferScheduler? = null,
+        store: BlockStore? = null,
+    ) = BlockCache(
+        source,
+        size = 64 * 1024,
+        concurrency = source.maxConnections,
+        parentCoroutineContext = coroutineContext,
+        foregroundStreams = null,
+        store = store,
+        blockSize = 64,
+        readAheadBytes = 192,
+        memoryCapBytes = 16 * 1024,
+        scheduler = scheduler,
+        timeSource = testScheduler.timeSource,
     )
 
     @Test
@@ -88,19 +101,18 @@ class AdaptiveBlockCacheTest {
         assertEquals(0, source.connectionLimit.subscriptionCount.value)
     }
 
-
-
     @Test
-    fun `unused cursor and withdrawn warm have no expansion allowance`() = runTest {
+    fun `unused owner and withdrawn warm have no expansion allowance`() = runTest {
         val scheduler = TransferScheduler(16, 16, BandwidthLimiter(), testScheduler.timeSource)
         val source = AdaptiveSource()
         val cache = cache(source, scheduler)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
+            val ticket = cache.beginRead(owner, 0L)
             runCurrent()
             assertEquals(0, source.allowance)
             assertEquals(0, source.active)
-            cache.closeCursor(cursor)
+            ticket.endRead(allowFinishInFlight = false)
             val warm = cache.warm(listOf(0L..65535L), StreamRole.BACKGROUND, null)
             runCurrent()
             assertEquals(16, source.allowance)
@@ -112,13 +124,13 @@ class AdaptiveBlockCacheTest {
             runCurrent()
             assertEquals(0, source.active)
         } finally {
+            owner.close()
             cache.close()
             cache.awaitClosedForTest()
         }
         assertEquals(0, source.connectionLimit.subscriptionCount.value)
         val requestsAtClose = source.requests.size
         source.connectionLimit.value = 16
-        scheduler.onInteractiveActivity()
         runCurrent()
         assertEquals(requestsAtClose, source.requests.size)
         assertEquals(0, source.allowance)
@@ -126,8 +138,13 @@ class AdaptiveBlockCacheTest {
 
     @Test
     fun `durable demand expands and withdrawing it releases allowance`() = runTest {
-        val scheduler = TransferScheduler(16, 16, BandwidthLimiter(), testScheduler.timeSource,
-            concurrencyMode = ConcurrencyMode.Fixed(16))
+        val scheduler = TransferScheduler(
+            16,
+            16,
+            BandwidthLimiter(),
+            testScheduler.timeSource,
+            concurrencyMode = ConcurrencyMode.Fixed(16),
+        )
         val source = AdaptiveSource()
         val store = object : DurableBlockStore {
             override suspend fun read(file: String, offset: Long, length: Int): ByteArray? = null
@@ -166,7 +183,10 @@ class AdaptiveBlockCacheTest {
             source.finishSecondSignature()
             runCurrent()
             assertEquals(16, source.active, "producer capacity follows available capacity")
-        } finally { cache.close(); cache.awaitClosedForTest() }
+        } finally {
+            cache.close()
+            cache.awaitClosedForTest()
+        }
     }
 
     @Test
@@ -174,21 +194,23 @@ class AdaptiveBlockCacheTest {
         val scheduler = TransferScheduler(16, 16, BandwidthLimiter(), testScheduler.timeSource)
         val source = AdaptiveSource()
         val cache = cache(source, scheduler)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.WAITING, bufferBudget = BufferBudget.NONE))
         try {
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            cache.setReadAhead(cursor, 0)
+            val ticket = cache.beginRead(owner, 0L)
             runCurrent()
             assertEquals(0, source.connectionLimit.value)
-            val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
+            val read = async { ticket.readSome(ByteArray(1), 0, 1) }
             runCurrent()
             assertEquals(16, source.allowance)
             assertEquals(1, source.active)
             source.finishCurrentReads()
             assertEquals(1, read.await())
+            ticket.endRead(allowFinishInFlight = false)
             runCurrent()
             assertEquals(0, source.allowance)
             assertEquals(0, source.active)
         } finally {
+            owner.close()
             cache.close()
             cache.awaitClosedForTest()
         }

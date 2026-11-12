@@ -1,8 +1,5 @@
 package io.github.nihildigit.pikpak
 
-import io.github.nihildigit.pikpak.internal.CacheDemand
-import io.github.nihildigit.pikpak.internal.ReadTelemetry
-import io.github.nihildigit.pikpak.internal.TransferScheduler
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond

@@ -1,25 +1,26 @@
 package io.github.nihildigit.pikpak.internal
 
 import io.github.nihildigit.pikpak.PikPakException
+import io.github.nihildigit.pikpak.TransferDemand
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.flow.collect
-import io.github.nihildigit.pikpak.TransferDemand
 import kotlin.concurrent.Volatile
 
 internal class RangeAdmission(private val onGranted: () -> Unit) :
     kotlin.coroutines.AbstractCoroutineContextElement(RangeAdmission) {
     companion object Key : kotlin.coroutines.CoroutineContext.Key<RangeAdmission>
-    val granted = kotlinx.coroutines.CompletableDeferred<Unit>()
+    val granted = CompletableDeferred<Unit>()
     fun grant() {
         onGranted()
         granted.complete(Unit)
@@ -31,13 +32,21 @@ internal class SignedRequestPriority(val value: Int) :
     companion object Key : kotlin.coroutines.CoroutineContext.Key<SignedRequestPriority>
 }
 
+internal class LiveSignedPriority(val flow: StateFlow<Int>) :
+    kotlin.coroutines.AbstractCoroutineContextElement(LiveSignedPriority) {
+    companion object Key : kotlin.coroutines.CoroutineContext.Key<LiveSignedPriority>
+}
+
 internal class SignedUrlCongestion(val onThrottled: () -> Unit) :
     kotlin.coroutines.AbstractCoroutineContextElement(SignedUrlCongestion) {
     companion object Key : kotlin.coroutines.CoroutineContext.Key<SignedUrlCongestion>
 }
 
-/** Scheduling withdrawal preserves accepted bytes and carries no route penalty. */
-internal class TransferPreempted : CancellationException("higher priority byte demand")
+/** Scheduling preemption preserves accepted bytes and carries no route penalty. */
+internal class TransferPreempted(message: String = "higher priority byte demand") : CancellationException(message)
+
+/** Explicit consumer/owner withdrawal preserves accepted bytes and carries no route penalty. */
+internal class DemandWithdrawnException(message: String = "demand withdrawn") : CancellationException(message)
 
 internal class FileAdmission(val identity: Any, val limit: Int, val onStats: (Int, Int) -> Unit = { _, _ -> }) :
     kotlin.coroutines.AbstractCoroutineContextElement(FileAdmission) {
@@ -46,10 +55,17 @@ internal class FileAdmission(val identity: Any, val limit: Int, val onStats: (In
 
 /** One atomic account/file/signature ledger, including direct probes and sibling routes. */
 internal class SignedUrlGates(private val accountLimit: Int = Int.MAX_VALUE) {
-    @Volatile var inUse: Int = 0
+    @Volatile
+    var inUse: Int = 0
         private set
-    private class Request(val signature: String, val file: FileAdmission?, var priority: Int,
-        val order: Long, val job: Job) {
+
+    private class Request(
+        val signature: String,
+        val file: FileAdmission?,
+        var priority: Int,
+        val order: Long,
+        val job: Job,
+    ) {
         val granted = CompletableDeferred<Unit>()
         var withdrawing = false
     }
@@ -77,9 +93,11 @@ internal class SignedUrlGates(private val accountLimit: Int = Int.MAX_VALUE) {
         (r.file == null || active.count { it.file?.identity === r.file.identity } < r.file.limit)
 
     private fun dispatch() {
-        for (r in pending.sortedWith(compareByDescending<Request> { it.priority }
-            .thenBy { if (it.priority >= 50) foregroundTurns[ownerOf(it)] ?: 0L else 0L }
-            .thenBy { it.order })) {
+        for (r in pending.sortedWith(
+            compareByDescending<Request> { it.priority }
+                .thenBy { if (it.priority >= 50) foregroundTurns[ownerOf(it)] ?: 0L else 0L }
+                .thenBy { it.order },
+        )) {
             if (fits(r)) {
                 pending.remove(r)
                 active.add(r)
@@ -90,16 +108,25 @@ internal class SignedUrlGates(private val accountLimit: Int = Int.MAX_VALUE) {
                     }
                 }
                 r.granted.complete(Unit)
-            } else if (r.priority >= 50) {
+            } else if (r.priority >= 0) {
+                fun canPreempt(victimPriority: Int): Boolean = when {
+                    victimPriority < 0 -> true
+                    r.priority >= 100 -> victimPriority < r.priority
+                    r.priority >= 50 -> victimPriority in 1 until 10
+                    else -> false
+                }
                 val signatureFull = active.count { it.signature == r.signature } >= (signatureLimits[r.signature] ?: 8)
                 val fileFull = r.file != null && active.count { it.file?.identity === r.file.identity } >= r.file.limit
-                active.filter { !it.withdrawing && it.priority < r.priority &&
-                    when {
-                        signatureFull -> it.signature == r.signature
-                        fileFull -> it.file?.identity === r.file?.identity
-                        else -> active.size >= accountLimit
-                    } }
-                    .minByOrNull { it.priority }?.let {
+                active.filter {
+                    !it.withdrawing && canPreempt(it.priority) &&
+                        when {
+                            signatureFull -> it.signature == r.signature
+                            fileFull -> it.file?.identity === r.file.identity
+                            else -> active.size >= accountLimit
+                        }
+                }
+                    .minWithOrNull(compareBy<Request> { it.priority }.thenByDescending { it.order })
+                    ?.let {
                         it.withdrawing = true
                         it.job.cancel(TransferPreempted())
                     }
@@ -110,8 +137,12 @@ internal class SignedUrlGates(private val accountLimit: Int = Int.MAX_VALUE) {
     }
 
     private fun notifyStats(r: Request) {
-        r.file?.let { file -> file.onStats(active.count { it.file?.identity === file.identity },
-            pending.count { it.file?.identity === file.identity }) }
+        r.file?.let { file ->
+            file.onStats(
+                active.count { it.file?.identity === file.identity },
+                pending.count { it.file?.identity === file.identity },
+            )
+        }
     }
 
     suspend fun <T> withSlot(
@@ -123,19 +154,68 @@ internal class SignedUrlGates(private val accountLimit: Int = Int.MAX_VALUE) {
         // Host steering preserves path and signature. Conservatively sharing identical paths
         // and queries across unrelated hosts is safe; host changes must never create quota.
         val identity = identityOf(url)
-        val demand = currentCoroutineContext()[TransferDemand]
-        if (demand?.isClosed == true) throw CancellationException("demand closed")
-        val requestOrder = order.takeIf { it != 0L }
-            ?: currentCoroutineContext()[RequestOrder]?.value ?: RequestOrder.Sequence.next()
-        val request = Request(identity, currentCoroutineContext()[FileAdmission], demand?.priority ?: priority,
-            requestOrder, currentCoroutineContext()[Job]!!)
-        mutex.withLock { pending.add(request); dispatch() }
-        val updates = demand?.let { owner -> launch {
-            owner.changes.collect {
-                if (owner.isClosed) request.job.cancel(CancellationException("demand closed"))
-                else mutex.withLock { request.priority = owner.priority; dispatch() }
+        val livePriority = currentCoroutineContext()[LiveSignedPriority]
+        val explicitPriority = currentCoroutineContext()[SignedRequestPriority]
+        val demand = if (livePriority == null) currentCoroutineContext()[TransferDemand] else null
+        if (livePriority?.flow?.value == Int.MIN_VALUE) throw DemandWithdrawnException()
+        if (demand?.isClosed == true) throw DemandWithdrawnException("demand closed")
+
+        fun resolvePriority(): Int = when {
+            livePriority != null -> livePriority.flow.value
+            demand != null -> {
+                val base = explicitPriority?.value ?: priority
+                maxOf(base, demand.priority)
             }
-        } }
+            explicitPriority != null -> explicitPriority.value
+            else -> priority
+        }
+
+        val requestOrder = order.takeIf { it != 0L }
+            ?: currentCoroutineContext()[RequestOrder]?.value
+            ?: RequestOrder.Sequence.next()
+        val request = Request(
+            identity,
+            currentCoroutineContext()[FileAdmission],
+            resolvePriority(),
+            requestOrder,
+            currentCoroutineContext()[Job]!!,
+        )
+        mutex.withLock {
+            pending.add(request)
+            dispatch()
+        }
+        val updates = when {
+            livePriority != null -> launch {
+                livePriority.flow.collect { next ->
+                    if (next == Int.MIN_VALUE) {
+                        request.job.cancel(DemandWithdrawnException())
+                    } else {
+                        mutex.withLock {
+                            if (request.priority != next) {
+                                request.priority = next
+                                dispatch()
+                            }
+                        }
+                    }
+                }
+            }
+            demand != null -> launch {
+                demand.priorityFlow.collect {
+                    if (demand.isClosed) {
+                        request.job.cancel(DemandWithdrawnException("demand closed"))
+                    } else {
+                        val next = resolvePriority()
+                        mutex.withLock {
+                            if (request.priority != next) {
+                                request.priority = next
+                                dispatch()
+                            }
+                        }
+                    }
+                }
+            }
+            else -> null
+        }
         try {
             request.granted.await()
             currentCoroutineContext().ensureActive()
@@ -147,10 +227,12 @@ internal class SignedUrlGates(private val accountLimit: Int = Int.MAX_VALUE) {
             }
         } catch (t: Throwable) {
             if (t is PikPakException && t.isThrottlePressure) {
-                withContext(NonCancellable) { mutex.withLock {
-                    val current = minOf(signatureLimits[identity] ?: 8, active.count { it.signature == identity })
-                    signatureLimits[identity] = (current - 1).coerceAtLeast(1)
-                } }
+                withContext(NonCancellable) {
+                    mutex.withLock {
+                        val current = minOf(signatureLimits[identity] ?: 8, active.count { it.signature == identity })
+                        signatureLimits[identity] = (current - 1).coerceAtLeast(1)
+                    }
+                }
                 currentCoroutineContext()[SignedUrlCongestion]?.onThrottled?.invoke()
             }
             throw t

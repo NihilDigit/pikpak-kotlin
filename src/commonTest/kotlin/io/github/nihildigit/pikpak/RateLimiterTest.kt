@@ -27,14 +27,14 @@ class RateLimiterTest {
         val paths = mutableListOf<String>()
         val http = HttpClient(MockEngine { request -> paths += request.url.encodedPath; respond("{}") })
         val client = PikPakClient("mock", "pw", sessionStore = InMemorySessionStore(), rateLimiter = limiter, httpClient = http)
-        val owner = TransferDemand(PikPakStreamReader.WARM_PRIORITY)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PREFETCH))
         try {
             limiter.acquire()
             val prepared = async(owner, start = CoroutineStart.UNDISPATCHED) {
                 withApiPriority(ApiRequestPriority.BACKGROUND) { client.http.requestRaw(HttpMethod.Get, "https://api.test/prepared") }
             }
             val normal = async(start = CoroutineStart.UNDISPATCHED) { client.http.requestRaw(HttpMethod.Get, "https://api.test/normal") }
-            owner.updatePriority(PikPakStreamReader.BLOCKING_PRIORITY)
+            owner.submitIntent(ConsumerIntent(service = ServiceIntent.WAITING))
             prepared.await(); normal.await()
             assertEquals(listOf("/prepared", "/normal"), paths)
         } finally { owner.close(); client.close(); http.close() }
@@ -44,7 +44,7 @@ class RateLimiterTest {
     fun closedDemandRefundsQueuedApiReservation() = kotlinx.coroutines.test.runTest {
         val limiter = RateLimiter(capacity = 1, refillPerSecond = 1.0, timeSource = testScheduler.timeSource)
         limiter.acquire()
-        val owner = TransferDemand(PikPakStreamReader.WARM_PRIORITY)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PREFETCH))
         val cancelled = async(start = CoroutineStart.UNDISPATCHED) { limiter.acquire(0, owner) }
         testScheduler.runCurrent()
         owner.close()

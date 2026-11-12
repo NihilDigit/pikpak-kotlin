@@ -145,72 +145,73 @@ public suspend fun <T> PikPakClient.streamRangeFromUrl(
                         configure()
                     },
                 ) { response ->
-                    val status = response.status
-                    if (response.headers.isColdArchive()) {
-                        response.bodyAsChannel().cancel(null)
-                        throw FileReactivatingException(httpStatus = status.value, headers = response.headerMap())
-                    }
-                    when {
-                        status == HttpStatusCode.OK -> {
-                            response.bodyAsChannel().cancel(null)
-                            throw PikPakException(
-                                -1,
-                                "streamRangeFromUrl: server returned 200 instead of 206 — Range header was ignored, " +
-                                    "streaming the full file would violate the range contract",
-                                httpStatus = 200,
-                                headers = response.headerMap(),
-                            )
+                    val channel = response.bodyAsChannel()
+                    try {
+                        val status = response.status
+                        if (response.headers.isColdArchive()) {
+                            throw FileReactivatingException(httpStatus = status.value, headers = response.headerMap())
                         }
-                        status == HttpStatusCode.RequestedRangeNotSatisfiable -> {
-                            response.bodyAsChannel().cancel(null)
-                            throw PikPakException(
-                                -1,
-                                "streamRangeFromUrl: server returned 416 Range Not Satisfiable (start=$start may exceed file size)",
-                                httpStatus = 416,
-                                headers = response.headerMap(),
-                            )
+                        when {
+                            status == HttpStatusCode.OK -> {
+                                throw PikPakException(
+                                    -1,
+                                    "streamRangeFromUrl: server returned 200 instead of 206 — Range header was ignored, " +
+                                        "streaming the full file would violate the range contract",
+                                    httpStatus = 200,
+                                    headers = response.headerMap(),
+                                )
+                            }
+                            status == HttpStatusCode.RequestedRangeNotSatisfiable -> {
+                                throw PikPakException(
+                                    -1,
+                                    "streamRangeFromUrl: server returned 416 Range Not Satisfiable (start=$start may exceed file size)",
+                                    httpStatus = 416,
+                                    headers = response.headerMap(),
+                                )
+                            }
+                            status != HttpStatusCode.PartialContent -> {
+                                throw PikPakException(
+                                    -1,
+                                    "streamRangeFromUrl: unexpected HTTP status ${status.value}",
+                                    httpStatus = status.value,
+                                    headers = response.headerMap(),
+                                )
+                            }
                         }
-                        status != HttpStatusCode.PartialContent -> {
-                            response.bodyAsChannel().cancel(null)
-                            throw PikPakException(
-                                -1,
-                                "streamRangeFromUrl: unexpected HTTP status ${status.value}",
-                                httpStatus = status.value,
-                                headers = response.headerMap(),
-                            )
-                        }
-                    }
 
-                    val parsed = parseContentRange(response.headers[HttpHeaders.ContentRange])
-                        ?: throw PikPakException(-1, "streamRangeFromUrl: missing or invalid Content-Range")
-                    val derivedLength = parsed.endInclusive - parsed.start + 1L
-                    val contentLengthHeader = response.headers[HttpHeaders.ContentLength]
-                    val rawContentLength = contentLengthHeader?.toLongOrNull()
-                    val requestedEnd = length?.let { start + it - 1 }
-                    if (parsed.start != start ||
-                        (requestedEnd != null && parsed.endInclusive > requestedEnd) ||
-                        (requestedEnd != null && parsed.endInclusive < requestedEnd &&
-                            parsed.totalSize != parsed.endInclusive + 1) ||
-                        (contentLengthHeader != null && rawContentLength != derivedLength)
-                    ) {
-                        throw PikPakException(-1, "streamRangeFromUrl: response does not match requested range")
-                    }
+                        val parsed = parseContentRange(response.headers[HttpHeaders.ContentRange])
+                            ?: throw PikPakException(-1, "streamRangeFromUrl: missing or invalid Content-Range")
+                        val derivedLength = parsed.endInclusive - parsed.start + 1L
+                        val contentLengthHeader = response.headers[HttpHeaders.ContentLength]
+                        val rawContentLength = contentLengthHeader?.toLongOrNull()
+                        val requestedEnd = length?.let { start + it - 1 }
+                        if (parsed.start != start ||
+                            (requestedEnd != null && parsed.endInclusive > requestedEnd) ||
+                            (requestedEnd != null && parsed.endInclusive < requestedEnd &&
+                                parsed.totalSize != parsed.endInclusive + 1) ||
+                            (contentLengthHeader != null && rawContentLength != derivedLength)
+                        ) {
+                            throw PikPakException(-1, "streamRangeFromUrl: response does not match requested range")
+                        }
 
-                    blockEntered = true
-                    val streamBytes = (rawContentLength ?: derivedLength).coerceAtLeast(0L)
-                    val result = block(
-                        RangeStream(
-                            channel = response.bodyAsChannel(),
-                            contentLength = rawContentLength ?: derivedLength,
-                            totalSize = parsed.totalSize,
-                            rangeStart = parsed.start,
-                            rangeEndInclusive = parsed.endInclusive,
-                        ),
-                    )
-                    if (!readerOwnsRetries && streamBytes > 0L) {
-                        accountState.onDownstreamBytesRead(streamBytes, flush = true)
+                        blockEntered = true
+                        val streamBytes = (rawContentLength ?: derivedLength).coerceAtLeast(0L)
+                        val result = block(
+                            RangeStream(
+                                channel = channel,
+                                contentLength = rawContentLength ?: derivedLength,
+                                totalSize = parsed.totalSize,
+                                rangeStart = parsed.start,
+                                rangeEndInclusive = parsed.endInclusive,
+                            ),
+                        )
+                        if (!readerOwnsRetries && streamBytes > 0L) {
+                            accountState.onDownstreamBytesRead(streamBytes, flush = true)
+                        }
+                        result
+                    } finally {
+                        channel.cancel(null)
                     }
-                    result
                 }
             }
         } catch (e: io.github.nihildigit.pikpak.internal.TransferPreempted) {

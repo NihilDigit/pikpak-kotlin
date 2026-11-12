@@ -124,14 +124,13 @@ class RoiSchedulingTest {
         client.concurrencyMode = ConcurrencyMode.Fixed(8)
         val reg = client.scheduler.register(connectionBudget = 8, onScheduleChanged = {})
         try {
-            client.scheduler.update(reg, false, false, true)
-            assertEquals(8, client.scheduler.workersFor(reg, true))
+            assertEquals(8, client.scheduler.connectionAllowanceFor(reg))
             withApiPriority(ApiRequestPriority.BACKGROUND) { client.withInteractiveApiPriority {} }
-            assertEquals(8, client.scheduler.workersFor(reg, true))
+            assertEquals(8, client.scheduler.connectionAllowanceFor(reg))
             client.withInteractiveApiPriority {}
-            assertEquals(8, client.scheduler.workersFor(reg, true))
+            assertEquals(8, client.scheduler.connectionAllowanceFor(reg))
             advanceTimeBy(501)
-            assertEquals(8, client.scheduler.workersFor(reg, true))
+            assertEquals(8, client.scheduler.connectionAllowanceFor(reg))
         } finally { client.scheduler.unregister(reg); client.close(); http.close() }
     }
 
@@ -153,12 +152,13 @@ class RoiSchedulingTest {
             timeSource = testScheduler.timeSource)
         val current = cache("current")
         val next = cache("next")
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING))
         try {
             current.warm(listOf(0L..127L), StreamRole.FOREGROUND, null).await()
             served.clear()
             gate.acquire(100)
-            val cursor = current.openCursor(StreamRole.FOREGROUND)
-            assertEquals(1, current.read(cursor, ByteArray(1), 0, 1))
+            val ticket = current.beginRead(owner, 0L)
+            assertEquals(1, ticket.readSome(ByteArray(1), 0, 1))
             runCurrent()
             assertEquals(1, gate.queued)
             val warm = next.warm(listOf(0L..63L), StreamRole.FOREGROUND, null)
@@ -170,6 +170,7 @@ class RoiSchedulingTest {
             assertEquals("next" to PikPakStreamReader.WARM_PRIORITY, served.first())
             assertTrue(served.drop(1).any { it == "current" to PikPakStreamReader.FAR_READ_AHEAD_PRIORITY })
         } finally {
+            owner.close()
             current.close(); next.close()
             current.awaitClosedForTest(); next.awaitClosedForTest()
         }
@@ -187,15 +188,16 @@ class RoiSchedulingTest {
         val cache = BlockCache(source, 1024, 1, coroutineContext, null,
             blockSize = 64, readAheadBytes = 256, memoryCapBytes = 512, wideBlockThresholdBytes = 64,
             timeSource = testScheduler.timeSource)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING))
         try {
             cache.warm(listOf(0L..63L), StreamRole.FOREGROUND, null).await()
             requests.clear()
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            assertEquals(1, cache.read(cursor, ByteArray(1), 0, 1))
+            val ticket = cache.beginRead(owner, 0L)
+            assertEquals(1, ticket.readSome(ByteArray(1), 0, 1))
             runCurrent()
             assertEquals(Triple(64L, 64L, PikPakStreamReader.READ_AHEAD_PRIORITY), requests.first())
             assertTrue(requests.drop(1).any { it.first == 128L && it.third == PikPakStreamReader.FAR_READ_AHEAD_PRIORITY })
-        } finally { cache.close(); cache.awaitClosedForTest() }
+        } finally { owner.close(); cache.close(); cache.awaitClosedForTest() }
     }
 
     @Test
@@ -210,16 +212,17 @@ class RoiSchedulingTest {
         val cache = BlockCache(source, 1024, 2, coroutineContext, null,
             blockSize = 64, readAheadBytes = 256, memoryCapBytes = 1024, wideBlockThresholdBytes = 64,
             timeSource = testScheduler.timeSource)
+        val owner = TransferDemand(ConsumerIntent(service = ServiceIntent.PLAYING))
         try {
-            val cursor = cache.openCursor(StreamRole.FOREGROUND)
-            val read = async { cache.read(cursor, ByteArray(1), 0, 1) }
+            val ticket = cache.beginRead(owner, 0L)
+            val read = async { ticket.readSome(ByteArray(1), 0, 1) }
             runCurrent()
             advanceTimeBy(300)
             runCurrent()
             assertTrue(PikPakStreamReader.READ_AHEAD_PRIORITY in priorities)
             assertFalse(PikPakStreamReader.FAR_READ_AHEAD_PRIORITY in priorities)
             read.cancelAndJoin()
-        } finally { cache.close(); cache.awaitClosedForTest() }
+        } finally { owner.close(); cache.close(); cache.awaitClosedForTest() }
     }
 
     @Test

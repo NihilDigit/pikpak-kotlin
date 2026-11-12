@@ -21,6 +21,7 @@ import io.ktor.client.request.headers
 import io.ktor.client.request.prepareRequest
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsChannel
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
@@ -33,7 +34,9 @@ import kotlin.time.Duration
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -271,19 +274,28 @@ internal class HttpEngine(
         while (true) {
             if (rateLimited) pikpak.rateLimiter.acquire(currentCoroutineContext()[ApiRequestPriority]?.priority ?: 0, currentCoroutineContext()[TransferDemand])
             var blockEntered = false
+            val responseGuard = ActiveResponseGuard()
             try {
-                return client.prepareRequest(url) {
-                    this.method = method
-                    this.expectSuccess = false
-                    configure()
-                }.execute { response ->
-                    val status = response.status.value
-                    val retryable = status == 429 || status == 503 || (replayable && status >= 500)
-                    if (retryRequests && retryable && attempt < policy.maxAttempts - 1) {
-                        throw RetryableStatus(status, response.retryAfter())
+                return withContext(responseGuard) {
+                    client.prepareRequest(url) {
+                        this.method = method
+                        this.expectSuccess = false
+                        configure()
+                    }.execute { response ->
+                        try {
+                            val status = response.status.value
+                            val retryable = status == 429 || status == 503 || (replayable && status >= 500)
+                            if (retryRequests && retryable && attempt < policy.maxAttempts - 1) {
+                                response.bodyAsChannel().cancel(null)
+                                throw RetryableStatus(status, response.retryAfter())
+                            }
+                            blockEntered = true
+                            block(response)
+                        } catch (t: Throwable) {
+                            runCatching { response.bodyAsChannel().cancel(t) }
+                            throw t
+                        }
                     }
-                    blockEntered = true
-                    block(response)
                 }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
@@ -301,6 +313,8 @@ internal class HttpEngine(
                 recordRetry(null, waitFor)
                 delay(waitFor)
                 attempt++
+            } finally {
+                responseGuard.closeAll()
             }
         }
     }
@@ -477,4 +491,65 @@ private fun hex(b: Byte): String {
 internal fun HttpRequestBuilder.jsonBody(json: Json, value: JsonElement) {
     contentType(ContentType.Application.Json)
     setBody(json.encodeToString(JsonElement.serializer(), value))
+}
+
+/**
+ * Closes any native engine response/body acquired during a single [HttpEngine.execute] attempt
+ * even if coroutine cancellation hits right as headers arrive (before Ktor's streaming body writer
+ * coroutine is dispatched to enter `use { ... }`).
+ */
+internal class ActiveResponseGuard : AbstractCoroutineContextElement(ActiveResponseGuard) {
+    companion object Key : CoroutineContext.Key<ActiveResponseGuard>
+
+    class Entry(
+        val closeIdempotent: () -> Unit,
+        val abortInFlight: () -> Unit,
+    ) {
+        @Volatile var completedNormally: Boolean = false
+    }
+
+    private data class State(
+        val closed: Boolean = false,
+        val entries: List<Entry> = emptyList(),
+    )
+
+    private val state = MutableStateFlow(State())
+
+    val isClosed: Boolean get() = state.value.closed
+
+    fun register(closeIdempotent: () -> Unit, abortInFlight: () -> Unit): Entry {
+        val entry = Entry(closeIdempotent = closeIdempotent, abortInFlight = abortInFlight)
+        while (true) {
+            val cur = state.value
+            if (cur.closed) {
+                runCatching { closeIdempotent() }
+                runCatching { abortInFlight() }
+                return entry
+            }
+            if (state.compareAndSet(cur, cur.copy(entries = cur.entries + entry))) {
+                return entry
+            }
+        }
+    }
+
+    fun markCompleted(entry: Entry) {
+        entry.completedNormally = true
+    }
+
+    fun closeAll() {
+        while (true) {
+            val cur = state.value
+            if (cur.closed) return
+            if (state.compareAndSet(cur, State(closed = true, entries = emptyList()))) {
+                for (i in 0 until cur.entries.size) {
+                    val entry = cur.entries[i]
+                    runCatching { entry.closeIdempotent() }
+                    if (!entry.completedNormally) {
+                        runCatching { entry.abortInFlight() }
+                    }
+                }
+                return
+            }
+        }
+    }
 }
