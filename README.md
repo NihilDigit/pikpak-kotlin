@@ -38,7 +38,7 @@ cache.openStream().use { stream ->
 ```kotlin
 repositories { mavenCentral() }
 dependencies {
-    implementation("io.github.nihildigit:pikpak-kotlin:2.3.0")
+    implementation("io.github.nihildigit:pikpak-kotlin:2.5.1")
     // Ktor is compileOnly in the SDK, so it never changes the Ktor you pinned: bring the core and one engine.
     implementation("io.ktor:ktor-client-core:<your-ktor-version>")
     implementation("io.ktor:ktor-client-okhttp:<your-ktor-version>")   // or ktor-client-darwin on iOS
@@ -55,9 +55,11 @@ The [project wiki](https://github.com/NihilDigit/pikpak-kotlin/wiki) is the manu
 | --- | --- |
 | [Getting Started](https://github.com/NihilDigit/pikpak-kotlin/wiki/Getting-Started) | Clients, sessions, logging in, injected HTTP clients, budgets |
 | [Best Practices](https://github.com/NihilDigit/pikpak-kotlin/wiki/Best-Practices) | What works, learned building a real client, with the reasons |
-| [Playback](https://github.com/NihilDigit/pikpak-kotlin/wiki/Playback) | Range reads, handles, streams, priorities, prefetch, disk caching, transcodes |
+| [Playback](https://github.com/NihilDigit/pikpak-kotlin/wiki/Playback) | Demand ownership, tickets, streams, priorities, prefetch, disk caching, transcodes |
+| [Original Link Pools](https://github.com/NihilDigit/pikpak-kotlin/wiki/Original-Link-Pools) | Original-media links, CDN service pools, candidate host rewriting, concurrency modes |
 | [Magnets and Instant Create](https://github.com/NihilDigit/pikpak-kotlin/wiki/Magnets-and-Instant-Create) | The hash path, and what it costs |
-| [Drive Operations](https://github.com/NihilDigit/pikpak-kotlin/wiki/Drive-Operations) | Files, trash, stars, search, shares, play history, archives |
+| [Drive Operations](https://github.com/NihilDigit/pikpak-kotlin/wiki/Drive-Operations) | Files, account state flows, trash, stars, search, shares, play history, archives |
+| [Delta Sync](https://github.com/NihilDigit/pikpak-kotlin/wiki/Delta-Sync) | Incremental file-change streams, server watermarks, batch task completion |
 | [Uploads and Offline Tasks](https://github.com/NihilDigit/pikpak-kotlin/wiki/Uploads-and-Offline-Tasks) | Resumable uploads, content hashes, offline downloads and pruning |
 | [Errors and Retries](https://github.com/NihilDigit/pikpak-kotlin/wiki/Errors-and-Retries) | What throws what, and what the client retries by itself |
 | [Architecture](https://github.com/NihilDigit/pikpak-kotlin/wiki/Architecture) · [Measurements](https://github.com/NihilDigit/pikpak-kotlin/wiki/Measurements) · [History](https://github.com/NihilDigit/pikpak-kotlin/wiki/History) | How it fits together, what PikPak was measured to do, and what was tried |

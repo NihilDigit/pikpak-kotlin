@@ -1,6 +1,7 @@
 package io.github.nihildigit.pikpak.internal
 
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration
@@ -21,6 +22,7 @@ internal class ReadTelemetry(
 
     /** Null means the engine has supplied no evidence, never an inferred cold connection. */
     val connectionReused: Boolean? get() = connection.value
+    val connectionFlow: StateFlow<Boolean?> get() = connection
 
     fun recordConnectionAcquired(reused: Boolean) {
         connection.value = reused

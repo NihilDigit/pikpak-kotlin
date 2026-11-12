@@ -33,8 +33,10 @@ internal class HostHealth(
         val rates: Map<String, List<RateSample>> = emptyMap(),
         val hostLatencies: Map<String, List<LatencySample>> = emptyMap(),
         val hostFirstByteLatencies: Map<String, List<LatencySample>> = emptyMap(),
+        val hostColdFirstByteLatencies: Map<String, List<LatencySample>> = emptyMap(),
         val latencies: List<LatencySample> = emptyList(),
         val cleanLatencies: List<LatencySample> = emptyList(),
+        val coldLatencies: List<LatencySample> = emptyList(),
         val silences: Map<String, TimeMark> = emptyMap(),
         val suspects: Map<String, TimeMark> = emptyMap(),
         val stalls: Map<String, TimeMark> = emptyMap(),
@@ -75,6 +77,11 @@ internal class HostHealth(
             val current = when {
                 sample == null -> previous
                 connectionReused == true -> previous.recordCleanLatency(sample)
+                connectionReused == false -> previous.copy(
+                    latencies = (previous.latencies + sample).takeLast(MAX_LATENCY_SAMPLES),
+                    coldLatencies = (previous.coldLatencies.filter { it.at.elapsedNow() < LATENCY_MEMORY } + sample)
+                        .takeLast(MAX_LATENCY_SAMPLES),
+                )
                 else -> previous.copy(latencies = (previous.latencies + sample).takeLast(MAX_LATENCY_SAMPLES))
             }
             val clearedSilences = if (bareHost != null) current.silences - host - bareHost else current.silences - host
@@ -167,9 +174,52 @@ internal class HostHealth(
         // connections handshake headroom so an 8-way cold open does not cascade across the cluster.
         val warm = claimedWarmSocket ?: (url != null && isWarm(url))
         if (url != null && (everPooled.value || hasAnyWarmHost()) && !warm) {
+            val recentCold = health.value.coldLatencies.filter { it.at.elapsedNow() < LATENCY_MEMORY }
+            if (recentCold.size >= MIN_COLD_LATENCY_SAMPLES) {
+                val coldTail = recentCold.map { it.wait }.sorted()[(recentCold.size * 9) / 10]
+                return maxOf(base, coldTail * COLD_DEADLINE_RATIO).coerceIn(MIN_DEADLINE, MAX_DEADLINE)
+            }
             return maxOf(base * COLD_DEADLINE_RATIO, INITIAL_DEADLINE).coerceAtMost(MAX_DEADLINE)
         }
         return base
+    }
+
+    /**
+     * Header response deadline for active playback / blocking foreground reads, tightened below
+     * [MIN_DEADLINE] / [INITIAL_DEADLINE] only when recent route evidence proves the socket is
+     * far past both pooled RTT (when [connectionReused] is `true`) and cold TLS handshake P90
+     * (when [connectionReused] is `false` or unknown).
+     */
+    fun urgentFirstResponseDeadline(
+        url: String? = null,
+        claimedWarmSocket: Boolean? = null,
+        connectionReused: Boolean? = null,
+        priority: Int = 0,
+    ): Duration {
+        val standard = firstResponseDeadline(url, claimedWarmSocket)
+        if (priority < io.github.nihildigit.pikpak.PikPakStreamReader.STREAMING_PRIORITY) return standard
+        val state = health.value
+        if (connectionReused == true) {
+            val recentClean = state.cleanLatencies.filter { it.at.elapsedNow() < LATENCY_MEMORY }
+            if (recentClean.size >= ROUTE_EPOCH_SAMPLES) {
+                val cleanTail = recentClean.map { it.wait }.sorted()[(recentClean.size * 9) / 10]
+                return (cleanTail * URGENT_DEADLINE_RATIO).coerceIn(URGENT_MIN_DEADLINE, standard)
+            }
+            val recentAll = state.latencies.filter { it.at.elapsedNow() < LATENCY_MEMORY }
+            if (recentAll.size >= MIN_LATENCY_SAMPLES) {
+                val tail = recentAll.map { it.wait }.sorted()[(recentAll.size * 9) / 10]
+                return (tail * LATENCY_RATIO).coerceIn(MIN_DEADLINE, standard)
+            }
+            return standard
+        }
+        if (priority >= io.github.nihildigit.pikpak.PikPakStreamReader.BLOCKING_PRIORITY) {
+            val recentCold = state.coldLatencies.filter { it.at.elapsedNow() < LATENCY_MEMORY }
+            if (recentCold.size >= MIN_COLD_LATENCY_SAMPLES) {
+                val coldTail = recentCold.map { it.wait }.sorted()[(recentCold.size * 9) / 10]
+                return (coldTail * URGENT_DEADLINE_RATIO).coerceIn(URGENT_COLD_MIN_DEADLINE, standard)
+            }
+        }
+        return standard
     }
 
     /**
@@ -211,7 +261,7 @@ internal class HostHealth(
      * Records clean time-to-first-body-byte ([ttfb]) on [url]'s service-isolated host key, distinct
      * from response-header latency so [RecoveryPolicy] models actual first-byte arrival.
      */
-    fun recordFirstByteLatency(url: String, ttfb: Duration) {
+    fun recordFirstByteLatency(url: String, ttfb: Duration, connectionReused: Boolean? = null) {
         if (!ttfb.isFinite() || ttfb < Duration.ZERO) return
         val host = keyOf(url) ?: return
         val now = timeSource.markNow()
@@ -220,8 +270,17 @@ internal class HostHealth(
             val kept = current.hostFirstByteLatencies[host].orEmpty()
                 .filter { it.at.elapsedNow() < memory }
                 .takeLast(MAX_SAMPLES - 1)
+            val updatedCold = if (connectionReused == false) {
+                val keptCold = current.hostColdFirstByteLatencies[host].orEmpty()
+                    .filter { it.at.elapsedNow() < memory }
+                    .takeLast(MAX_SAMPLES - 1)
+                current.hostColdFirstByteLatencies + (host to (keptCold + sample))
+            } else {
+                current.hostColdFirstByteLatencies
+            }
             current.copy(
                 hostFirstByteLatencies = current.hostFirstByteLatencies + (host to (kept + sample)),
+                hostColdFirstByteLatencies = updatedCold,
             )
         }
     }
@@ -427,12 +486,15 @@ internal class HostHealth(
         if (candidates.isEmpty()) return null
 
         val targetBytes = remainingBytes.coerceAtLeast(1L).toDouble()
+        val poolTracked = everPooled.value || hasAnyWarmHost()
         return candidates.mapNotNull { cand ->
             val rate = medianRate(cand.key)?.takeIf { it > 0L } ?: return@mapNotNull null
-            val ttfbMs = conservativeTtfbMillis(cand.key)
+            val candUrl = currentEdge.rewrite(currentUrl, cand)
+            val candWarm = if (poolTracked) isWarm(candUrl) else null
+            val ttfbMs = conservativeTtfbMillis(cand.key, candWarm)
             RecoveryPolicy.CandidateEstimate(
                 hostKey = cand.key,
-                url = currentEdge.rewrite(currentUrl, cand),
+                url = candUrl,
                 ttfbMillis = ttfbMs,
                 bodyBytesPerSecond = rate,
             )
@@ -441,30 +503,53 @@ internal class HostHealth(
         }
     }
 
-    private fun HealthState.conservativeTtfbMillis(hostKey: String): Long {
-        val recentTtfb = hostFirstByteLatencies[hostKey].orEmpty()
+    private fun HealthState.conservativeTtfbMillis(hostKey: String, warmSocketAvailable: Boolean? = null): Long {
+        val baseEstimate = run {
+            val recentTtfb = hostFirstByteLatencies[hostKey].orEmpty()
+                .filter { it.at.elapsedNow() < memory }
+                .map { it.wait.inWholeMilliseconds.coerceAtLeast(0L) }
+                .sorted()
+            if (recentTtfb.isNotEmpty()) {
+                return@run recentTtfb[((recentTtfb.size * 3) / 4).coerceIn(0, recentTtfb.lastIndex)]
+            }
+            val recentHeaders = hostLatencies[hostKey].orEmpty()
+                .filter { it.at.elapsedNow() < memory }
+                .map { it.wait.inWholeMilliseconds.coerceAtLeast(0L) }
+                .sorted()
+            if (recentHeaders.isNotEmpty()) {
+                return@run recentHeaders[((recentHeaders.size * 3) / 4).coerceIn(0, recentHeaders.lastIndex)]
+            }
+            val accountRecent = latencies
+                .filter { it.at.elapsedNow() < LATENCY_MEMORY }
+                .map { it.wait.inWholeMilliseconds.coerceAtLeast(0L) }
+                .sorted()
+            if (accountRecent.isNotEmpty()) {
+                return@run accountRecent[((accountRecent.size * 3) / 4).coerceIn(0, accountRecent.lastIndex)]
+                    .coerceAtLeast(DEFAULT_CONSERVATIVE_TTFB_MS)
+            }
+            DEFAULT_CONSERVATIVE_TTFB_MS
+        }
+        if (warmSocketAvailable != false) return baseEstimate
+
+        // No idle pooled socket is available for this candidate host right now: switching to it
+        // must pay a cold TCP+TLS handshake rather than its warm pooled TTFB.
+        val hostColdTtfb = hostColdFirstByteLatencies[hostKey].orEmpty()
             .filter { it.at.elapsedNow() < memory }
             .map { it.wait.inWholeMilliseconds.coerceAtLeast(0L) }
             .sorted()
-        if (recentTtfb.isNotEmpty()) {
-            return recentTtfb[((recentTtfb.size * 3) / 4).coerceIn(0, recentTtfb.lastIndex)]
+        if (hostColdTtfb.isNotEmpty()) {
+            val coldP75 = hostColdTtfb[((hostColdTtfb.size * 3) / 4).coerceIn(0, hostColdTtfb.lastIndex)]
+            return maxOf(baseEstimate, coldP75)
         }
-        val recentHeaders = hostLatencies[hostKey].orEmpty()
-            .filter { it.at.elapsedNow() < memory }
-            .map { it.wait.inWholeMilliseconds.coerceAtLeast(0L) }
-            .sorted()
-        if (recentHeaders.isNotEmpty()) {
-            return recentHeaders[((recentHeaders.size * 3) / 4).coerceIn(0, recentHeaders.lastIndex)]
-        }
-        val accountRecent = latencies
+        val accountColdHeaders = coldLatencies
             .filter { it.at.elapsedNow() < LATENCY_MEMORY }
             .map { it.wait.inWholeMilliseconds.coerceAtLeast(0L) }
             .sorted()
-        if (accountRecent.isNotEmpty()) {
-            return accountRecent[((accountRecent.size * 3) / 4).coerceIn(0, accountRecent.lastIndex)]
-                .coerceAtLeast(DEFAULT_CONSERVATIVE_TTFB_MS)
+        if (accountColdHeaders.isNotEmpty()) {
+            val coldP75 = accountColdHeaders[((accountColdHeaders.size * 3) / 4).coerceIn(0, accountColdHeaders.lastIndex)]
+            return maxOf(baseEstimate, coldP75)
         }
-        return DEFAULT_CONSERVATIVE_TTFB_MS
+        return maxOf(baseEstimate * COLD_DEADLINE_RATIO, DEFAULT_CONSERVATIVE_TTFB_MS)
     }
 
     private fun HealthState.withRate(host: String, sample: RateSample): HealthState {
@@ -643,9 +728,13 @@ internal class HostHealth(
 
         const val LATENCY_RATIO = 2
         const val COLD_DEADLINE_RATIO = 2
+        const val URGENT_DEADLINE_RATIO = 3
+        val URGENT_MIN_DEADLINE: Duration = 1_000.milliseconds
+        val URGENT_COLD_MIN_DEADLINE: Duration = 1_200.milliseconds
         val BODY_SILENCE: Duration = 3.seconds
         val URGENT_BODY_SILENCE: Duration = 2.seconds
         const val MIN_LATENCY_SAMPLES = 8
+        const val MIN_COLD_LATENCY_SAMPLES = 4
         const val MAX_LATENCY_SAMPLES = 32
 
         /** Short against [DEFAULT_MEMORY]: a proxy switched on or off changes the line within seconds. */

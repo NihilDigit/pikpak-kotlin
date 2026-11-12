@@ -883,14 +883,19 @@ internal class BlockCache(
             return false
         }
         if (ticket.epoch == state.observedEpoch) {
-            if (ticket.epoch > state.latestNativeTicketEpoch) {
+            val advancedNativeEpoch = ticket.epoch > state.latestNativeTicketEpoch
+            if (advancedNativeEpoch) {
                 state.latestNativeTicketEpoch = ticket.epoch
             }
             val clampedStart = ticket.startOffset.coerceAtMost(size)
             ticket.lane = attachOrCreateLaneLocked(state, ticket.epoch, clampedStart, ticket.order)
             ticket.registered = true
             openTickets.add(ticket)
-            return detachSupersededEpochLanesLocked(state)
+            val detachedLanes = detachSupersededEpochLanesLocked(state)
+            val hasOpenSuperseded = advancedNativeEpoch && openTickets.any {
+                !it.ended && it.owner === ticket.owner && it.epoch < ticket.epoch
+            }
+            return detachedLanes || hasOpenSuperseded
         } else {
             ticket.lane = null
         }
@@ -1406,50 +1411,52 @@ internal class BlockCache(
         val continuationClaims = ArrayList<ByteClaim.Continuation>(openTickets.size)
         val lookAheadClaims = ArrayList<ByteClaim.LookAhead>(owners.size)
         val finishClaims = ArrayList<ByteClaim.FinishInFlight>(owners.size)
+        val supersededClaims = HashSet<ByteClaim>()
 
         // 1. Required claims (active ReadWaiter) & Continuation claims (open mid-block reader between readSome calls).
         for (i in 0 until openTickets.size) {
             val ticket = openTickets[i]
             if (ticket.ended || ticket.owner.isClosed || ticket.position >= ticket.effectiveEnd) continue
             val intent = ticket.owner.intent
-            val fg = ticket.effectiveRole == StreamRole.FOREGROUND
+            val superseded = isSupersededByCurrentEpochTicketLocked(owners[ticket.owner], ticket, intent.epoch)
+            val fg = ticket.effectiveRole == StreamRole.FOREGROUND && !superseded
             val priority = ticketClaimPriorityLocked(ticket, intent)
             val waiter = ticket.activeWaiter
             if (waiter != null) {
-                requiredClaims.add(
-                    ByteClaim.Required(
-                        owner = ticket.owner,
-                        epoch = waiter.readEpoch,
-                        slot = waiter.slot,
-                        endByteExclusive = waiter.endByteExclusive,
-                        foreground = fg,
-                        priority = priority,
-                        order = ticket.order,
-                    ),
+                val claim = ByteClaim.Required(
+                    owner = ticket.owner,
+                    epoch = waiter.readEpoch,
+                    slot = waiter.slot,
+                    endByteExclusive = waiter.endByteExclusive,
+                    foreground = fg,
+                    priority = priority,
+                    order = ticket.order,
                 )
+                requiredClaims.add(claim)
+                if (superseded) supersededClaims.add(claim)
             } else {
                 val curSlot = slotOf(ticket.position)
                 if (ticket.continuationSlot == curSlot) {
                     val fetch = inFlight[curSlot]
                     if (isContinuationEligibleLocked(curSlot, fetch)) {
-                        continuationClaims.add(
-                            ByteClaim.Continuation(
-                                owner = ticket.owner,
-                                epoch = intent.epoch,
-                                slot = curSlot,
-                                fetch = fetch!!,
-                                exchangeId = fetch.claimControl.liveExchangeId,
-                                foreground = fg,
-                                priority = priority,
-                                order = ticket.order,
-                            ),
+                        val claim = ByteClaim.Continuation(
+                            owner = ticket.owner,
+                            epoch = intent.epoch,
+                            slot = curSlot,
+                            fetch = fetch!!,
+                            exchangeId = fetch.claimControl.liveExchangeId,
+                            foreground = fg,
+                            priority = priority,
+                            order = ticket.order,
                         )
+                        continuationClaims.add(claim)
+                        if (superseded) supersededClaims.add(claim)
                     }
                 }
             }
         }
 
-        // 2. Owner-aggregated LookAhead claims & ended-reader single-block FinishInFlight claims.
+        // 2. Owner-aggregated LookAhead claims.
         for (state in owners.values) {
             val owner = state.owner
             if (owner.isClosed) continue
@@ -1462,6 +1469,11 @@ internal class BlockCache(
             if (currentTickets.isNotEmpty() && intent.service != ServiceIntent.PAUSED) {
                 val ownerByteCeiling = effectiveOwnerBudgetBytesLocked(intent)
                 if (ownerByteCeiling > 0L) {
+                    val explicitWaitingWindow = if (intent.service == ServiceIntent.WAITING) {
+                        minOf(ownerByteCeiling, intent.bufferBudget.waitingReadAheadBytes.coerceAtLeast(0L))
+                    } else {
+                        0L
+                    }
                     val primaryLane = state.lanes.firstOrNull { it.epoch == epoch }
                     data class QualifyingLane(
                         val lane: ReadLane,
@@ -1469,23 +1481,30 @@ internal class BlockCache(
                         val maxEndExclusive: Long,
                         val foreground: Boolean,
                         val order: Long,
+                        val provenSequential: Boolean,
                     )
                     val qualifying = ArrayList<QualifyingLane>(state.lanes.size)
                     val ticketsByLane = currentTickets.groupBy { it.lane!! }
                     for ((lane, laneTickets) in ticketsByLane) {
                         if (lane.epoch != epoch || lane.speculationStamp != owner.speculationRevision) continue
+                        val activePos = laneTickets.minOf { it.position }
+                        val maxEnd = laneTickets.maxOf { it.effectiveEnd }
+                        val fg = laneTickets.any { it.effectiveRole == StreamRole.FOREGROUND }
+                        val hasNativeForegroundTicket = laneTickets.any {
+                            it.epoch == epoch && it.effectiveRole == StreamRole.FOREGROUND
+                        }
+                        val spansBeyondHeadSlot = maxEnd > (slotOf(activePos) + 1L) * blockSize
                         val provenSequential = lane.crossedBlockBoundary || lane.contiguousBytesRead >= blockSize
                         val qualifies = when (intent.service) {
-                            ServiceIntent.WAITING, ServiceIntent.PREFETCH -> provenSequential
+                            ServiceIntent.WAITING -> provenSequential ||
+                                (explicitWaitingWindow > 0L && hasNativeForegroundTicket && spansBeyondHeadSlot)
+                            ServiceIntent.PREFETCH -> provenSequential
                             ServiceIntent.PLAYING -> provenSequential || lane === primaryLane
                             ServiceIntent.PAUSED -> false
                         }
                         if (!qualifies) continue
-                        val activePos = laneTickets.minOf { it.position }
-                        val maxEnd = laneTickets.maxOf { it.effectiveEnd }
-                        val fg = laneTickets.any { it.effectiveRole == StreamRole.FOREGROUND }
                         val earliestOrder = laneTickets.minOf { it.order }
-                        qualifying.add(QualifyingLane(lane, activePos, maxEnd, fg, earliestOrder))
+                        qualifying.add(QualifyingLane(lane, activePos, maxEnd, fg, earliestOrder, provenSequential))
                     }
 
                     if (qualifying.isNotEmpty()) {
@@ -1495,6 +1514,11 @@ internal class BlockCache(
                         // Aggregate across the owner: N tickets / lanes divide the owner's budget, never multiply it!
                         val multiLane = qualifying.size > 1
                         val totalOwnerBlocks = ((ownerByteCeiling + blockSize - 1L) / blockSize).toInt().coerceAtLeast(1)
+                        val totalWaitingBlocks = if (explicitWaitingWindow > 0L) {
+                            ((explicitWaitingWindow + blockSize - 1L) / blockSize).toInt().coerceAtLeast(1)
+                        } else {
+                            0
+                        }
                         for (idx in 0 until qualifying.size) {
                             val q = qualifying[idx]
                             val laneMaxBlocks = if (multiLane) {
@@ -1507,6 +1531,15 @@ internal class BlockCache(
                                 minOf(ownerByteCeiling, laneMaxBlocks.toLong() * blockSize)
                             } else {
                                 ownerByteCeiling
+                            }
+                            val perLaneWaitingWindow = if (explicitWaitingWindow <= 0L) {
+                                0L
+                            } else if (multiLane) {
+                                val waitingLaneBlocks = (totalWaitingBlocks / qualifying.size) +
+                                    if (idx < totalWaitingBlocks % qualifying.size) 1 else 0
+                                minOf(perLaneCeiling, waitingLaneBlocks.toLong() * blockSize)
+                            } else {
+                                minOf(perLaneCeiling, explicitWaitingWindow)
                             }
                             val laneBudget = when (intent.service) {
                                 ServiceIntent.WAITING -> {
@@ -1527,9 +1560,14 @@ internal class BlockCache(
                                     } else {
                                         baseWaitingCeiling
                                     }
+                                    val progressiveBudget = if (q.provenSequential) {
+                                        (q.lane.contiguousBytesRead * 2L).coerceIn(2L * blockSize, waitingCeiling)
+                                    } else {
+                                        0L
+                                    }
                                     minOf(
                                         perLaneCeiling,
-                                        (q.lane.contiguousBytesRead * 2L).coerceIn(2L * blockSize, waitingCeiling),
+                                        maxOf(progressiveBudget, perLaneWaitingWindow),
                                     )
                                 }
                                 ServiceIntent.PREFETCH -> minOf(perLaneCeiling, 4L * blockSize)
@@ -1539,8 +1577,11 @@ internal class BlockCache(
                             val endByteExclusive = minOf(q.activePos + laneBudget, q.maxEndExclusive, size)
                             if (endByteExclusive <= q.activePos) continue
                             val headSlot = slotOf(q.activePos)
-                            val hasActiveAtHead = requiredClaims.any { it.owner === owner && it.slot == headSlot } ||
-                                continuationClaims.any { it.owner === owner && it.slot == headSlot }
+                            val hasActiveAtHead = requiredClaims.any {
+                                it.owner === owner && it.slot == headSlot && it !in supersededClaims
+                            } || continuationClaims.any {
+                                it.owner === owner && it.slot == headSlot && it !in supersededClaims
+                            }
                             val firstLaSlot = if (hasActiveAtHead) headSlot + 1 else headSlot
                             val endSlotInclusive = if (multiLane) {
                                 minOf(slotOf(endByteExclusive - 1L), firstLaSlot + laneMaxBlocks - 1)
@@ -1579,8 +1620,55 @@ internal class BlockCache(
                     }
                 }
             }
+        }
 
-            // Retain single-block FinishInFlight strictly for ended/completed range tickets.
+        // 2b. Suppress superseded pre-seek Required / Continuation claims whenever their owner has any
+        //     uncached current-epoch work, preventing lingering FFmpeg old_hd sockets from stealing CDN
+        //     connections or link bandwidth while the post-seek target is still filling.
+        if (supersededClaims.isNotEmpty()) {
+            val busyCurrentEpochOwners = HashSet<TransferDemand>(owners.size)
+            for (i in 0 until requiredClaims.size) {
+                val c = requiredClaims[i]
+                if (c !in supersededClaims && c.slot !in cache) {
+                    busyCurrentEpochOwners.add(c.owner)
+                }
+            }
+            for (i in 0 until continuationClaims.size) {
+                val c = continuationClaims[i]
+                if (c !in supersededClaims && c.slot !in cache) {
+                    busyCurrentEpochOwners.add(c.owner)
+                }
+            }
+            for (i in 0 until lookAheadClaims.size) {
+                val la = lookAheadClaims[i]
+                for (slot in la.firstSlot..la.lastSlotInclusive) {
+                    if (slot !in cache && slot !in failed) {
+                        if (isFarTailDeferredLocked(la, slot)) break
+                        busyCurrentEpochOwners.add(la.owner)
+                        break
+                    }
+                }
+            }
+            if (busyCurrentEpochOwners.isNotEmpty()) {
+                fun hasDeliveringInFlight(slot: Int): Boolean {
+                    val f = inFlight[slot] ?: return false
+                    return !f.cancelled && !f.released && f.nextSlot == slot && f.buffered > 0
+                }
+                requiredClaims.removeAll {
+                    it in supersededClaims && it.owner in busyCurrentEpochOwners && !hasDeliveringInFlight(it.slot)
+                }
+                continuationClaims.removeAll {
+                    it in supersededClaims && it.owner in busyCurrentEpochOwners && !hasDeliveringInFlight(it.slot)
+                }
+            }
+        }
+
+        // 3. Retain single-block FinishInFlight strictly for ended/completed range tickets.
+        for (state in owners.values) {
+            val owner = state.owner
+            if (owner.isClosed) continue
+            val intent = owner.intent
+            val epoch = intent.epoch
             if (intent.service != ServiceIntent.PAUSED) {
                 if (state.finishInFlightBySlot.isNotEmpty()) {
                     val iter = state.finishInFlightBySlot.values.iterator()
@@ -2033,6 +2121,15 @@ internal class BlockCache(
             if (activeCount >= maxWorkers) {
                 val bestUnclaimedPrio = highestUnclaimedPriorityLocked(plan)
                 if (bestUnclaimedPrio >= 0) {
+                    val hasUnclaimedBestRequired = bestUnclaimedPrio >= PikPakStreamReader.STREAMING_PRIORITY &&
+                        plan.required.any { req ->
+                            req.priority == bestUnclaimedPrio &&
+                                req.slot !in cache &&
+                                req.slot !in offered &&
+                                req.slot !in inFlight &&
+                                req.slot !in failed &&
+                                req.slot !in persisting
+                        }
                     val maxVictimPrio = when {
                         bestUnclaimedPrio >= PikPakStreamReader.BLOCKING_PRIORITY -> PikPakStreamReader.BLOCKING_PRIORITY - 1
                         bestUnclaimedPrio >= PikPakStreamReader.STREAMING_PRIORITY -> PikPakStreamReader.STREAMING_PRIORITY - 1
@@ -2041,7 +2138,12 @@ internal class BlockCache(
                     var victim: Fetch? = null
                     for (i in 0 until activeFetches.size) {
                         val f = activeFetches[i]
-                        if (f.cancelled || f.released || f.livePriorityValue > maxVictimPrio) continue
+                        val eligibleEqualTierWant = hasUnclaimedBestRequired &&
+                            f.livePriorityValue == bestUnclaimedPrio &&
+                            !f.claimControl.inBlockQuantum &&
+                            !plan.required.any { it.slot in f.nextSlot until f.plannedEndSlot } &&
+                            !plan.continuation.any { it.slot in f.nextSlot until f.plannedEndSlot }
+                        if (f.cancelled || f.released || (f.livePriorityValue > maxVictimPrio && !eligibleEqualTierWant)) continue
                         if (victim == null ||
                             f.livePriorityValue < victim.livePriorityValue ||
                             (f.livePriorityValue == victim.livePriorityValue &&
@@ -2322,7 +2424,9 @@ internal class BlockCache(
         var latestDeadline: TimeMark? = null
         for (i in 0 until openTickets.size) {
             val t = openTickets[i]
-            if (!t.ended && !t.owner.isClosed && t.effectiveRole == StreamRole.FOREGROUND) {
+            val state = owners[t.owner]
+            val superseded = state != null && isSupersededByCurrentEpochTicketLocked(state, t, t.owner.intent.epoch)
+            if (!t.ended && !t.owner.isClosed && t.effectiveRole == StreamRole.FOREGROUND && !superseded) {
                 if (t.activeWaiter != null) {
                     readingFg = true
                 }
@@ -2361,8 +2465,8 @@ internal class BlockCache(
         return !deadline.hasPassedNow()
     }
 
-    private fun hasForegroundDemand(): Boolean {
-        if (hasForegroundStreamDemand()) return true
+    private fun hasUrgentForegroundWarm(): Boolean {
+        if (closed) return false
         val allWants = wants
         for (i in 0 until allWants.size) {
             val w = allWants[i]
@@ -2373,13 +2477,19 @@ internal class BlockCache(
         return false
     }
 
+    private fun hasForegroundDemand(): Boolean =
+        hasForegroundStreamDemand() || hasUrgentForegroundWarm()
+
     private suspend fun watchForegroundIdle() {
         while (currentCoroutineContext().isActive) {
             val seen = idleSignal.value
             val nextIdle: Duration? = locked {
                 var earliest: Duration? = null
                 val anyReadingFg = openTickets.any {
-                    !it.ended && !it.owner.isClosed && it.activeWaiter != null && it.effectiveRole == StreamRole.FOREGROUND
+                    val st = owners[it.owner]
+                    val superseded = st != null && isSupersededByCurrentEpochTicketLocked(st, it, it.owner.intent.epoch)
+                    !it.ended && !it.owner.isClosed && it.activeWaiter != null &&
+                        it.effectiveRole == StreamRole.FOREGROUND && !superseded
                 }
                 if (!anyReadingFg) {
                     for (state in owners.values) {
@@ -2440,7 +2550,7 @@ internal class BlockCache(
             base,
             adaptiveSource?.connectionLimit?.value?.coerceAtLeast(0) ?: concurrency,
         )
-        return if (!hasForegroundStreamDemand() && foregroundWarms > 0) {
+        return if (!hasForegroundStreamDemand() && foregroundWarms > 0 && !hasUrgentForegroundWarm()) {
             minOf(capacity, 2)
         } else {
             capacity
@@ -2829,6 +2939,28 @@ internal class BlockCache(
                     .coerceIn(1L, Int.MAX_VALUE.toLong())
                     .toInt()
             }
+            streamWarm != null -> {
+                var unreservedSlots = 0L
+                val ranges = streamWarm.slots.ranges
+                for (rIdx in 0 until ranges.size) {
+                    val range = ranges[rIdx]
+                    for (s in range.first..range.last) {
+                        if (s.toLong() * blockSize >= size) break
+                        if (wantsSlot(streamWarm, s) &&
+                            s !in cache && s !in inFlight && s !in offered && s !in persisting && s !in failed
+                        ) {
+                            unreservedSlots++
+                        }
+                    }
+                }
+                val remainingWorkers = minOf(
+                    (maxWorkers - nonCancelledActive).coerceAtLeast(1),
+                    spanWorkers.coerceAtLeast(1),
+                )
+                ((unreservedSlots.coerceAtLeast(1L) + remainingWorkers - 1L) / remainingWorkers)
+                    .coerceIn(1L, 2L)
+                    .toInt()
+            }
             else -> 2
         }
 
@@ -2871,7 +3003,7 @@ internal class BlockCache(
                     minOf(schedulerCeiling, progressiveSpan)
                 }
             }
-            streamWarm != null -> 2
+            streamWarm != null -> minOf(fairShare, 2)
             downloadWant != null -> {
                 val span = registration?.let { scheduler!!.spanFor(it, spanWorkers, durable = true) } ?: 2
                 minOf(fairShare, span)

@@ -489,22 +489,72 @@ class RangeReader internal constructor(
                     // Throwing from the child fails the scope and cancels the request with it.
                     val answered = CompletableDeferred<Unit>()
                     val claimedWarm = client.hostHealth.onRequestStarted(attemptUrl)
-                    val limit = client.hostHealth.firstResponseDeadline(attemptUrl, claimedWarm)
                     val claimControl = currentCoroutineContext()[FetchClaimControl]
                     val demand = currentCoroutineContext()[TransferDemand]
-                    fun currentBodySilence(): Duration {
-                        val effectivePriority = maxOf(priority, claimControl?.priorityFlow?.value ?: demand?.priority ?: priority)
-                        return client.hostHealth.bodySilenceDeadline(effectivePriority)
-                    }
+                    fun currentEffectivePriority(): Int =
+                        maxOf(priority, claimControl?.priorityFlow?.value ?: demand?.priority ?: priority)
+                    fun currentHeaderDeadline(): Duration = client.hostHealth.urgentFirstResponseDeadline(
+                        url = attemptUrl,
+                        claimedWarmSocket = claimedWarm,
+                        connectionReused = connectionTelemetry.connectionReused,
+                        priority = currentEffectivePriority(),
+                    )
+                    fun currentBodySilence(): Duration =
+                        client.hostHealth.bodySilenceDeadline(currentEffectivePriority())
                     val deadline = launch {
                         attempt.admission.granted.await()
                         var statusesSeen = attempt.retries.statuses
+                        var windowStarted = timeSource.markNow()
+                        var sleptInWindow = Duration.ZERO
                         while (true) {
-                            delay(limit)
                             if (answered.isCompleted) return@launch
                             val statuses = attempt.retries.statuses
-                            if (statuses == statusesSeen) throw UnresponsiveHost(limit)
-                            statusesSeen = statuses
+                            if (statuses != statusesSeen) {
+                                statusesSeen = statuses
+                                windowStarted = timeSource.markNow()
+                                sleptInWindow = Duration.ZERO
+                            }
+                            val observedPriority = currentEffectivePriority()
+                            val observedReused = connectionTelemetry.connectionReused
+                            val currentLimit = currentHeaderDeadline()
+                            val elapsed = maxOf(windowStarted.elapsedNow(), sleptInWindow)
+                            if (elapsed >= currentLimit) {
+                                if (answered.isCompleted) return@launch
+                                val statusesNow = attempt.retries.statuses
+                                if (statusesNow == statusesSeen) {
+                                    throw UnresponsiveHost(maxOf(currentLimit, elapsed))
+                                }
+                                statusesSeen = statusesNow
+                                windowStarted = timeSource.markNow()
+                                sleptInWindow = Duration.ZERO
+                                continue
+                            }
+                            val waitDuration = (currentLimit - elapsed).coerceAtLeast(1.milliseconds)
+                            val wokeEarly = withTimeoutOrNull(waitDuration) {
+                                coroutineScope {
+                                    val wake = CompletableDeferred<Unit>()
+                                    val pJob = claimControl?.priorityFlow?.let { pFlow ->
+                                        launch(start = CoroutineStart.UNDISPATCHED) {
+                                            pFlow.first { maxOf(priority, it) > observedPriority }
+                                            wake.complete(Unit)
+                                        }
+                                    }
+                                    val cJob = launch(start = CoroutineStart.UNDISPATCHED) {
+                                        connectionTelemetry.connectionFlow.first { it != observedReused }
+                                        wake.complete(Unit)
+                                    }
+                                    try {
+                                        wake.await()
+                                    } finally {
+                                        pJob?.cancel()
+                                        cJob.cancel()
+                                    }
+                                }
+                                true
+                            } ?: false
+                            if (!wokeEarly) {
+                                sleptInWindow += waitDuration
+                            }
                         }
                     }
                     val remainingSnap = remaining
@@ -617,7 +667,11 @@ class RangeReader internal constructor(
                                         if (wasFirstByte) {
                                             val cleanFirstByte = attempt.retries.statuses == 0 && attempt.retries.transport == 0
                                             attempt.firstByteElapsed()?.takeIf { cleanFirstByte }?.let { ttfb ->
-                                                client.hostHealth.recordFirstByteLatency(attemptUrl, ttfb)
+                                                client.hostHealth.recordFirstByteLatency(
+                                                    attemptUrl,
+                                                    ttfb,
+                                                    connectionReused = connectionTelemetry.connectionReused,
+                                                )
                                             }
                                         }
                                         if (telemetry != null && telemetry.timeToFirstByte == null) {
@@ -685,7 +739,10 @@ class RangeReader internal constructor(
                                                 shortWindowSinkWait += chunkSinkWait
                                                 val rawWindowElapsed = shortWindowMark?.elapsedNow() ?: Duration.ZERO
                                                 val netWindowElapsed = (rawWindowElapsed - shortWindowSinkWait).coerceAtLeast(Duration.ZERO)
-                                                if (netWindowElapsed >= RecoveryPolicy.MIN_SHORT_WINDOW_MS.milliseconds) {
+                                                val cleanFirstByte = attempt.retries.statuses == 0 && attempt.retries.transport == 0
+                                                val cleanTtfbMs = attempt.firstByteElapsed()?.takeIf { cleanFirstByte }?.inWholeMilliseconds ?: 0L
+                                                val minShortWindowMs = (cleanTtfbMs / 3L).coerceIn(RecoveryPolicy.MIN_SHORT_WINDOW_MS, 500L)
+                                                if (netWindowElapsed >= minShortWindowMs.milliseconds) {
                                                     val shortWindowRate = if (shortWindowBytes > 0L) {
                                                         (shortWindowBytes * 1_000_000_000L) / netWindowElapsed.inWholeNanoseconds.coerceAtLeast(1L)
                                                     } else {

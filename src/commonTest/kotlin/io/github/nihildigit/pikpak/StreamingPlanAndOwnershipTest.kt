@@ -3051,4 +3051,323 @@ class StreamingPlanAndOwnershipTest {
             cache.awaitClosedForTest()
         }
     }
+
+    @Test
+    fun `waitingReadAheadBytes fans out all workers in parallel on open-ended startup and seek while keeping short probes single-block`() = runTest {
+        val fileSize = 64 * blockSize
+        val payload = ByteArray(fileSize.toInt()) { (it * 31 % 251).toByte() }
+        val scheduler = TransferScheduler(8, 8, BandwidthLimiter(), testScheduler.timeSource)
+        val foregroundStreams = ForegroundStreams()
+        val holdStartup = CompletableDeferred<Unit>()
+        val holdSeek = CompletableDeferred<Unit>()
+        var phase = 0 // 0 = short probe, 1 = startup, 2 = seek
+        val observedRequests = mutableListOf<Pair<Long, Long>>()
+
+        val source = object : RangeSource {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
+                observedRequests += start to length
+                when (phase) {
+                    1 -> holdStartup.await()
+                    2 -> holdSeek.await()
+                }
+                return block(ByteReadChannel(payload.copyOfRange(start.toInt(), (start + length).toInt())))
+            }
+        }
+
+        val cache = BlockCache(
+            source = source,
+            size = fileSize,
+            concurrency = 6,
+            parentCoroutineContext = coroutineContext,
+            foregroundStreams = foregroundStreams,
+            blockSize = blockSize,
+            readAheadBytes = 16 * blockSize,
+            memoryCapBytes = 40 * blockSize,
+            scheduler = scheduler,
+            timeSource = testScheduler.timeSource,
+        )
+        val owner = TransferDemand(
+            ConsumerIntent(
+                epoch = 1L,
+                service = ServiceIntent.WAITING,
+                bufferBudget = BufferBudget(
+                    maxReadAheadBytes = 16 * blockSize,
+                    waitingReadAheadBytes = 10 * blockSize,
+                ),
+            ),
+        )
+        try {
+            // 1. Bounded single-block short probe (0..8192) MUST stay strictly single-block (0 LookAhead).
+            val probeTicket = cache.beginRead(owner, 0L, 8192L)
+            val probeBuf = ByteArray(8192)
+            assertEquals(8192, probeTicket.readSome(probeBuf, 0, probeBuf.size))
+            runCurrent()
+            assertTrue(cache.planForTest().lookAhead.isEmpty(), "Single-block probe must not trigger waitingReadAheadBytes")
+            assertEquals(listOf(0L to blockSize), observedRequests)
+            probeTicket.endRead(ReadEndReason.RangeCompleted)
+
+            // 2. Open-ended startup at slot 4 (held before TTFB) MUST immediately fan out all 6 workers in parallel!
+            observedRequests.clear()
+            phase = 1
+            val startupTicket = cache.beginRead(owner, 4 * blockSize, fileSize)
+            val startupRead = async {
+                val out = ByteArray(4096)
+                startupTicket.readSome(out, 0, out.size)
+            }
+            runCurrent()
+            assertEquals(
+                6,
+                observedRequests.size,
+                "All 6 workers must claim startup GOP blocks before first byte returns: $observedRequests",
+            )
+            val coveredStartupBytes = observedRequests.sumOf { it.second }
+            assertTrue(
+                coveredStartupBytes >= 8 * blockSize,
+                "First parallel startup wave should cover >= 2 MiB (got $coveredStartupBytes B): $observedRequests",
+            )
+
+            // 3. Cross-region seek (epoch 2) withdraws startup speculation and immediately fans out 6 workers at slot 32!
+            observedRequests.clear()
+            phase = 2
+            owner.submitIntent(owner.intent.copy(epoch = 2L, service = ServiceIntent.WAITING))
+            startupRead.cancel()
+            startupTicket.endRead(ReadEndReason.ConsumerClosed)
+            runCurrent()
+
+            val seekTicket = cache.beginRead(owner, 32 * blockSize, fileSize)
+            val seekRead = async {
+                val out = ByteArray(4096)
+                seekTicket.readSome(out, 0, out.size)
+            }
+            runCurrent()
+            assertEquals(
+                6,
+                observedRequests.size,
+                "All 6 workers must claim post-seek GOP blocks before first byte returns: $observedRequests",
+            )
+            assertTrue(
+                observedRequests.all { (start, _) -> start >= 32 * blockSize },
+                "All post-seek fetches must target the new seek region: $observedRequests",
+            )
+
+            // Multi-lane invariant: opening a second qualifying lane divides waitingReadAheadBytes instead of multiplying it.
+            val secondSeekTicket = cache.beginRead(owner, 48 * blockSize, fileSize)
+            val secondSeekRead = async {
+                val out = ByteArray(4096)
+                secondSeekTicket.readSome(out, 0, out.size)
+            }
+            runCurrent()
+            val multiLaneTotalSlots = cache.planForTest().lookAhead
+                .filter { it.owner === owner }
+                .sumOf { it.lastSlotInclusive - it.firstSlot + 1 }
+            assertTrue(
+                multiLaneTotalSlots <= 10,
+                "Multiple qualifying lanes must divide waitingReadAheadBytes (<= 10 slots total, got $multiLaneTotalSlots)",
+            )
+
+            holdStartup.complete(Unit)
+            holdSeek.complete(Unit)
+            assertEquals(4096, seekRead.await())
+            assertEquals(4096, secondSeekRead.await())
+            seekTicket.endRead(ReadEndReason.RangeCompleted)
+            secondSeekTicket.endRead(ReadEndReason.RangeCompleted)
+        } finally {
+            holdStartup.complete(Unit)
+            holdSeek.complete(Unit)
+            owner.close()
+            cache.close()
+            cache.awaitClosedForTest()
+        }
+    }
+
+    @Test
+    fun `urgent foreground warm uses full worker capacity and yields to unclaimed Required at equal priority`() = runTest {
+        val fileSize = 32 * blockSize
+        val payload = ByteArray(fileSize.toInt()) { (it * 19 % 251).toByte() }
+        val holdWarm = CompletableDeferred<Unit>()
+        val activeSlots = LinkedHashSet<Int>()
+        val cancelledWarmSlots = mutableListOf<Int>()
+
+        val source = object : RangeSource {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
+                val slot = (start / blockSize).toInt()
+                if (slot < 20) {
+                    activeSlots += slot
+                    var completed = false
+                    try {
+                        holdWarm.await()
+                        val res = block(ByteReadChannel(payload.copyOfRange(start.toInt(), (start + length).toInt())))
+                        completed = true
+                        return res
+                    } finally {
+                        if (!completed && !holdWarm.isCompleted) cancelledWarmSlots += slot
+                    }
+                }
+                return block(ByteReadChannel(payload.copyOfRange(start.toInt(), (start + length).toInt())))
+            }
+        }
+
+        val cache = BlockCache(
+            source = source,
+            size = fileSize,
+            concurrency = 4,
+            parentCoroutineContext = coroutineContext,
+            foregroundStreams = ForegroundStreams(),
+            blockSize = blockSize,
+            readAheadBytes = 8 * blockSize,
+            memoryCapBytes = 24 * blockSize,
+            timeSource = testScheduler.timeSource,
+        )
+        val owner = TransferDemand(ConsumerIntent(epoch = 1L, service = ServiceIntent.WAITING))
+        try {
+            val warmJob = launch {
+                cache.warm(
+                    listOf(
+                        0L until 2 * blockSize,
+                        8 * blockSize until 9 * blockSize,
+                        16 * blockSize until 17 * blockSize,
+                    ),
+                    durable = false,
+                    role = StreamRole.FOREGROUND,
+                    priority = PikPakStreamReader.BLOCKING_PRIORITY,
+                    demand = owner,
+                )
+            }
+            runCurrent()
+            assertEquals(
+                setOf(0, 1, 8, 16),
+                activeSlots,
+                "Urgent BLOCKING_PRIORITY foreground warm must fan out across all 4 workers with 1-slot fairShare",
+            )
+
+            // An actual ReadTicket at unclaimed slot 24 (BLOCKING_PRIORITY) immediately preempts one Want worker!
+            val ticket = cache.beginRead(owner, 24 * blockSize, 24 * blockSize + 4096L)
+            val buf = ByteArray(4096)
+            assertEquals(4096, ticket.readSome(buf, 0, buf.size))
+            assertTrue(cancelledWarmSlots.isNotEmpty(), "Unclaimed Required must preempt an equal-priority non-quantum Want worker")
+            ticket.endRead(ReadEndReason.RangeCompleted)
+
+            holdWarm.complete(Unit)
+            warmJob.join()
+        } finally {
+            holdWarm.complete(Unit)
+            owner.close()
+            cache.close()
+            cache.awaitClosedForTest()
+        }
+    }
+
+    @Test
+    fun `superseded pre-seek ticket hitting uncached slot withdraws and withholds Required while post-seek work is uncached`() = runTest {
+        val fileSize = 64 * blockSize
+        val payload = ByteArray(fileSize.toInt()) { (it * 13 % 251).toByte() }
+        val holdOldSlot = CompletableDeferred<Unit>()
+        val holdPostSeek = CompletableDeferred<Unit>()
+        val startedSlots = mutableListOf<Pair<Int, Int>>()
+        val cancelledSlots = mutableListOf<Int>()
+
+        val source = object : RangeSource {
+            override suspend fun <T> read(
+                start: Long,
+                length: Long,
+                priority: Int,
+                block: suspend (ByteReadChannel) -> T,
+            ): T {
+                val slot = (start / blockSize).toInt()
+                startedSlots += slot to priority
+                var completed = false
+                try {
+                    if (slot == 4 && !holdOldSlot.isCompleted) {
+                        holdOldSlot.await()
+                    } else if (slot >= 32 && !holdPostSeek.isCompleted) {
+                        holdPostSeek.await()
+                    }
+                    val res = block(ByteReadChannel(payload.copyOfRange(start.toInt(), (start + length).toInt())))
+                    completed = true
+                    return res
+                } finally {
+                    if (!completed) cancelledSlots += slot
+                }
+            }
+        }
+
+        val cache = BlockCache(
+            source = source,
+            size = fileSize,
+            concurrency = 4,
+            parentCoroutineContext = coroutineContext,
+            foregroundStreams = ForegroundStreams(),
+            blockSize = blockSize,
+            readAheadBytes = 8 * blockSize,
+            memoryCapBytes = 24 * blockSize,
+            timeSource = testScheduler.timeSource,
+        )
+        val owner = TransferDemand(
+            ConsumerIntent(
+                epoch = 0L,
+                service = ServiceIntent.PLAYING,
+                bufferBudget = BufferBudget(
+                    maxReadAheadBytes = 4 * blockSize,
+                    waitingReadAheadBytes = 4 * blockSize,
+                ),
+            ),
+        )
+        try {
+            // 1. Pre-seek ticket reads uncached slot 4 (held in flight before seek).
+            val oldTicket = cache.beginRead(owner, 4 * blockSize, 5 * blockSize)
+            val oldRead = async {
+                val out = ByteArray(4096)
+                oldTicket.readSome(out, 0, out.size)
+            }
+            runCurrent()
+            assertTrue(startedSlots.any { it.first == 4 }, "Pre-seek slot 4 started before seek")
+
+            // 2. Seek advances owner to epoch=1 (WAITING) and opens post-seek ticket at slot 32..36.
+            startedSlots.clear()
+            owner.submitIntent(owner.intent.copy(epoch = 1L, service = ServiceIntent.WAITING))
+            runCurrent()
+            val newTicket = cache.beginRead(owner, 32 * blockSize, fileSize)
+            val newRead = async {
+                val out = ByteArray(4096)
+                newTicket.readSome(out, 0, out.size)
+            }
+            runCurrent()
+
+            // Pre-seek slot 4 must be withdrawn immediately, and NO prio=5 Required claim or upstream fetch may run at slot < 32!
+            assertTrue(4 in cancelledSlots, "In-flight pre-seek slot 4 must be withdrawn when post-seek ticket claims uncached work")
+            assertTrue(
+                cache.planForTest().required.none { it.slot < 32 },
+                "Superseded pre-seek Required must be withheld while post-seek work is uncached: ${cache.planForTest().required}",
+            )
+            assertTrue(
+                startedSlots.all { it.first >= 32 },
+                "Zero upstream fetches may target pre-seek region while post-seek work is uncached: $startedSlots",
+            )
+
+            // 3. Even if old_hd stays open until post-seek work finishes caching, it never deadlocks once post-seek finishes:
+            holdOldSlot.complete(Unit)
+            holdPostSeek.complete(Unit)
+            runCurrent()
+            assertEquals(4096, newRead.await())
+            assertEquals(4096, oldRead.await())
+            oldTicket.endRead(ReadEndReason.ConsumerClosed)
+            newTicket.endRead(ReadEndReason.RangeCompleted)
+        } finally {
+            holdOldSlot.complete(Unit)
+            holdPostSeek.complete(Unit)
+            owner.close()
+            cache.close()
+            cache.awaitClosedForTest()
+        }
+    }
 }

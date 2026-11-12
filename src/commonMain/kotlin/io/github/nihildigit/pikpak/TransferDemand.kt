@@ -28,6 +28,14 @@ enum class ServiceIntent {
 data class BufferBudget(
     val targetBuffer: Duration? = null,
     val maxReadAheadBytes: Long = PikPakStreamReader.DEFAULT_READ_AHEAD_BYTES,
+    /**
+     * Explicit initial look-ahead window permitted while in [ServiceIntent.WAITING] before a
+     * lane has proven sequential consumption across a full block. Defaults to `0L` so short
+     * probes and random-access consumers stay strictly `Required`-only until sequential reading
+     * is proven; full-screen playback sets a bounded startup/seek burst window so high-RTT
+     * connections establish and fetch the initial GOP in parallel.
+     */
+    val waitingReadAheadBytes: Long = 0L,
 ) {
     init {
         require(targetBuffer == null || (targetBuffer.isFinite() && targetBuffer >= Duration.ZERO)) {
@@ -35,6 +43,9 @@ data class BufferBudget(
         }
         require(maxReadAheadBytes >= 0L) {
             "maxReadAheadBytes must be non-negative"
+        }
+        require(waitingReadAheadBytes >= 0L) {
+            "waitingReadAheadBytes must be non-negative"
         }
     }
 

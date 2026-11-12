@@ -471,4 +471,93 @@ class HostHealthTest {
         }
         assertEquals(congestedTranscode, health.route(congestedTranscode, mayExplore = false))
     }
+
+    @Test
+    fun `urgentFirstResponseDeadline tightens on proven fast routes and cold replacement candidate models handshake TTFB`() {
+        val time = TestTimeSource()
+        val health = HostHealth(timeSource = time)
+        val warmHostUrl = "https://dl-z01a-0041.mypikpak.com/download/?fid=F&t=1"
+        val coldHostUrl = "https://dl-z01a-0042.mypikpak.com/download/?fid=F&t=1"
+        health.observe(
+            FileDetail(
+                medias = listOf(
+                    MediaVariant(mediaId = "1080", link = DownloadLink(url = warmHostUrl)),
+                    MediaVariant(mediaId = "720", link = DownloadLink(url = coldHostUrl)),
+                ),
+            ),
+        )
+
+        // Train fast Singapore-like route: warm pooled RTT ~150 ms, cold TLS handshake ~450 ms.
+        repeat(4) {
+            health.onRequestStarted(warmHostUrl)
+            health.answered(warmHostUrl, 450.milliseconds, connectionReused = false)
+            health.recordFirstByteLatency(warmHostUrl, 450.milliseconds, connectionReused = false)
+            health.onSocketReturned(warmHostUrl)
+        }
+        repeat(4) {
+            health.onRequestStarted(warmHostUrl)
+            health.answered(warmHostUrl, 150.milliseconds, connectionReused = true)
+            health.recordFirstByteLatency(warmHostUrl, 150.milliseconds, connectionReused = true)
+            health.onSocketReturned(warmHostUrl)
+        }
+
+        // Standard cold deadline drops from static 5.0 s to 2.0 s once cold handshakes are measured fast:
+        assertEquals(2.seconds, health.firstResponseDeadline(coldHostUrl, claimedWarmSocket = false))
+        // Urgent blocking read tightens further (~1.0 s on warm reused socket, ~1.35 s on cold socket):
+        assertEquals(
+            1.seconds,
+            health.urgentFirstResponseDeadline(
+                url = warmHostUrl,
+                claimedWarmSocket = true,
+                connectionReused = true,
+                priority = PikPakStreamReader.BLOCKING_PRIORITY,
+            ),
+        )
+        val urgentCold = health.urgentFirstResponseDeadline(
+            url = coldHostUrl,
+            claimedWarmSocket = false,
+            connectionReused = false,
+            priority = PikPakStreamReader.BLOCKING_PRIORITY,
+        )
+        assertTrue(urgentCold in 1200.milliseconds..1500.milliseconds, "urgentCold=$urgentCold")
+
+        // Now test cold-socket TTFB modeling in bestReplacementCandidate on a high-RTT Japan-like route:
+        val highRttHealth = HostHealth(timeSource = time)
+        highRttHealth.observe(
+            FileDetail(
+                medias = listOf(
+                    MediaVariant(mediaId = "1080", link = DownloadLink(url = warmHostUrl)),
+                    MediaVariant(mediaId = "720", link = DownloadLink(url = coldHostUrl)),
+                ),
+            ),
+        )
+        // Cold handshake on coldHostUrl took 1,650 ms, followed by pooled requests at 420 ms, then all pooled sockets consumed:
+        highRttHealth.onRequestStarted(coldHostUrl)
+        highRttHealth.answered(coldHostUrl, 1650.milliseconds, connectionReused = false)
+        highRttHealth.recordFirstByteLatency(coldHostUrl, 1650.milliseconds, connectionReused = false)
+        highRttHealth.onSocketReturned(coldHostUrl)
+        repeat(3) {
+            highRttHealth.onRequestStarted(coldHostUrl)
+            highRttHealth.answered(coldHostUrl, 420.milliseconds, connectionReused = true)
+            highRttHealth.recordFirstByteLatency(coldHostUrl, 420.milliseconds, connectionReused = true)
+            highRttHealth.delivered(HostHealth.hostOf(coldHostUrl), HostHealth.MIN_SAMPLE_BYTES, 260_000L, coldHostUrl)
+            highRttHealth.onSocketReturned(coldHostUrl)
+        }
+        // Drain idle socket count on coldHostUrl while keeping warmHostUrl pooled so poolTracked == true and isWarm(coldHostUrl) == false:
+        repeat(4) { highRttHealth.onRequestStarted(coldHostUrl) }
+        highRttHealth.onRequestStarted(warmHostUrl)
+        highRttHealth.answered(warmHostUrl, 420.milliseconds, connectionReused = true)
+        highRttHealth.onSocketReturned(warmHostUrl)
+
+        val candidate = highRttHealth.bestReplacementCandidate(
+            currentUrl = warmHostUrl,
+            excludedHosts = emptySet(),
+            remainingBytes = 256L * 1024L,
+        )
+        assertEquals(coldHostUrl, candidate?.url)
+        assertTrue(
+            (candidate?.ttfbMillis ?: 0L) >= 1650L,
+            "Cold replacement candidate must account for cold handshake TTFB (>= 1650 ms), got ${candidate?.ttfbMillis}",
+        )
+    }
 }
