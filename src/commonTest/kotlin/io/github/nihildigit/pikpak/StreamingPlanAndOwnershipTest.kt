@@ -451,7 +451,7 @@ class StreamingPlanAndOwnershipTest {
     }
 
     @Test
-    fun `Scenario B - cold head and tail moov probes stay Required-only, WAITING sequential read grows boundedly, PLAYING aggregates budget across N tickets, and hr-seek epoch bump preempts in 0ms`() = runTest {
+    fun `Scenario B - cold head and tail moov probes stay Required-only and WAITING sequential read grows boundedly and PLAYING aggregates budget across N tickets and hr-seek epoch bump preempts in 0ms`() = runTest {
         val fileSize = 64 * blockSize // 16 MiB
         val payload = ByteArray(fileSize.toInt()) { (it * 23 % 251).toByte() }
         val issued = mutableListOf<Triple<Long, Long, Int>>()
