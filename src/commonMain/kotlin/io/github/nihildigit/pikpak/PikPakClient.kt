@@ -1,6 +1,7 @@
 package io.github.nihildigit.pikpak
 
 import io.github.nihildigit.pikpak.internal.AccountState
+import io.github.nihildigit.pikpak.internal.ActiveAuthContext
 import io.github.nihildigit.pikpak.internal.AuthApi
 import io.github.nihildigit.pikpak.internal.FolderIdCache
 import io.github.nihildigit.pikpak.internal.ForegroundStreams
@@ -72,7 +73,7 @@ import org.kotlincrypto.hash.md.MD5
  */
 class PikPakClient(
     val account: String,
-    passwordSupplier: suspend () -> String,
+    passwordSupplier: (suspend () -> String)? = null,
     val sessionStore: SessionStore = FileSessionStore(),
     val rateLimiter: RateLimiter = RateLimiter.default(),
     val retryPolicy: RetryPolicy = RetryPolicy.Default,
@@ -112,6 +113,20 @@ class PikPakClient(
      */
     concurrentAcceleration: Boolean = true,
     internal val timeSource: TimeSource = TimeSource.Monotonic,
+    /**
+     * Username sent during password `signin` when [account] is a local storage key
+     * (such as `"pikpak:<sub>"`) rather than the user's email/phone/username.
+     */
+    val loginUsername: String = account,
+    /**
+     * Explicit persistent `X-Device-Id`. When null, resolves from the active [Session.deviceId]
+     * if present, otherwise falls back to `MD5(account)` for backward compatibility.
+     */
+    val explicitDeviceId: String? = null,
+    /** Client profile used for new sign-ins and device authorizations on this client. */
+    val authProfile: AuthClientProfile = AuthClientProfile.AndroidDefault,
+    /** Optional additional client profiles recognized when restoring persisted sessions. */
+    val additionalAuthProfiles: List<AuthClientProfile> = emptyList(),
 ) {
     constructor(
         account: String,
@@ -129,25 +144,66 @@ class PikPakClient(
         transportMemoryBudgetBytes: Long = DEFAULT_TRANSPORT_MEMORY_BUDGET_BYTES,
         concurrentAcceleration: Boolean = true,
         timeSource: TimeSource = TimeSource.Monotonic,
+        loginUsername: String = account,
+        explicitDeviceId: String? = null,
+        authProfile: AuthClientProfile = AuthClientProfile.AndroidDefault,
+        additionalAuthProfiles: List<AuthClientProfile> = emptyList(),
     ) : this(
-        account,
-        { password },
-        sessionStore,
-        rateLimiter,
-        retryPolicy,
-        httpClient,
-        cdnHttpClient,
-        connectionBudget,
-        accountConnectionBudget,
-        domain,
-        steerEdgeHosts,
-        downloadLimiter,
-        transportMemoryBudgetBytes,
-        concurrentAcceleration,
-        timeSource,
+        account = account,
+        passwordSupplier = { password },
+        sessionStore = sessionStore,
+        rateLimiter = rateLimiter,
+        retryPolicy = retryPolicy,
+        httpClient = httpClient,
+        cdnHttpClient = cdnHttpClient,
+        connectionBudget = connectionBudget,
+        accountConnectionBudget = accountConnectionBudget,
+        domain = domain,
+        steerEdgeHosts = steerEdgeHosts,
+        downloadLimiter = downloadLimiter,
+        transportMemoryBudgetBytes = transportMemoryBudgetBytes,
+        concurrentAcceleration = concurrentAcceleration,
+        timeSource = timeSource,
+        loginUsername = loginUsername,
+        explicitDeviceId = explicitDeviceId,
+        authProfile = authProfile,
+        additionalAuthProfiles = additionalAuthProfiles,
     )
 
-    val deviceId: String = MD5().digest(account.encodeToByteArray()).toHex()
+    internal val defaultDeviceId: String = MD5().digest(account.encodeToByteArray()).toHex()
+
+    val deviceId: String get() = activeAuthContext().deviceId
+
+    internal fun resolveAuthProfile(profileId: String?): AuthClientProfile =
+        AuthClientProfile.resolveOrNull(
+            id = profileId,
+            primary = authProfile,
+            additionalProfiles = additionalAuthProfiles,
+        ) ?: throw PikPakException(
+            errorCode = -1,
+            errorMessage = "unknown_auth_profile",
+            errorDescription = "Session requires unknown AuthClientProfile '$profileId'",
+        )
+
+    internal fun activeAuthContext(candidateSession: Session? = state.session): ActiveAuthContext {
+        val profile = if (candidateSession == null) {
+            authProfile
+        } else {
+            resolveAuthProfile(candidateSession.profileId)
+        }
+        val resolvedDeviceId = candidateSession?.deviceId?.takeIf { it.isNotBlank() }
+            ?: explicitDeviceId?.takeIf { it.isNotBlank() }
+            ?: defaultDeviceId
+        return ActiveAuthContext(profile = profile, deviceId = resolvedDeviceId)
+    }
+
+    /**
+     * Optional observer notified whenever a passwordless session cannot authenticate or
+     * refresh without interactive user sign-in ([InteractiveLoginRequiredException]),
+     * including automatic 401/expiry recovery during ordinary API calls.
+     */
+    @Volatile
+    var onInteractiveLoginRequired: ((InteractiveLoginRequiredException) -> Unit)? = null
 
     /**
      * Root domain for API calls, and through them for download links. See [PikPakDomain].
@@ -524,6 +580,40 @@ class PikPakClient(
     suspend fun login(): Session = mutex.withLock { auth.loginLocked() }
 
     /**
+     * Initiates a first-party RFC 8628 device authorization flow (`POST /v1/auth/device/code`)
+     * and returns the browser URLs (`googleAuthUrl` and `qrLoginUrl`) plus polling parameters.
+     */
+    suspend fun startDeviceAuthorization(
+        scope: String = DEFAULT_OAUTH_SCOPE,
+        platformName: String = "Piko",
+        deviceId: String = explicitDeviceId?.takeIf { it.isNotBlank() } ?: generateDeviceId(),
+    ): DeviceAuthorization = auth.startDeviceAuthorization(
+        scope = scope,
+        platformName = platformName,
+        deviceId = deviceId,
+    )
+
+    /**
+     * Performs a single RFC 8628 poll step against `POST /v1/auth/token`.
+     * When [commit] is true and the user has confirmed sign-in, persists the session to
+     * [sessionStore] and updates [currentSession].
+     */
+    suspend fun pollDeviceAuthorization(
+        authorization: DeviceAuthorization,
+        commit: Boolean = true,
+    ): DevicePollResult = auth.pollDeviceAuthorization(authorization, commit = commit)
+
+    /**
+     * Polls [authorization] until the user confirms sign-in in their system browser,
+     * the code expires, the user denies access, or the calling coroutine is cancelled.
+     */
+    suspend fun awaitDeviceAuthorization(
+        authorization: DeviceAuthorization,
+        commit: Boolean = true,
+        onPoll: (suspend (DevicePollResult) -> Unit)? = null,
+    ): Session = auth.awaitDeviceAuthorization(authorization, commit = commit, onPoll = onPoll)
+
+    /**
      * Warms the client up: authenticates and performs one cheap API call so the
      * captcha handshake happens now rather than on the first request the user
      * is waiting for. Failures propagate — a caller that wants best-effort
@@ -634,7 +724,7 @@ class PikPakClient(
 /** A duplicate comes within a lease's own lifetime, so the last few hundred ids are plenty. */
 private const val DELETED_LEASES_KEPT = 256
 
-internal class ClientState(val passwordSupplier: suspend () -> String) {
+internal class ClientState(val passwordSupplier: (suspend () -> String)?) {
     val sessionFlow = MutableStateFlow<Session?>(null)
     var session: Session?
         get() = sessionFlow.value

@@ -97,9 +97,10 @@ internal class HttpEngine(
             // otherwise send a newer value than the one the refresh below
             // is keyed on, and the refresh would skip itself.
             val sessionUsed = if (current != null && current.isUsable()) current else pikpak.mutex.withLock { pikpak.auth.loginLocked() }
+            val authContext = pikpak.activeAuthContext(sessionUsed)
             val captchaUsed = pikpak.state.captchaToken
             val element = try {
-                requestRaw(method, url) {
+                requestRaw(method, url, authContext = authContext) {
                     applyAuthHeaders(sessionUsed, captchaUsed)
                     configure()
                 }
@@ -144,6 +145,8 @@ internal class HttpEngine(
     suspend fun requestRaw(
         method: HttpMethod,
         url: String,
+        authContext: ActiveAuthContext = pikpak.activeAuthContext(),
+        retryRequests: Boolean = true,
         configure: HttpRequestBuilder.() -> Unit = {},
     ): JsonElement = execute(
         client = client,
@@ -151,10 +154,12 @@ internal class HttpEngine(
         // Endpoints name the official hosts; the root is swapped here, once, rather than in each
         url = pikpak.domain.apiUrl(url),
         rateLimited = true,
+        retryRequests = retryRequests,
         configure = {
             headers {
-                set(HttpHeaders.UserAgent, PikPakConstants.USER_AGENT)
-                set("X-Device-Id", pikpak.deviceId)
+                set(HttpHeaders.UserAgent, authContext.profile.userAgent)
+                set("X-Device-Id", authContext.deviceId)
+                set("X-Client-Id", authContext.profile.clientId)
             }
             configure()
         },
@@ -327,6 +332,8 @@ internal class HttpEngine(
     /** Thrown only while retries remain, so it never leaves [execute]. */
     private class RetryableStatus(val status: Int, val retryAfter: Duration?) : RuntimeException("HTTP $status")
 
+    internal fun isTransientFailure(t: Throwable): Boolean = isTransient(t)
+
     private fun isTransient(t: Throwable): Boolean {
         if (t is UrlExpiredException) return false
         if (t is HttpRequestTimeoutException) return true
@@ -464,12 +471,12 @@ internal fun buildUrl(base: String, path: String, query: Map<String, String> = e
 internal fun buildUrl(base: String, path: String, query: List<Pair<String, String>>): String {
     val full = base.trimEnd('/') + "/" + path.trimStart('/')
     if (query.isEmpty()) return full
-    val qs = query.joinToString("&") { (k, v) -> "${encode(k)}=${encode(v)}" }
+    val qs = query.joinToString("&") { (k, v) -> "${rfc3986Encode(k)}=${rfc3986Encode(v)}" }
     val sep = if ('?' in full) '&' else '?'
     return "$full$sep$qs"
 }
 
-private fun encode(s: String): String = buildString(s.length) {
+internal fun rfc3986Encode(s: String): String = buildString(s.length) {
     for (c in s) when {
         // RFC 3986 unreserved set. Must match ASCII only — Char.isLetterOrDigit
         // returns true for Unicode letters on the JVM, which would leave

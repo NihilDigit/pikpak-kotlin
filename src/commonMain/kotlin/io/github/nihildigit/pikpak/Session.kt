@@ -20,9 +20,13 @@ data class Session(
     @SerialName("refresh_token") val refreshToken: String,
     val sub: String,
     @SerialName("expires_at") val expiresAt: Long,
+    @SerialName("profile_id") val profileId: String? = null,
+    @SerialName("device_id") val deviceId: String? = null,
+    val scope: String? = null,
 ) {
     /** Leaves the tokens out: a session printed into a log or a crash report would hand the account over. */
-    override fun toString(): String = "Session(sub=$sub, expiresAt=$expiresAt)"
+    override fun toString(): String =
+        "Session(sub=$sub, expiresAt=$expiresAt, profileId=${profileId ?: AuthClientProfile.ANDROID_DEFAULT_ID})"
 }
 
 /**

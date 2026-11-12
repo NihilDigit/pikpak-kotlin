@@ -42,9 +42,11 @@ open class PikPakException(
         get() = errorCode == ErrorCodes.CAPTCHA_REQUIRED && errorMessage.startsWith("captcha")
 
     /**
-     * The refresh token is dead. [PikPakClient.login] never throws this: it
-     * clears the dead session from memory and the store and signs in with the
-     * password, and what reaches the caller is that sign-in's own outcome.
+     * The refresh token is dead (`error_code == 4126`). When a `passwordSupplier` is
+     * configured, [PikPakClient.login] clears the dead session and falls through to
+     * password sign-in rather than throwing a raw refresh error; when `passwordSupplier`
+     * is `null` (passwordless / browser-authorized clients), it clears the dead session
+     * and throws [InteractiveLoginRequiredException] (`errorCode == 4126`).
      */
     val isRefreshTokenInvalid: Boolean get() = errorCode == ErrorCodes.REFRESH_TOKEN_INVALID
 
@@ -131,5 +133,6 @@ class InstantContentUnavailableException(
 object ErrorCodes {
     const val OK = 0
     const val CAPTCHA_REQUIRED = 9
+    const val DEVICE_AUTHORIZATION_PENDING = 4050
     const val REFRESH_TOKEN_INVALID = 4126
 }

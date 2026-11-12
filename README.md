@@ -6,7 +6,7 @@
 
 A Kotlin Multiplatform SDK for [PikPak](https://mypikpak.com/) cloud storage — JVM, Android and iOS.
 
-- **Every endpoint is one `suspend` call.** Sessions, token refresh, captcha re-authentication, retries, rate limiting, content hashing and OSS upload signing happen inside the client.
+- **Every endpoint is one `suspend` call.** Sessions, password or browser/Google device authorization (RFC 8628), token refresh, captcha re-authentication, retries, rate limiting, content hashing and OSS upload signing happen inside the client.
 - **Playback-grade reads.** A remote file read at any offset over as many connections as PikPak allows, with expiring links, vanished file objects and silent edge hosts handled underneath; streams share a block cache, prefetch in play order, and can keep what matters on disk.
 - **A magnet to a playable file in about a second.** PikPak stores content by hash, and the SDK uses both halves of that: resolve a magnet to the hash of every file in it, and turn a hash into a file with no bytes transferred.
 - **Built on measurements.** Connection limits, host behaviour, costs and quirks of the API were measured, dated, and written down in the [wiki](https://github.com/NihilDigit/pikpak-kotlin/wiki/Measurements).
@@ -38,7 +38,7 @@ cache.openStream().use { stream ->
 ```kotlin
 repositories { mavenCentral() }
 dependencies {
-    implementation("io.github.nihildigit:pikpak-kotlin:2.5.1")
+    implementation("io.github.nihildigit:pikpak-kotlin:3.0.0")
     // Ktor is compileOnly in the SDK, so it never changes the Ktor you pinned: bring the core and one engine.
     implementation("io.ktor:ktor-client-core:<your-ktor-version>")
     implementation("io.ktor:ktor-client-okhttp:<your-ktor-version>")   // or ktor-client-darwin on iOS
@@ -53,7 +53,7 @@ The [project wiki](https://github.com/NihilDigit/pikpak-kotlin/wiki) is the manu
 
 | | |
 | --- | --- |
-| [Getting Started](https://github.com/NihilDigit/pikpak-kotlin/wiki/Getting-Started) | Clients, sessions, logging in, injected HTTP clients, budgets |
+| [Getting Started](https://github.com/NihilDigit/pikpak-kotlin/wiki/Getting-Started) | Clients, sessions, password & browser/Google device auth (RFC 8628), injected HTTP clients, budgets |
 | [Best Practices](https://github.com/NihilDigit/pikpak-kotlin/wiki/Best-Practices) | What works, learned building a real client, with the reasons |
 | [Playback](https://github.com/NihilDigit/pikpak-kotlin/wiki/Playback) | Demand ownership, tickets, streams, priorities, prefetch, disk caching, transcodes |
 | [Original Link Pools](https://github.com/NihilDigit/pikpak-kotlin/wiki/Original-Link-Pools) | Original-media links, CDN service pools, candidate host rewriting, concurrency modes |
